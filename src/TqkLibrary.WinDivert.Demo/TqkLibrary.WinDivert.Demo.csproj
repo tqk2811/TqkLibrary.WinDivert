@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<Import Project="..\..\src\ProjectBuildProperties.targets" />
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFrameworks>net462;net6.0-windows;net8.0-windows</TargetFrameworks>
+		<RootNamespace>TqkLibrary.WinDivert.Demo</RootNamespace>
+		<AssemblyName>TqkLibrary.WinDivert.Demo</AssemblyName>
+		<ApplicationManifest>app.manifest</ApplicationManifest>
+		<Platforms>x64;x86</Platforms>
+		<PlatformTarget>x64</PlatformTarget>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\..\src\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
+	</ItemGroup>
+
+</Project>

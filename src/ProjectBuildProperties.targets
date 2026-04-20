@@ -1,0 +1,19 @@
+<Project>
+	<PropertyGroup>
+		<LangVersion>12.0</LangVersion>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<Deterministic>true</Deterministic>
+		<ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+	</PropertyGroup>
+
+	<!-- net462 doesn't ship nullable attributes; suppress noise without breaking the feature -->
+	<PropertyGroup Condition="'$(TargetFramework)' == 'net462'">
+		<NoWarn>$(NoWarn);CS8601;CS8602;CS8603;CS8604;CS8618;CS8625</NoWarn>
+	</PropertyGroup>
+</Project>
