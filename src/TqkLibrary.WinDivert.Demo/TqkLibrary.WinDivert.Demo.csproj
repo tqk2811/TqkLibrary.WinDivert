@@ -16,4 +16,8 @@
 		<ProjectReference Include="..\..\src\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
 	</ItemGroup>
 
+	<ItemGroup>
+	  <PackageReference Include="System.CommandLine" />
+	</ItemGroup>
+
 </Project>

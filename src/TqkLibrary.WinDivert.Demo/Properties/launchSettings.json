@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "TqkLibrary.WinDivert.Demo": {
+      "commandName": "Project",
+      "commandLineArgs": "launch curl.exe --args \"-sS --get https://lumtest.com/myip.json\" --protocol t"
+    }
+  }
+}
