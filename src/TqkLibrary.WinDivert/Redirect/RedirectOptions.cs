@@ -34,4 +34,8 @@ public sealed class RedirectOptions
     // Applied to the WinDivert NETWORK handle priority (-30000..30000; higher = earlier).
     public short NetworkPriority { get; set; } = 100;
     public short SocketPriority { get; set; } = 100;
+
+    // If set, every captured packet, redirect, NAT entry, and socket event is appended to this
+    // file with a UTC timestamp. Null disables diagnostic logging (no overhead).
+    public string? LogFilePath { get; set; }
 }

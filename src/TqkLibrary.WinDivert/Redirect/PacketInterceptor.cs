@@ -1,5 +1,6 @@
 using System;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using TqkLibrary.WinDivert.Flow;
@@ -55,6 +56,7 @@ public sealed class PacketInterceptor : IDisposable
         // `not impostor` avoids re-capturing packets we reinjected ourselves (prevents loops).
         string proto = BuildProtoFilter();
         string filter = $"ip and ({proto}) and not impostor";
+        DiagnosticLogger.Log("INT", $"Open filter=\"{filter}\" priority={priority} tcpRelay={_tcpRelayPort} udpRelay={_udpRelayPort} pid={_pid}");
         _handle = WinDivertHandle.Open(
             filter,
             WinDivertLayer.Network,
@@ -87,8 +89,9 @@ public sealed class PacketInterceptor : IDisposable
             {
                 result = Process(buffer, length, ref addr);
             }
-            catch
+            catch (Exception ex)
             {
+                DiagnosticLogger.Log("INT", $"Process threw: {ex.GetType().Name}: {ex.Message}");
                 result = ProcessResult.Pass;
             }
 
@@ -98,8 +101,29 @@ public sealed class PacketInterceptor : IDisposable
             if (result == ProcessResult.Modified)
                 _handle.CalcChecksums(buffer, length, ref addr);
 
-            _handle.TrySend(buffer, length, ref addr);
+            bool sent = _handle.TrySend(buffer, length, ref addr);
+            if (result == ProcessResult.Modified && !sent)
+                DiagnosticLogger.Log("INT", $"  TrySend FAILED win32={Marshal.GetLastWin32Error()}");
         }
+    }
+
+    private static string TcpFlags(ParsedPacket p)
+    {
+        if (!p.IsTcp) return "";
+        var t = p.Tcp;
+        var sb = new System.Text.StringBuilder(8);
+        if (t.Syn) sb.Append('S');
+        if (t.Ack) sb.Append('A');
+        if (t.Fin) sb.Append('F');
+        if (t.Rst) sb.Append('R');
+        return sb.Length == 0 ? "-" : sb.ToString();
+    }
+
+    private string Describe(ParsedPacket p, in WinDivertAddress addr, int length)
+    {
+        string proto = p.IsTcp ? "tcp" : p.IsUdp ? "udp" : ((byte)p.Protocol).ToString();
+        string flags = p.IsTcp ? $" flags={TcpFlags(p)}" : "";
+        return $"out={(addr.Outbound ? 1 : 0)} lb={(addr.Loopback ? 1 : 0)} if={addr.Network.IfIdx}/{addr.Network.SubIfIdx} {proto} {p.Source}:{p.SourcePort} -> {p.Destination}:{p.DestinationPort} len={length}{flags}";
     }
 
     private ProcessResult Process(byte[] buffer, int length, ref WinDivertAddress addr)
@@ -111,6 +135,8 @@ public sealed class PacketInterceptor : IDisposable
         byte proto = (byte)p.Protocol;
         bool isTcp = p.IsTcp;
         int expectedRelay = isTcp ? _tcpRelayPort : _udpRelayPort;
+
+        DiagnosticLogger.Log("INT", $"recv {Describe(p, addr, length)}");
 
         // Case 1: egress from target process on a real interface → redirect to local relay.
         if (addr.Outbound && !addr.Loopback)
@@ -124,11 +150,13 @@ public sealed class PacketInterceptor : IDisposable
                 ? _socketTracker.IsTrackedTcp(new FlowKey(proto, srcIp, srcPort, dstIp, dstPort))
                 : _socketTracker.IsTrackedUdp(srcIp, srcPort);
 
+            DiagnosticLogger.Log("INT", $"  egress tracked={tracked} tcpFlows={_socketTracker.TcpSnapshot.Count} natCount={_nat.Count}");
             if (!tracked) return ProcessResult.Pass;
 
             // Store the real-interface IfIdx so the reply path can reinject on the same interface.
             var entry = new NatEntry(_pid, proto, srcIp, srcPort, dstIp, dstPort, addr.Network.IfIdx, addr.Network.SubIfIdx);
             _nat.Upsert(entry);
+            DiagnosticLogger.Log("INT", $"  nat.upsert {(isTcp ? "tcp" : "udp")} srcPort={srcPort} -> origDst={dstIp}:{dstPort} ifIdx={addr.Network.IfIdx}");
 
             IPAddress loopback = p.IsIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
             p.SetSource(loopback, srcPort);
@@ -140,6 +168,7 @@ public sealed class PacketInterceptor : IDisposable
             addr.Loopback = true;
             addr.Network.IfIdx = 1;
             addr.Network.SubIfIdx = 0;
+            DiagnosticLogger.Log("INT", $"  -> REDIRECT 127.0.0.1:{srcPort} -> 127.0.0.1:{expectedRelay} (Outbound=true Loopback=true IfIdx=1)");
             return ProcessResult.Modified;
         }
 
@@ -148,12 +177,17 @@ public sealed class PacketInterceptor : IDisposable
         {
             ushort dstPort = p.DestinationPort;
             NatEntry? entry = _nat.Find(proto, dstPort);
+            DiagnosticLogger.Log("INT", $"  reply candidate dstPort={dstPort} natHit={(entry != null)} addr.Outbound={addr.Outbound}");
             if (entry == null) return ProcessResult.Pass;
 
             // Loopback packets are captured twice (sender outbound + receiver inbound). Handle on
             // the outbound capture; the inbound duplicate would otherwise hit a nonexistent socket
             // and produce a spurious RST, so drop it.
-            if (!addr.Outbound) return ProcessResult.Drop;
+            if (!addr.Outbound)
+            {
+                DiagnosticLogger.Log("INT", "  -> DROP loopback inbound duplicate");
+                return ProcessResult.Drop;
+            }
 
             p.SetSource(entry.OriginalDestinationAddress, entry.OriginalDestinationPort);
             p.SetDestination(entry.OriginalSourceAddress, entry.OriginalSourcePort);
@@ -163,6 +197,7 @@ public sealed class PacketInterceptor : IDisposable
             addr.Outbound = false;
             addr.Network.IfIdx = entry.IfIdx;
             addr.Network.SubIfIdx = entry.SubIfIdx;
+            DiagnosticLogger.Log("INT", $"  -> REPLY rewrite to {entry.OriginalDestinationAddress}:{entry.OriginalDestinationPort} -> {entry.OriginalSourceAddress}:{entry.OriginalSourcePort} ifIdx={entry.IfIdx}");
             return ProcessResult.Modified;
         }
 

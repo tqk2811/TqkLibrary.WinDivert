@@ -15,10 +15,15 @@ internal static class RedirectorRunner
         SuspendedProcessLauncher.SuspendedProcess? suspended,
         CancellationToken ct)
     {
+        string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
+            ?? System.IO.Path.Combine(Environment.CurrentDirectory, "windivert-interceptor.log");
+        Console.WriteLine($"Diagnostic log: {logPath}");
+
         var opts = new RedirectOptions
         {
             ProcessId = pid,
             Protocols = proto,
+            LogFilePath = logPath,
             TcpConnectionHandler = async (conn, innerCt) =>
             {
                 Console.WriteLine($"  [TCP open ] pid={conn.ProcessId} {conn.OriginalSource} -> {conn.OriginalDestination}");

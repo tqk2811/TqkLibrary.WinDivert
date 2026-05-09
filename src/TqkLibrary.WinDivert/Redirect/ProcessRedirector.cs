@@ -35,6 +35,9 @@ public sealed class ProcessRedirector : IDisposable
 
     public void Start()
     {
+        DiagnosticLogger.Configure(_options.LogFilePath);
+        DiagnosticLogger.Log("RDR", $"Start pid={_options.ProcessId} protocols={_options.Protocols} netPri={_options.NetworkPriority} sockPri={_options.SocketPriority}");
+
         _tracker = new SocketTracker(_options.ProcessId);
         _tracker.TcpConnectEstablished += k => TcpConnectEstablished?.Invoke(k);
         _tracker.TcpConnectClosed += k => TcpConnectClosed?.Invoke(k);
@@ -54,15 +57,19 @@ public sealed class ProcessRedirector : IDisposable
             udpPort = _udpRelay.Port;
         }
 
+        DiagnosticLogger.Log("RDR", $"Relay ports tcp={tcpPort} udp={udpPort}");
+
         _interceptor = new PacketInterceptor(_tracker, _nat, _options.ProcessId, tcpPort, udpPort, _options.Protocols);
         _interceptor.Start(_options.NetworkPriority);
     }
 
     public void Dispose()
     {
+        DiagnosticLogger.Log("RDR", "Dispose");
         _interceptor?.Dispose();
         _tcpRelay?.Dispose();
         _udpRelay?.Dispose();
         _tracker?.Dispose();
+        DiagnosticLogger.Close();
     }
 }

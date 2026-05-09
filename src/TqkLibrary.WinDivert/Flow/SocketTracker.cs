@@ -5,6 +5,7 @@ using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using TqkLibrary.WinDivert.Native;
+using TqkLibrary.WinDivert.Redirect;
 
 namespace TqkLibrary.WinDivert.Flow;
 
@@ -64,6 +65,7 @@ public sealed class SocketTracker : IDisposable
     {
         if (_pumpTask != null) throw new InvalidOperationException("Already started");
         string filter = $"processId == {_processId} and (tcp or udp)";
+        DiagnosticLogger.Log("TRK", $"Open filter=\"{filter}\"");
         _handle = WinDivertHandle.Open(
             filter,
             WinDivertLayer.Socket,
@@ -95,14 +97,17 @@ public sealed class SocketTracker : IDisposable
         ushort rp = data.RemotePort;
         byte proto = data.Protocol;
 
+        DiagnosticLogger.Log("TRK", $"evt={addr.Event} proto={proto} pid={data.ProcessId} {local}:{lp} -> {remote}:{rp}");
+
         switch (addr.Event)
         {
             case WinDivertEvent.SocketConnect:
                 if (proto == 6)
                 {
                     var key = new FlowKey(proto, local, lp, remote, rp);
-                    _tcpFlows[key] = 1;
-                    TcpConnectEstablished?.Invoke(key);
+                    bool added = _tcpFlows.TryAdd(key, 1);
+                    DiagnosticLogger.Log("TRK", $"  tcpFlows.add={added} count={_tcpFlows.Count} key={key}");
+                    if (added) TcpConnectEstablished?.Invoke(key);
                 }
                 break;
 
@@ -110,8 +115,9 @@ public sealed class SocketTracker : IDisposable
                 if (proto == 6)
                 {
                     var key = new FlowKey(proto, local, lp, remote, rp);
-                    if (_tcpFlows.TryRemove(key, out _))
-                        TcpConnectClosed?.Invoke(key);
+                    bool removed = _tcpFlows.TryRemove(key, out _);
+                    DiagnosticLogger.Log("TRK", $"  tcpFlows.remove={removed} count={_tcpFlows.Count} key={key}");
+                    if (removed) TcpConnectClosed?.Invoke(key);
                 }
                 else if (proto == 17)
                 {

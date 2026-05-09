@@ -30,6 +30,7 @@ public sealed class TcpRelayServer : IDisposable
     {
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+        DiagnosticLogger.Log("RLY", $"TcpRelay listening on 127.0.0.1:{Port}");
         _acceptLoop = Task.Run(() => AcceptLoop(_cts.Token));
     }
 
@@ -41,9 +42,11 @@ public sealed class TcpRelayServer : IDisposable
             try
             {
                 client = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                IPEndPoint? rep = client.Client.RemoteEndPoint as IPEndPoint;
+                DiagnosticLogger.Log("RLY", $"Accepted from {rep}");
             }
-            catch (ObjectDisposedException) { return; }
-            catch (SocketException) { return; }
+            catch (ObjectDisposedException) { DiagnosticLogger.Log("RLY", "AcceptLoop disposed"); return; }
+            catch (SocketException ex) { DiagnosticLogger.Log("RLY", $"AcceptLoop SocketException: {ex.SocketErrorCode}"); return; }
 
             _ = Task.Run(() => HandleAsync(client, ct));
         }
@@ -54,6 +57,7 @@ public sealed class TcpRelayServer : IDisposable
         IPEndPoint? remote = client.Client.RemoteEndPoint as IPEndPoint;
         if (remote == null)
         {
+            DiagnosticLogger.Log("RLY", "Handle: remote==null, closing");
             client.Close();
             return;
         }
@@ -62,17 +66,21 @@ public sealed class TcpRelayServer : IDisposable
         NatEntry? entry = _nat.Find(protocol: 6, srcPort: (ushort)remote.Port);
         if (entry == null)
         {
+            DiagnosticLogger.Log("RLY", $"Handle: NAT miss for srcPort={remote.Port}, closing");
             client.Close();
             return;
         }
+        DiagnosticLogger.Log("RLY", $"Handle: matched srcPort={remote.Port} -> origDst={entry.OriginalDestinationAddress}:{entry.OriginalDestinationPort}");
 
         TcpClient upstream = new TcpClient();
         try
         {
             await upstream.ConnectAsync(entry.OriginalDestinationAddress, entry.OriginalDestinationPort).ConfigureAwait(false);
+            DiagnosticLogger.Log("RLY", $"Upstream connected to {entry.OriginalDestinationAddress}:{entry.OriginalDestinationPort}");
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLogger.Log("RLY", $"Upstream connect FAILED: {ex.GetType().Name}: {ex.Message}");
             client.Close();
             upstream.Close();
             return;
