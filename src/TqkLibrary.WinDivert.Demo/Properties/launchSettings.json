@@ -1,8 +1,12 @@
 {
   "profiles": {
-    "TqkLibrary.WinDivert.Demo": {
+    "test curl": {
       "commandName": "Project",
       "commandLineArgs": "launch curl.exe --args \"-sS --get https://lumtest.com/myip.json\" --protocol t"
+    },
+    "Attach RDCMan (running)": {
+      "commandName": "Project",
+      "commandLineArgs": "attach --process RDCMan --protocol t --exit-when-process-gone"
     }
   }
 }
