@@ -52,8 +52,9 @@ public sealed class PacketInterceptor : IDisposable
     {
         // IPv4 only in this scaffold; extending to IPv6 means duplicating the filter or using
         // ipv6 packet branch in the parser — the NAT logic itself is address-family-agnostic.
+        // `not impostor` avoids re-capturing packets we reinjected ourselves (prevents loops).
         string proto = BuildProtoFilter();
-        string filter = $"ip and ({proto})";
+        string filter = $"ip and ({proto}) and not impostor";
         _handle = WinDivertHandle.Open(
             filter,
             WinDivertLayer.Network,
@@ -70,6 +71,8 @@ public sealed class PacketInterceptor : IDisposable
         return "false";
     }
 
+    private enum ProcessResult { Pass, Modified, Drop }
+
     private void PumpLoop(CancellationToken ct)
     {
         byte[] buffer = new byte[65535];
@@ -79,35 +82,39 @@ public sealed class PacketInterceptor : IDisposable
             if (!_handle.TryRecv(buffer, out int length, out WinDivertAddress addr))
                 break;
 
-            bool modified = false;
+            ProcessResult result;
             try
             {
-                modified = Process(buffer, length, ref addr);
+                result = Process(buffer, length, ref addr);
             }
             catch
             {
-                // fall through: reinject unchanged
+                result = ProcessResult.Pass;
             }
 
-            if (modified)
+            if (result == ProcessResult.Drop)
+                continue;
+
+            if (result == ProcessResult.Modified)
                 _handle.CalcChecksums(buffer, length, ref addr);
 
             _handle.TrySend(buffer, length, ref addr);
         }
     }
 
-    private bool Process(byte[] buffer, int length, ref WinDivertAddress addr)
+    private ProcessResult Process(byte[] buffer, int length, ref WinDivertAddress addr)
     {
         ParsedPacket? p = PacketParser.TryParse(buffer, length);
-        if (p == null) return false;
-        if (!(p.IsTcp || p.IsUdp)) return false;
+        if (p == null) return ProcessResult.Pass;
+        if (!(p.IsTcp || p.IsUdp)) return ProcessResult.Pass;
 
         byte proto = (byte)p.Protocol;
         bool isTcp = p.IsTcp;
+        int expectedRelay = isTcp ? _tcpRelayPort : _udpRelayPort;
 
-        if (addr.Outbound)
+        // Case 1: egress from target process on a real interface → redirect to local relay.
+        if (addr.Outbound && !addr.Loopback)
         {
-            // Egress from target process (before rewrite, src is still process's real addr).
             IPAddress srcIp = p.Source;
             ushort srcPort = p.SourcePort;
             IPAddress dstIp = p.Destination;
@@ -117,37 +124,49 @@ public sealed class PacketInterceptor : IDisposable
                 ? _socketTracker.IsTrackedTcp(new FlowKey(proto, srcIp, srcPort, dstIp, dstPort))
                 : _socketTracker.IsTrackedUdp(srcIp, srcPort);
 
-            if (!tracked) return false;
+            if (!tracked) return ProcessResult.Pass;
 
-            // Record/refresh NAT entry (keyed by srcPort).
-            var entry = new NatEntry(_pid, proto, srcIp, srcPort, dstIp, dstPort);
+            // Store the real-interface IfIdx so the reply path can reinject on the same interface.
+            var entry = new NatEntry(_pid, proto, srcIp, srcPort, dstIp, dstPort, addr.Network.IfIdx, addr.Network.SubIfIdx);
             _nat.Upsert(entry);
 
-            int relayPort = isTcp ? _tcpRelayPort : _udpRelayPort;
             IPAddress loopback = p.IsIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
-
             p.SetSource(loopback, srcPort);
-            p.SetDestination(loopback, (ushort)relayPort);
-            return true;
+            p.SetDestination(loopback, (ushort)expectedRelay);
+
+            // Re-inject at the WFP OUTBOUND hook on the loopback interface. The kernel handles
+            // both halves of the loopback transmission and delivers the SYN to the relay's listener.
+            // Switching to Outbound=false here causes WFP to silently drop the packet (no listener match).
+            addr.Loopback = true;
+            addr.Network.IfIdx = 1;
+            addr.Network.SubIfIdx = 0;
+            return ProcessResult.Modified;
         }
-        else
+
+        // Case 2: relay listener's reply on loopback (src=loopback:relayPort, dst=loopback:origSrcPort).
+        if (addr.Loopback && p.SourcePort == expectedRelay)
         {
-            // Ingress side. We only care about the reply leg coming back from the relay on loopback:
-            // (src=loopback:relayPort, dst=loopback:sp). Everything else is left alone.
-            ushort srcPort = p.SourcePort;
             ushort dstPort = p.DestinationPort;
-
-            int expectedRelay = isTcp ? _tcpRelayPort : _udpRelayPort;
-            if (srcPort != expectedRelay) return false;
-
             NatEntry? entry = _nat.Find(proto, dstPort);
-            if (entry == null) return false;
+            if (entry == null) return ProcessResult.Pass;
 
-            // Rewrite so the target process sees packets as if from the original destination.
+            // Loopback packets are captured twice (sender outbound + receiver inbound). Handle on
+            // the outbound capture; the inbound duplicate would otherwise hit a nonexistent socket
+            // and produce a spurious RST, so drop it.
+            if (!addr.Outbound) return ProcessResult.Drop;
+
             p.SetSource(entry.OriginalDestinationAddress, entry.OriginalDestinationPort);
             p.SetDestination(entry.OriginalSourceAddress, entry.OriginalSourcePort);
-            return true;
+
+            // Reinject as inbound on the real interface the original socket lives on.
+            addr.Loopback = false;
+            addr.Outbound = false;
+            addr.Network.IfIdx = entry.IfIdx;
+            addr.Network.SubIfIdx = entry.SubIfIdx;
+            return ProcessResult.Modified;
         }
+
+        return ProcessResult.Pass;
     }
 
     public void Dispose()
