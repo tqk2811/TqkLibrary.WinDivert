@@ -7,6 +7,14 @@
     "Attach RDCMan (running)": {
       "commandName": "Project",
       "commandLineArgs": "attach --process RDCMan --protocol t --exit-when-process-gone"
+    },
+    "curl via HTTP proxy": {
+      "commandName": "Project",
+      "commandLineArgs": "proxy --proxy http://43.156.183.112:1080 --launch curl.exe --launch-args \"-sS --get https://lumtest.com/myip.json\""
+    },
+    "curl via SOCKS5 proxy": {
+      "commandName": "Project",
+      "commandLineArgs": "proxy --proxy socks5://127.0.0.1:1080 --launch curl.exe --launch-args \"-sS --get https://lumtest.com/myip.json\""
     }
   }
 }

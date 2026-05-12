@@ -18,6 +18,7 @@ internal static class Program
         {
             new AttachCommandHelper().Command,
             new LaunchCommandHelper().Command,
+            new ProxyCommandHelper().Command,
         };
         return root.Parse(args).InvokeAsync();
     }
