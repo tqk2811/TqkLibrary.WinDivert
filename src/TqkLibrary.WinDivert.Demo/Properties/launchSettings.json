@@ -15,6 +15,14 @@
     "curl via SOCKS5 proxy": {
       "commandName": "Project",
       "commandLineArgs": "proxy --proxy socks5://127.0.0.1:1080 --launch curl.exe --launch-args \"-sS --get https://lumtest.com/myip.json\""
+    },
+    "Self-host HTTP proxy + curl": {
+      "commandName": "Project",
+      "commandLineArgs": "selfhost --launch curl.exe --launch-args \"-sS --get https://lumtest.com/myip.json\""
+    },
+    "Self-host HTTP proxy (auth) + curl": {
+      "commandName": "Project",
+      "commandLineArgs": "selfhost --auth user:pass --launch curl.exe --launch-args \"-sS --get https://lumtest.com/myip.json\""
     }
   }
 }
