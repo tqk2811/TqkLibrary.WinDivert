@@ -14,6 +14,8 @@ internal sealed class AttachCommandHelper : ICommandHelper
     private readonly Option<bool> _waitOpt;
     private readonly Option<int> _waitTimeoutOpt;
     private readonly Option<bool> _exitWhenGoneOpt;
+    private readonly Option<bool> _suspendOnAttachOpt;
+    private readonly Option<bool> _followChildrenOpt;
 
     public Command Command => _command;
 
@@ -42,12 +44,22 @@ internal sealed class AttachCommandHelper : ICommandHelper
         {
             Description = "Exit automatically when target process terminates.",
         };
+        _suspendOnAttachOpt = new Option<bool>("--suspend-on-attach")
+        {
+            Description = "Freeze the running process until the tracker is ready, then resume. Eliminates the SYN-race leak. WARNING: a kernel-mode anti-cheat may flag the freeze.",
+        };
+        _followChildrenOpt = new Option<bool>("--follow-children")
+        {
+            Description = "Track every descendant process spawned by the target (polled every 500ms).",
+        };
 
         _command.Options.Add(_processOpt);
         _command.Options.Add(_protocolOpt);
         _command.Options.Add(_waitOpt);
         _command.Options.Add(_waitTimeoutOpt);
         _command.Options.Add(_exitWhenGoneOpt);
+        _command.Options.Add(_suspendOnAttachOpt);
+        _command.Options.Add(_followChildrenOpt);
 
         _command.SetAction(InvokeAsync);
     }
@@ -59,6 +71,8 @@ internal sealed class AttachCommandHelper : ICommandHelper
         bool wait = parseResult.GetValue(_waitOpt);
         int waitTimeout = parseResult.GetValue(_waitTimeoutOpt);
         bool exitWhenGone = parseResult.GetValue(_exitWhenGoneOpt);
+        bool suspendOnAttach = parseResult.GetValue(_suspendOnAttachOpt);
+        bool followChildren = parseResult.GetValue(_followChildrenOpt);
 
         RedirectProtocol? protocol = null;
         if (protocolText != null)
@@ -77,6 +91,27 @@ internal sealed class AttachCommandHelper : ICommandHelper
         RedirectProtocol proto = protocol ?? ProtocolParser.SelectInteractive();
         if (proto == RedirectProtocol.None) return 0;
 
-        return await RedirectorRunner.RunAsync(pid.Value, proto, exitWhenGone, suspended: null, ct).ConfigureAwait(false);
+        SuspendedProcessLauncher.SuspendedProcess? attachSuspended = null;
+        if (suspendOnAttach)
+        {
+            try
+            {
+                attachSuspended = SuspendedProcessLauncher.AttachSuspend(pid.Value);
+                Console.WriteLine($"Suspended running pid={pid} until tracker ready.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"--suspend-on-attach failed: {ex.Message}");
+                return 1;
+            }
+        }
+        try
+        {
+            return await RedirectorRunner.RunAsync(pid.Value, proto, exitWhenGone, attachSuspended, followChildren, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            attachSuspended?.Dispose();
+        }
     }
 }

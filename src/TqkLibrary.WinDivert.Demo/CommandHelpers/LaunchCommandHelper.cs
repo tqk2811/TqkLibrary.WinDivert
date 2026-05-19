@@ -67,7 +67,7 @@ internal sealed class LaunchCommandHelper : ICommandHelper
                 return 1;
             }
 
-            return await RedirectorRunner.RunAsync(suspended.Pid, proto.Value, exitWhenProcessGone: true, suspended, ct).ConfigureAwait(false);
+            return await RedirectorRunner.RunAsync(suspended.Pid, proto.Value, exitWhenProcessGone: true, suspended, followChildren: false, ct).ConfigureAwait(false);
         }
         finally
         {

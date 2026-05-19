@@ -2,6 +2,7 @@ using System;
 using System.CommandLine;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Interfaces;
 
 namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
@@ -16,6 +17,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
     private readonly Option<bool> _exitWhenGoneOpt;
     private readonly Option<string?> _launchExeOpt;
     private readonly Option<string?> _launchArgsOpt;
+    private readonly Option<bool> _suspendOnAttachOpt;
+    private readonly Option<bool> _followChildrenOpt;
 
     public Command Command => _command;
 
@@ -53,6 +56,14 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         {
             Description = "Command-line arguments for --launch.",
         };
+        _suspendOnAttachOpt = new Option<bool>("--suspend-on-attach")
+        {
+            Description = "Freeze the running process (NtSuspendProcess) until the tracker is ready, then resume. Eliminates the SYN-race leak when using --process. WARNING: a kernel-mode anti-cheat may flag the freeze.",
+        };
+        _followChildrenOpt = new Option<bool>("--follow-children")
+        {
+            Description = "Track every descendant process spawned by the target (polled every 500ms). Each child gets its own SocketTracker handle so its TCP/UDP traffic is redirected too.",
+        };
 
         _command.Options.Add(_proxyOpt);
         _command.Options.Add(_processOpt);
@@ -61,6 +72,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         _command.Options.Add(_exitWhenGoneOpt);
         _command.Options.Add(_launchExeOpt);
         _command.Options.Add(_launchArgsOpt);
+        _command.Options.Add(_suspendOnAttachOpt);
+        _command.Options.Add(_followChildrenOpt);
 
         _command.SetAction(InvokeAsync);
     }
@@ -74,6 +87,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         bool exitWhenGone = parseResult.GetValue(_exitWhenGoneOpt);
         string? launchExe = parseResult.GetValue(_launchExeOpt);
         string? launchArgs = parseResult.GetValue(_launchArgsOpt);
+        bool suspendOnAttach = parseResult.GetValue(_suspendOnAttachOpt);
+        bool followChildren = parseResult.GetValue(_followChildrenOpt);
 
         if (launchExe != null && processSelector != null)
         {
@@ -83,9 +98,12 @@ internal sealed class ProxyCommandHelper : ICommandHelper
 
         IProxySource proxySource;
         string proxyDisplay = MaskUserInfo(proxyUrl);
+        // Construct bridge once so the same instance services every tunnel for this run.
+        // Disposed implicitly when the process exits — no per-tunnel teardown needed.
+        ILoggerFactory loggerFactory = new ProxyLoggerBridge(minConsoleLevel: LogLevel.Warning);
         try
         {
-            proxySource = ProxyUriParser.Parse(proxyUrl);
+            proxySource = ProxyUriParser.Parse(proxyUrl, loggerFactory);
         }
         catch (Exception ex)
         {
@@ -113,6 +131,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
                     suspended.Pid, proxySource, proxyDisplay,
                     exitWhenProcessGone: true,
                     resumeBeforeRun: suspended,
+                    loggerFactory,
+                    followChildren,
                     ct).ConfigureAwait(false);
                 return rc;
             }
@@ -125,11 +145,34 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         uint? pid = await ProcessResolver.ResolveAsync(processSelector, wait, waitTimeout, ct).ConfigureAwait(false);
         if (pid == null) return 0;
 
-        return await ProxyRedirectorRunner.RunAsync(
-            pid.Value, proxySource, proxyDisplay,
-            exitWhenGone,
-            resumeBeforeRun: null,
-            ct).ConfigureAwait(false);
+        SuspendedProcessLauncher.SuspendedProcess? attachSuspended = null;
+        if (suspendOnAttach)
+        {
+            try
+            {
+                attachSuspended = SuspendedProcessLauncher.AttachSuspend(pid.Value);
+                Console.WriteLine($"Suspended running pid={pid} until tracker ready.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"--suspend-on-attach failed: {ex.Message}");
+                return 1;
+            }
+        }
+        try
+        {
+            return await ProxyRedirectorRunner.RunAsync(
+                pid.Value, proxySource, proxyDisplay,
+                exitWhenGone,
+                resumeBeforeRun: attachSuspended,
+                loggerFactory,
+                followChildren,
+                ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            attachSuspended?.Dispose();
+        }
     }
 
     private static string MaskUserInfo(string url)

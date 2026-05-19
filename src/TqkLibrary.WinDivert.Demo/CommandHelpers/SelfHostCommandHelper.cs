@@ -155,6 +155,8 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
                     suspended.Pid, clientSource, proxyDisplay,
                     exitWhenProcessGone: true,
                     resumeBeforeRun: suspended,
+                    loggerFactory: null,
+                    followChildren: false,
                     ct).ConfigureAwait(false);
             }
             finally
@@ -170,6 +172,8 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
             pid.Value, clientSource, proxyDisplay,
             exitWhenGone,
             resumeBeforeRun: null,
+            loggerFactory: null,
+            followChildren: false,
             ct).ConfigureAwait(false);
     }
 

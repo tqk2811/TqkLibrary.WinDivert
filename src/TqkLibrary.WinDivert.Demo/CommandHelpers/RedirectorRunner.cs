@@ -13,6 +13,7 @@ internal static class RedirectorRunner
         RedirectProtocol proto,
         bool exitWhenProcessGone,
         SuspendedProcessLauncher.SuspendedProcess? suspended,
+        bool followChildren,
         CancellationToken ct)
     {
         string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
@@ -58,6 +59,22 @@ internal static class RedirectorRunner
             return 1;
         }
 
+        ProcessTreeMonitor? treeMonitor = null;
+        if (followChildren)
+        {
+            treeMonitor = new ProcessTreeMonitor(pid);
+            treeMonitor.ChildSpawned += (childPid, parentPid) =>
+            {
+                Console.WriteLine($"  [child +  ] pid={childPid} parent={parentPid} -> tracking");
+                try { redirector.AddTrackedProcessId(childPid); }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  [child err] pid={childPid}: {ex.GetType().Name}: {ex.Message}");
+                }
+            };
+            treeMonitor.Start();
+        }
+
         if (suspended != null)
         {
             try
@@ -68,12 +85,14 @@ internal static class RedirectorRunner
             catch (Exception ex)
             {
                 Console.WriteLine("Failed to resume process: " + ex.Message);
+                treeMonitor?.Dispose();
                 return 1;
             }
         }
 
         Console.WriteLine();
         Console.WriteLine($"Redirecting pid={pid}. TCP relay port={redirector.TcpRelayPort}, UDP relay port={redirector.UdpRelayPort}.");
+        if (followChildren) Console.WriteLine("Child process capture: ENABLED.");
         Console.WriteLine("Press Ctrl+C to stop.");
 
         using var exitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -85,6 +104,7 @@ internal static class RedirectorRunner
         try { await Task.Delay(-1, exitCts.Token).ConfigureAwait(false); }
         catch (OperationCanceledException) { }
 
+        treeMonitor?.Dispose();
         Console.WriteLine("Stopping...");
         return 0;
     }

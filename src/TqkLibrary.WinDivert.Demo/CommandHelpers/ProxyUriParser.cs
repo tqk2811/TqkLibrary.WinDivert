@@ -1,5 +1,6 @@
 using System;
 using System.Net;
+using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Authentications;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.Proxy.ProxySources;
@@ -8,7 +9,10 @@ namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
 
 internal static class ProxyUriParser
 {
-    public static IProxySource Parse(string raw)
+    // loggerFactory is forwarded into each IProxySource so that BaseTunnel can create per-tunnel
+    // ILoggers. TqkLibrary.Proxy >= 1.0.0.8 dropped the global Singleton.LoggerFactory and switched
+    // to constructor injection, so passing null here silently disables all proxy-side logs.
+    public static IProxySource Parse(string raw, ILoggerFactory? loggerFactory = null)
     {
         if (string.IsNullOrWhiteSpace(raw))
             throw new ArgumentException("Proxy URL is empty.", nameof(raw));
@@ -23,7 +27,7 @@ internal static class ProxyUriParser
         {
             case "http":
             {
-                var source = new HttpProxySource(uri);
+                var source = new HttpProxySource(uri, loggerFactory);
                 if (user != null && pass != null)
                     source.HttpProxyAuthentication = new HttpProxyAuthentication(user, pass);
                 return source;
@@ -32,15 +36,15 @@ internal static class ProxyUriParser
             case "socks4a":
             {
                 IPEndPoint ep = ResolveEndpoint(uri);
-                return new Socks4ProxySource(ep, user) { IsUseSocks4A = scheme == "socks4a" };
+                return new Socks4ProxySource(ep, user, loggerFactory) { IsUseSocks4A = scheme == "socks4a" };
             }
             case "socks5":
             case "socks":
             {
                 IPEndPoint ep = ResolveEndpoint(uri);
                 if (user != null && pass != null)
-                    return new Socks5ProxySource(ep, new HttpProxyAuthentication(user, pass));
-                return new Socks5ProxySource(ep);
+                    return new Socks5ProxySource(ep, new HttpProxyAuthentication(user, pass), loggerFactory);
+                return new Socks5ProxySource(ep, loggerFactory);
             }
             default:
                 throw new NotSupportedException($"Unsupported proxy scheme '{scheme}'. Use http, socks4, socks4a, or socks5.");
