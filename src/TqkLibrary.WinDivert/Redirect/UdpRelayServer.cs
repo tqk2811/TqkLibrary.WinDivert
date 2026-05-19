@@ -74,6 +74,16 @@ public sealed class UdpRelayServer : IDisposable
         }
     }
 
+    // Send a UDP payload to the target process as if it originated from the original destination.
+    // The packet is emitted FROM the relay listener (so its source = the relay port the
+    // PacketInterceptor recognises in case-2), TO 127.0.0.1:<originalClientPort>. The interceptor
+    // then rewrites src=relay->origDst and dst=loopback->origSrc and reinjects on the real interface.
+    public Task InjectReplyToProcessAsync(ushort processClientPort, byte[] payload)
+    {
+        if (payload is null) throw new ArgumentNullException(nameof(payload));
+        return _listener.SendAsync(payload, payload.Length, new IPEndPoint(IPAddress.Loopback, processClientPort));
+    }
+
     public void Dispose()
     {
         try { _cts.Cancel(); } catch { }

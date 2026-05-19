@@ -38,4 +38,10 @@ public sealed class RedirectOptions
     // If set, every captured packet, redirect, NAT entry, and socket event is appended to this
     // file with a UTC timestamp. Null disables diagnostic logging (no overhead).
     public string? LogFilePath { get; set; }
+
+    // When true, opens a parallel WinDivert handle that drops IPv6 TCP/UDP traffic belonging
+    // to the target process. The interceptor itself is IPv4-only, so without this any AAAA-
+    // resolved connection would emit through the kernel direct and leak the real IPv6 address.
+    // Non-target IPv6 traffic is re-injected unchanged.
+    public bool BlockIpv6 { get; set; } = true;
 }

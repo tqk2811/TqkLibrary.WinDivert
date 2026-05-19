@@ -146,9 +146,21 @@ public sealed class PacketInterceptor : IDisposable
             IPAddress dstIp = p.Destination;
             ushort dstPort = p.DestinationPort;
 
+            FlowKey tcpKey = isTcp ? new FlowKey(proto, srcIp, srcPort, dstIp, dstPort) : default;
             bool tracked = isTcp
-                ? _socketTracker.IsTrackedTcp(new FlowKey(proto, srcIp, srcPort, dstIp, dstPort))
+                ? _socketTracker.IsTrackedTcp(tcpKey)
                 : _socketTracker.IsTrackedUdp(srcIp, srcPort);
+
+            // Race fallback: kernel may emit the SYN to the Network layer before the SOCKET-layer
+            // pump has added the FlowKey. Refresh from the kernel TCP/UDP table (throttled) and recheck.
+            if (!tracked && _socketTracker.TryReconcileFromKernel(out _, out _))
+            {
+                tracked = isTcp
+                    ? _socketTracker.IsTrackedTcp(tcpKey)
+                    : _socketTracker.IsTrackedUdp(srcIp, srcPort);
+                if (tracked)
+                    DiagnosticLogger.Log("INT", "  egress reconciled from kernel table");
+            }
 
             DiagnosticLogger.Log("INT", $"  egress tracked={tracked} tcpFlows={_socketTracker.TcpSnapshot.Count} natCount={_nat.Count}");
             if (!tracked) return ProcessResult.Pass;

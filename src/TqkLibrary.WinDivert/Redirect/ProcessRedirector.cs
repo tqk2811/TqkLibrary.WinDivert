@@ -17,11 +17,34 @@ public sealed class ProcessRedirector : IDisposable
     private TcpRelayServer? _tcpRelay;
     private UdpRelayServer? _udpRelay;
     private PacketInterceptor? _interceptor;
+    private Ipv6Blocker? _ipv6Blocker;
     private readonly NatTable _nat = new();
 
     public NatTable Nat => _nat;
     public int TcpRelayPort => _tcpRelay?.Port ?? 0;
     public int UdpRelayPort => _udpRelay?.Port ?? 0;
+
+    /// <summary>
+    /// Inject a UDP datagram back to the target process as if it came from the original
+    /// destination. Used by handlers that take over UDP forwarding (e.g. SOCKS5 UDP ASSOCIATE)
+    /// and need to deliver replies the relay's default upstream socket never sees.
+    /// </summary>
+    public Task InjectUdpReplyToProcessAsync(ushort processClientPort, byte[] payload)
+    {
+        if (_udpRelay is null) throw new InvalidOperationException("UDP redirect is not enabled");
+        return _udpRelay.InjectReplyToProcessAsync(processClientPort, payload);
+    }
+
+    /// <summary>
+    /// Add an additional process id to the redirect scope. Used by external tree monitors to
+    /// pull child processes into the same SocketTracker so their TCP/UDP traffic is captured
+    /// just like the root target's. Idempotent — adding the same pid twice is a no-op.
+    /// </summary>
+    public void AddTrackedProcessId(uint pid)
+    {
+        if (_tracker is null) throw new InvalidOperationException("Redirector not started");
+        _tracker.AddProcess(pid);
+    }
 
     public event Action<FlowKey>? TcpConnectEstablished;
     public event Action<FlowKey>? TcpConnectClosed;
@@ -61,11 +84,18 @@ public sealed class ProcessRedirector : IDisposable
 
         _interceptor = new PacketInterceptor(_tracker, _nat, _options.ProcessId, tcpPort, udpPort, _options.Protocols);
         _interceptor.Start(_options.NetworkPriority);
+
+        if (_options.BlockIpv6)
+        {
+            _ipv6Blocker = new Ipv6Blocker(_tracker);
+            _ipv6Blocker.Start(_options.NetworkPriority);
+        }
     }
 
     public void Dispose()
     {
         DiagnosticLogger.Log("RDR", "Dispose");
+        _ipv6Blocker?.Dispose();
         _interceptor?.Dispose();
         _tcpRelay?.Dispose();
         _udpRelay?.Dispose();
