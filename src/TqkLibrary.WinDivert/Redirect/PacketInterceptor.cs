@@ -33,6 +33,7 @@ public sealed class PacketInterceptor : IDisposable
     // null = redirect every destination port; non-null = whitelist (only ports in the set are
     // NAT-redirected, all others pass through to their real destination).
     private readonly HashSet<ushort>? _dstPortFilter;
+    private readonly DnsCacheLookup? _dnsLookup;
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _pumpTask;
@@ -45,7 +46,8 @@ public sealed class PacketInterceptor : IDisposable
         int tcpRelayPort,
         int udpRelayPort,
         RedirectProtocol protocols,
-        IReadOnlyCollection<ushort>? destinationPortFilter = null)
+        IReadOnlyCollection<ushort>? destinationPortFilter = null,
+        DnsCacheLookup? dnsLookup = null)
     {
         _socketTracker = socketTracker;
         _nat = nat;
@@ -56,6 +58,7 @@ public sealed class PacketInterceptor : IDisposable
         _dstPortFilter = (destinationPortFilter != null && destinationPortFilter.Count > 0)
             ? new HashSet<ushort>(destinationPortFilter)
             : null;
+        _dnsLookup = dnsLookup;
     }
 
     public void Start(short priority)
@@ -189,7 +192,9 @@ public sealed class PacketInterceptor : IDisposable
             // Store the real-interface IfIdx so the reply path can reinject on the same interface.
             var entry = new NatEntry(_pid, proto, srcIp, srcPort, dstIp, dstPort, addr.Network.IfIdx, addr.Network.SubIfIdx);
             _nat.Upsert(entry);
-            DiagnosticLogger.Log("INT", $"  nat.upsert {(isTcp ? "tcp" : "udp")} srcPort={srcPort} -> origDst={dstIp}:{dstPort} ifIdx={addr.Network.IfIdx}");
+            string? dnsName = _dnsLookup?.Resolve(dstIp);
+            string dnsTag = dnsName != null ? $" name={dnsName}" : "";
+            DiagnosticLogger.Log("INT", $"  nat.upsert {(isTcp ? "tcp" : "udp")} srcPort={srcPort} -> origDst={dstIp}:{dstPort}{dnsTag} ifIdx={addr.Network.IfIdx}");
 
             IPAddress loopback = p.IsIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
             p.SetSource(loopback, srcPort);

@@ -18,11 +18,13 @@ public sealed class ProcessRedirector : IDisposable
     private UdpRelayServer? _udpRelay;
     private PacketInterceptor? _interceptor;
     private Ipv6Blocker? _ipv6Blocker;
+    private DnsCacheLookup? _dnsLookup;
     private readonly NatTable _nat = new();
 
     public NatTable Nat => _nat;
     public int TcpRelayPort => _tcpRelay?.Port ?? 0;
     public int UdpRelayPort => _udpRelay?.Port ?? 0;
+    public DnsCacheLookup? DnsLookup => _dnsLookup;
 
     /// <summary>
     /// Inject a UDP datagram back to the target process as if it came from the original
@@ -82,7 +84,14 @@ public sealed class ProcessRedirector : IDisposable
 
         DiagnosticLogger.Log("RDR", $"Relay ports tcp={tcpPort} udp={udpPort}");
 
-        _interceptor = new PacketInterceptor(_tracker, _nat, _options.ProcessId, tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts);
+        if (_options.EnableDnsLookup)
+        {
+            _dnsLookup = new DnsCacheLookup();
+            _dnsLookup.Start();
+            DiagnosticLogger.Log("RDR", "DNS cache lookup ENABLED");
+        }
+
+        _interceptor = new PacketInterceptor(_tracker, _nat, _options.ProcessId, tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts, _dnsLookup);
         _interceptor.Start(_options.NetworkPriority);
 
         if (_options.BlockIpv6)
@@ -100,6 +109,7 @@ public sealed class ProcessRedirector : IDisposable
         _tcpRelay?.Dispose();
         _udpRelay?.Dispose();
         _tracker?.Dispose();
+        _dnsLookup?.Dispose();
         DiagnosticLogger.Close();
     }
 }

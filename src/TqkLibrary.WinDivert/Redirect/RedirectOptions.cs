@@ -52,4 +52,10 @@ public sealed class RedirectOptions
     // reach the original destination directly — they DO NOT go through the proxy and DO NOT
     // get IP-leak protection. Applies to whatever protocols are enabled via Protocols.
     public IReadOnlyCollection<ushort>? RedirectDestinationPorts { get; set; }
+
+    // When true, a background task periodically reads the Windows DNS Client Service cache
+    // (`ipconfig /displaydns`) so log lines and console events can annotate destination IPs
+    // with their resolved domain names. Names accumulate within the redirector's lifetime, so
+    // a name once seen for an IP keeps resolving even after the OS DNS cache evicts it.
+    public bool EnableDnsLookup { get; set; } = true;
 }

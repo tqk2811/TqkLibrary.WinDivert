@@ -19,6 +19,7 @@ internal static class ProxyRedirectorRunner
         ILoggerFactory? loggerFactory,
         bool followChildren,
         ushort[]? redirectDestinationPorts,
+        bool enableDnsLookup,
         CancellationToken ct)
     {
         string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
@@ -34,17 +35,22 @@ internal static class ProxyRedirectorRunner
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; exitCts.Cancel(); };
 
         UdpProxyForwarder? udpForwarder = null;
+        // Captured by handler lambdas below; assigned just after construction so the handlers can
+        // call into the redirector (e.g. DnsLookup.Resolve) without a circular constructor dep.
+        ProcessRedirector? redirectorRef = null;
         var opts = new RedirectOptions
         {
             ProcessId = pid,
             Protocols = RedirectProtocol.All,
             LogFilePath = logPath,
-            TcpConnectionHandler = (conn, innerCt) => HandleTcpAsync(conn, proxySource, loggerFactory, innerCt),
-            UdpDatagramHandler = (dg, innerCt) => udpForwarder?.OnDatagram(dg, innerCt) ?? DropUdpDatagram(dg, innerCt),
+            TcpConnectionHandler = (conn, innerCt) => HandleTcpAsync(conn, proxySource, loggerFactory, redirectorRef, innerCt),
+            UdpDatagramHandler = (dg, innerCt) => udpForwarder?.OnDatagram(dg, innerCt) ?? DropUdpDatagram(dg, redirectorRef, innerCt),
             RedirectDestinationPorts = redirectDestinationPorts,
+            EnableDnsLookup = enableDnsLookup,
         };
 
         using var redirector = new ProcessRedirector(opts);
+        redirectorRef = redirector;
         redirector.TcpConnectEstablished += k => Console.WriteLine($"  [track +  ] {k}");
         redirector.TcpConnectClosed += k => Console.WriteLine($"  [track -  ] {k}");
 
@@ -138,16 +144,24 @@ internal static class ProxyRedirectorRunner
     // Returning null tells UdpRelayServer to skip the upstream direct send — without this the
     // datagram would leak the real client IP. Used both when the proxy refuses UDP ASSOCIATE
     // and when the proxy doesn't advertise UDP support at all.
-    private static byte[]? DropUdpDatagram(RedirectedUdpDatagram dg, CancellationToken ct)
+    private static byte[]? DropUdpDatagram(RedirectedUdpDatagram dg, ProcessRedirector? redirector, CancellationToken ct)
     {
-        Console.WriteLine($"  [UDP DROP ] pid={dg.ProcessId} {dg.OriginalSource} -> {dg.OriginalDestination} ({dg.Payload.Length} bytes)");
+        string dst = FormatEndpoint(dg.OriginalDestination, redirector);
+        Console.WriteLine($"  [UDP DROP ] pid={dg.ProcessId} {dg.OriginalSource} -> {dst} ({dg.Payload.Length} bytes)");
         return null;
     }
 
-    private static async Task HandleTcpAsync(RedirectedTcpConnection conn, IProxySource proxySource, ILoggerFactory? loggerFactory, CancellationToken ct)
+    private static string FormatEndpoint(System.Net.IPEndPoint ep, ProcessRedirector? redirector)
+    {
+        string? name = redirector?.DnsLookup?.Resolve(ep.Address);
+        return name != null ? $"{ep} [{name}]" : ep.ToString();
+    }
+
+    private static async Task HandleTcpAsync(RedirectedTcpConnection conn, IProxySource proxySource, ILoggerFactory? loggerFactory, ProcessRedirector? redirector, CancellationToken ct)
     {
         Guid tunnelId = Guid.NewGuid();
-        Console.WriteLine($"  [TCP open ] {tunnelId:N} pid={conn.ProcessId} {conn.OriginalSource} -> {conn.OriginalDestination} (via proxy)");
+        string dstLabel = FormatEndpoint(conn.OriginalDestination, redirector);
+        Console.WriteLine($"  [TCP open ] {tunnelId:N} pid={conn.ProcessId} {conn.OriginalSource} -> {dstLabel} (via proxy)");
         IConnectSource? tunnel = null;
         try
         {
@@ -164,13 +178,13 @@ internal static class ProxyRedirectorRunner
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"  [proxy err] {tunnelId:N} {conn.OriginalDestination}: {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine($"  [proxy err] {tunnelId:N} {dstLabel}: {ex.GetType().Name}: {ex.Message}");
             loggerFactory?.CreateLogger("TcpRelay")?.LogError(ex, "tunnel setup failed {TunnelId} -> {Target}", tunnelId, conn.OriginalDestination);
         }
         finally
         {
             try { tunnel?.Dispose(); } catch { }
-            Console.WriteLine($"  [TCP close] {tunnelId:N} {conn.OriginalSource} -> {conn.OriginalDestination}");
+            Console.WriteLine($"  [TCP close] {tunnelId:N} {conn.OriginalSource} -> {dstLabel}");
         }
     }
 

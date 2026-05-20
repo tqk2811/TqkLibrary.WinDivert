@@ -21,6 +21,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
     private readonly Option<bool> _suspendOnAttachOpt;
     private readonly Option<bool> _followChildrenOpt;
     private readonly Option<string?> _redirectPortsOpt;
+    private readonly Option<bool> _noDnsResolveOpt;
 
     public Command Command => _command;
 
@@ -70,6 +71,10 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         {
             Description = "Comma-separated destination port whitelist (e.g. \"443\" or \"443,8080\"). When set, only outbound traffic to these ports is routed via the proxy; other ports flow direct to their real destination (NOT proxied, NOT IP-leak protected). Omit to redirect every port (default).",
         };
+        _noDnsResolveOpt = new Option<bool>("--no-dns-resolve")
+        {
+            Description = "Disable IP -> domain name annotation in logs and console output (which reads `ipconfig /displaydns` every 15s in the background).",
+        };
 
         _command.Options.Add(_proxyOpt);
         _command.Options.Add(_processOpt);
@@ -81,6 +86,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         _command.Options.Add(_suspendOnAttachOpt);
         _command.Options.Add(_followChildrenOpt);
         _command.Options.Add(_redirectPortsOpt);
+        _command.Options.Add(_noDnsResolveOpt);
 
         _command.SetAction(InvokeAsync);
     }
@@ -97,6 +103,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         bool suspendOnAttach = parseResult.GetValue(_suspendOnAttachOpt);
         bool followChildren = parseResult.GetValue(_followChildrenOpt);
         string? redirectPortsRaw = parseResult.GetValue(_redirectPortsOpt);
+        bool noDnsResolve = parseResult.GetValue(_noDnsResolveOpt);
 
         if (launchExe != null && processSelector != null)
         {
@@ -161,6 +168,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
                     loggerFactory,
                     followChildren,
                     redirectPorts,
+                    enableDnsLookup: !noDnsResolve,
                     ct).ConfigureAwait(false);
                 return rc;
             }
@@ -196,6 +204,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
                 loggerFactory,
                 followChildren,
                 redirectPorts,
+                enableDnsLookup: !noDnsResolve,
                 ct).ConfigureAwait(false);
         }
         finally
