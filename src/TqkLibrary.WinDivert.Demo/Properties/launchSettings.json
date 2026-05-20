@@ -26,11 +26,15 @@
     },
     "BlueArchive attach": {
       "commandName": "Project",
-      "commandLineArgs": "proxy --proxy socks5://51.79.177.162:1010 --process BlueArchive --wait --exit-when-process-gone --follow-children"
+      "commandLineArgs": "proxy --proxy http://138.2.78.251:8100 --process BlueArchive --wait --exit-when-process-gone --follow-children"
+    },
+    "BlueArchive attach (443 only)": {
+      "commandName": "Project",
+      "commandLineArgs": "proxy --proxy http://138.2.78.251:8100 --process BlueArchive --wait --exit-when-process-gone --follow-children --redirect-ports 443"
     },
     "BlueArchive attach suspend": {
       "commandName": "Project",
-      "commandLineArgs": "proxy --proxy http://161.117.86.53:8100 --process BlueArchive --wait --exit-when-process-gone --suspend-on-attach --follow-children"
+      "commandLineArgs": "proxy --proxy http://138.2.78.251:8100 --process BlueArchive --wait --exit-when-process-gone --suspend-on-attach --follow-children"
     },
     "BlueArchive launch": {
       "commandName": "Project",

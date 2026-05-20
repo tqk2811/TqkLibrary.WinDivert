@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -44,4 +45,11 @@ public sealed class RedirectOptions
     // resolved connection would emit through the kernel direct and leak the real IPv6 address.
     // Non-target IPv6 traffic is re-injected unchanged.
     public bool BlockIpv6 { get; set; } = true;
+
+    // If null or empty, every destination port of the tracked process is NAT-redirected to the
+    // local relay (current default). When set, only outbound packets whose destination port is
+    // in this collection are redirected; other ports pass through the kernel unchanged and
+    // reach the original destination directly — they DO NOT go through the proxy and DO NOT
+    // get IP-leak protection. Applies to whatever protocols are enabled via Protocols.
+    public IReadOnlyCollection<ushort>? RedirectDestinationPorts { get; set; }
 }

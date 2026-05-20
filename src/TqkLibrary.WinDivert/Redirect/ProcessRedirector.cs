@@ -82,7 +82,7 @@ public sealed class ProcessRedirector : IDisposable
 
         DiagnosticLogger.Log("RDR", $"Relay ports tcp={tcpPort} udp={udpPort}");
 
-        _interceptor = new PacketInterceptor(_tracker, _nat, _options.ProcessId, tcpPort, udpPort, _options.Protocols);
+        _interceptor = new PacketInterceptor(_tracker, _nat, _options.ProcessId, tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts);
         _interceptor.Start(_options.NetworkPriority);
 
         if (_options.BlockIpv6)

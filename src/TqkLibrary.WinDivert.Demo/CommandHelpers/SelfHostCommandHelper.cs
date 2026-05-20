@@ -157,6 +157,7 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
                     resumeBeforeRun: suspended,
                     loggerFactory: null,
                     followChildren: false,
+                    redirectDestinationPorts: null,
                     ct).ConfigureAwait(false);
             }
             finally
@@ -174,6 +175,7 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
             resumeBeforeRun: null,
             loggerFactory: null,
             followChildren: false,
+            redirectDestinationPorts: null,
             ct).ConfigureAwait(false);
     }
 

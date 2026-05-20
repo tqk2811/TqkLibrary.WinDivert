@@ -1,5 +1,6 @@
 using System;
 using System.CommandLine;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -19,6 +20,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
     private readonly Option<string?> _launchArgsOpt;
     private readonly Option<bool> _suspendOnAttachOpt;
     private readonly Option<bool> _followChildrenOpt;
+    private readonly Option<string?> _redirectPortsOpt;
 
     public Command Command => _command;
 
@@ -64,6 +66,10 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         {
             Description = "Track every descendant process spawned by the target (polled every 500ms). Each child gets its own SocketTracker handle so its TCP/UDP traffic is redirected too.",
         };
+        _redirectPortsOpt = new Option<string?>("--redirect-ports")
+        {
+            Description = "Comma-separated destination port whitelist (e.g. \"443\" or \"443,8080\"). When set, only outbound traffic to these ports is routed via the proxy; other ports flow direct to their real destination (NOT proxied, NOT IP-leak protected). Omit to redirect every port (default).",
+        };
 
         _command.Options.Add(_proxyOpt);
         _command.Options.Add(_processOpt);
@@ -74,6 +80,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         _command.Options.Add(_launchArgsOpt);
         _command.Options.Add(_suspendOnAttachOpt);
         _command.Options.Add(_followChildrenOpt);
+        _command.Options.Add(_redirectPortsOpt);
 
         _command.SetAction(InvokeAsync);
     }
@@ -89,11 +96,31 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         string? launchArgs = parseResult.GetValue(_launchArgsOpt);
         bool suspendOnAttach = parseResult.GetValue(_suspendOnAttachOpt);
         bool followChildren = parseResult.GetValue(_followChildrenOpt);
+        string? redirectPortsRaw = parseResult.GetValue(_redirectPortsOpt);
 
         if (launchExe != null && processSelector != null)
         {
             Console.WriteLine("--launch and --process are mutually exclusive.");
             return 2;
+        }
+
+        ushort[]? redirectPorts = null;
+        if (!string.IsNullOrWhiteSpace(redirectPortsRaw))
+        {
+            try
+            {
+                redirectPorts = redirectPortsRaw!
+                    .Split(new[] { ',', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(s => ushort.Parse(s.Trim()))
+                    .Distinct()
+                    .ToArray();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to parse --redirect-ports '{redirectPortsRaw}': {ex.Message}");
+                return 2;
+            }
+            if (redirectPorts.Length == 0) redirectPorts = null;
         }
 
         IProxySource proxySource;
@@ -133,6 +160,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
                     resumeBeforeRun: suspended,
                     loggerFactory,
                     followChildren,
+                    redirectPorts,
                     ct).ConfigureAwait(false);
                 return rc;
             }
@@ -167,6 +195,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
                 resumeBeforeRun: attachSuspended,
                 loggerFactory,
                 followChildren,
+                redirectPorts,
                 ct).ConfigureAwait(false);
         }
         finally

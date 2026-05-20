@@ -18,6 +18,7 @@ internal static class ProxyRedirectorRunner
         SuspendedProcessLauncher.SuspendedProcess? resumeBeforeRun,
         ILoggerFactory? loggerFactory,
         bool followChildren,
+        ushort[]? redirectDestinationPorts,
         CancellationToken ct)
     {
         string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
@@ -40,6 +41,7 @@ internal static class ProxyRedirectorRunner
             LogFilePath = logPath,
             TcpConnectionHandler = (conn, innerCt) => HandleTcpAsync(conn, proxySource, loggerFactory, innerCt),
             UdpDatagramHandler = (dg, innerCt) => udpForwarder?.OnDatagram(dg, innerCt) ?? DropUdpDatagram(dg, innerCt),
+            RedirectDestinationPorts = redirectDestinationPorts,
         };
 
         using var redirector = new ProcessRedirector(opts);
@@ -111,8 +113,12 @@ internal static class ProxyRedirectorRunner
             }
         }
 
+        string portFilterDesc = redirectDestinationPorts == null || redirectDestinationPorts.Length == 0
+            ? "ALL ports"
+            : "dst ports {" + string.Join(",", redirectDestinationPorts) + "} (other ports go DIRECT, no proxy)";
         Console.WriteLine();
         Console.WriteLine($"Redirecting pid={pid}: TCP -> {proxyDisplay} (relay={redirector.TcpRelayPort}); UDP -> {udpMode}.");
+        Console.WriteLine($"Port filter: {portFilterDesc}.");
         Console.WriteLine("IPv6 of target: BLOCKED (interceptor is IPv4-only; v6 traffic would otherwise leak direct).");
         if (followChildren) Console.WriteLine($"Child process capture: ENABLED (polling every 500ms).");
         Console.WriteLine("Press Ctrl+C to stop.");

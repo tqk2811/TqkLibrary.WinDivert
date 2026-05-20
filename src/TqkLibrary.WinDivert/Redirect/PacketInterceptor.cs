@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -28,6 +30,9 @@ public sealed class PacketInterceptor : IDisposable
     private readonly int _tcpRelayPort;
     private readonly int _udpRelayPort;
     private readonly RedirectProtocol _protocols;
+    // null = redirect every destination port; non-null = whitelist (only ports in the set are
+    // NAT-redirected, all others pass through to their real destination).
+    private readonly HashSet<ushort>? _dstPortFilter;
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _pumpTask;
@@ -39,7 +44,8 @@ public sealed class PacketInterceptor : IDisposable
         uint processId,
         int tcpRelayPort,
         int udpRelayPort,
-        RedirectProtocol protocols)
+        RedirectProtocol protocols,
+        IReadOnlyCollection<ushort>? destinationPortFilter = null)
     {
         _socketTracker = socketTracker;
         _nat = nat;
@@ -47,6 +53,9 @@ public sealed class PacketInterceptor : IDisposable
         _tcpRelayPort = tcpRelayPort;
         _udpRelayPort = udpRelayPort;
         _protocols = protocols;
+        _dstPortFilter = (destinationPortFilter != null && destinationPortFilter.Count > 0)
+            ? new HashSet<ushort>(destinationPortFilter)
+            : null;
     }
 
     public void Start(short priority)
@@ -56,7 +65,10 @@ public sealed class PacketInterceptor : IDisposable
         // `not impostor` avoids re-capturing packets we reinjected ourselves (prevents loops).
         string proto = BuildProtoFilter();
         string filter = $"ip and ({proto}) and not impostor";
-        DiagnosticLogger.Log("INT", $"Open filter=\"{filter}\" priority={priority} tcpRelay={_tcpRelayPort} udpRelay={_udpRelayPort} pid={_pid}");
+        string filterDesc = _dstPortFilter == null
+            ? "all"
+            : string.Join(",", _dstPortFilter.OrderBy(p => p));
+        DiagnosticLogger.Log("INT", $"Open filter=\"{filter}\" priority={priority} tcpRelay={_tcpRelayPort} udpRelay={_udpRelayPort} pid={_pid} dstPortFilter={filterDesc}");
         _handle = WinDivertHandle.Open(
             filter,
             WinDivertLayer.Network,
@@ -164,6 +176,15 @@ public sealed class PacketInterceptor : IDisposable
 
             DiagnosticLogger.Log("INT", $"  egress tracked={tracked} tcpFlows={_socketTracker.TcpSnapshot.Count} natCount={_nat.Count}");
             if (!tracked) return ProcessResult.Pass;
+
+            // Destination-port whitelist: tracked packets whose dstPort is outside the configured
+            // set bypass NAT entirely and flow straight to the original destination. This means
+            // they DO NOT traverse the relay/proxy — caller opts into this trade-off explicitly.
+            if (_dstPortFilter != null && !_dstPortFilter.Contains(dstPort))
+            {
+                DiagnosticLogger.Log("INT", $"  -> SKIP redirect, dstPort={dstPort} not in filter (passthrough)");
+                return ProcessResult.Pass;
+            }
 
             // Store the real-interface IfIdx so the reply path can reinject on the same interface.
             var entry = new NatEntry(_pid, proto, srcIp, srcPort, dstIp, dstPort, addr.Network.IfIdx, addr.Network.SubIfIdx);
