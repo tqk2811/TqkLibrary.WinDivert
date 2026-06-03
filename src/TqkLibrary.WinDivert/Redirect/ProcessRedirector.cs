@@ -1,5 +1,7 @@
 using System;
 using TqkLibrary.WinDivert.Flow;
+using TqkLibrary.WinDivert.Native;
+using TqkLibrary.WinDivert.Pipeline;
 
 namespace TqkLibrary.WinDivert.Redirect;
 
@@ -7,7 +9,9 @@ namespace TqkLibrary.WinDivert.Redirect;
 //   1) SocketTracker — SOCKET-layer handle scoped to the target PID
 //   2) TcpRelayServer / UdpRelayServer — local loopback listeners
 //   3) NatTable — shared translation state
-//   4) PacketInterceptor — NETWORK-layer handle that rewrites headers
+//   4) PacketPump (NETWORK-layer handles) running middleware pipelines that rewrite/drop packets:
+//        - IPv4 pump: NatRedirectMiddleware (+ user/DNS/UDP-block middlewares)
+//        - IPv6 pump: Ipv6BlockMiddleware (when BlockIpv6)
 //
 // Lifetime: construct, call Start(), use, then Dispose().
 public sealed class ProcessRedirector : IDisposable
@@ -16,8 +20,8 @@ public sealed class ProcessRedirector : IDisposable
     private SocketTracker? _tracker;
     private TcpRelayServer? _tcpRelay;
     private UdpRelayServer? _udpRelay;
-    private PacketInterceptor? _interceptor;
-    private Ipv6Blocker? _ipv6Blocker;
+    private PacketPump? _ipv4Pump;
+    private PacketPump? _ipv6Pump;
     private DnsCacheLookup? _dnsLookup;
     private readonly NatTable _nat = new();
 
@@ -91,21 +95,52 @@ public sealed class ProcessRedirector : IDisposable
             DiagnosticLogger.Log("RDR", "DNS cache lookup ENABLED");
         }
 
-        _interceptor = new PacketInterceptor(_tracker, _nat, _options.ProcessId, tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts, _dnsLookup);
-        _interceptor.Start(_options.NetworkPriority);
+        // ---- IPv4 NETWORK pipeline: NAT redirect + any user-supplied middlewares ----
+        // `not impostor` avoids re-capturing packets we reinjected ourselves (prevents loops).
+        string proto = BuildProtoFilter(_options.Protocols);
+        string v4Filter = $"ip and ({proto}) and not impostor";
+        string filterDesc = (_options.RedirectDestinationPorts == null || _options.RedirectDestinationPorts.Count == 0)
+            ? "all"
+            : string.Join(",", _options.RedirectDestinationPorts);
+        DiagnosticLogger.Log("INT", $"Open filter=\"{v4Filter}\" priority={_options.NetworkPriority} tcpRelay={tcpPort} udpRelay={udpPort} pid={_options.ProcessId} dstPortFilter={filterDesc}");
+        WinDivertHandle v4Handle = WinDivertHandle.Open(v4Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
 
+        var v4Builder = new PacketPipelineBuilder();
+        // NAT must run first so it can claim the egress/reply legs before anything else.
+        v4Builder.Use(new NatRedirectMiddleware(tcpPort, udpPort, _options.RedirectDestinationPorts));
+        // Let callers insert their own middlewares (composable pipeline).
+        _options.ConfigureNetworkPipeline?.Invoke(v4Builder);
+
+        _ipv4Pump = new PacketPump("INT", v4Handle, v4Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup);
+        _ipv4Pump.Start();
+
+        // ---- IPv6 NETWORK pipeline: drop the target's IPv6 (the IPv4 pump is v4-only, so v6
+        // would otherwise leak the real address). Non-target v6 traffic is passed through. ----
         if (_options.BlockIpv6)
         {
-            _ipv6Blocker = new Ipv6Blocker(_tracker);
-            _ipv6Blocker.Start(_options.NetworkPriority);
+            string v6Filter = "ipv6 and (tcp or udp) and not impostor";
+            DiagnosticLogger.Log("V6X", $"Open filter=\"{v6Filter}\" priority={_options.NetworkPriority}");
+            WinDivertHandle v6Handle = WinDivertHandle.Open(v6Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
+            var v6Builder = new PacketPipelineBuilder();
+            v6Builder.Use(new Ipv6BlockMiddleware());
+            _ipv6Pump = new PacketPump("V6X", v6Handle, v6Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup);
+            _ipv6Pump.Start();
         }
+    }
+
+    private static string BuildProtoFilter(RedirectProtocol protocols)
+    {
+        if (protocols == RedirectProtocol.All) return "tcp or udp";
+        if (protocols == RedirectProtocol.Tcp) return "tcp";
+        if (protocols == RedirectProtocol.Udp) return "udp";
+        return "false";
     }
 
     public void Dispose()
     {
         DiagnosticLogger.Log("RDR", "Dispose");
-        _ipv6Blocker?.Dispose();
-        _interceptor?.Dispose();
+        _ipv6Pump?.Dispose();
+        _ipv4Pump?.Dispose();
         _tcpRelay?.Dispose();
         _udpRelay?.Dispose();
         _tracker?.Dispose();
