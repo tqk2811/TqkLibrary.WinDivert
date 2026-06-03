@@ -24,6 +24,10 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
 {
     private readonly int _tcpRelayPort;
     private readonly int _udpRelayPort;
+    // Which protocols this stage NAT-redirects. The handle's filter may capture more (e.g. UDP for
+    // a downstream DNS/block middleware); packets of a protocol not in this set are deferred via
+    // next() so NAT never redirects them.
+    private readonly RedirectProtocol _protocols;
     // null = redirect every destination port; non-null = whitelist (only ports in the set are
     // NAT-redirected, all others pass through to their real destination).
     private readonly HashSet<ushort>? _dstPortFilter;
@@ -31,10 +35,12 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     public NatRedirectMiddleware(
         int tcpRelayPort,
         int udpRelayPort,
+        RedirectProtocol protocols,
         IReadOnlyCollection<ushort>? destinationPortFilter = null)
     {
         _tcpRelayPort = tcpRelayPort;
         _udpRelayPort = udpRelayPort;
+        _protocols = protocols;
         _dstPortFilter = (destinationPortFilter != null && destinationPortFilter.Count > 0)
             ? new HashSet<ushort>(destinationPortFilter)
             : null;
@@ -46,8 +52,13 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         if (p == null || !(p.IsTcp || p.IsUdp))
             return next(ctx);
 
-        byte proto = (byte)p.Protocol;
         bool isTcp = p.IsTcp;
+        // Only NAT the protocols we were asked to; defer the rest to downstream middlewares.
+        RedirectProtocol thisProto = isTcp ? RedirectProtocol.Tcp : RedirectProtocol.Udp;
+        if ((_protocols & thisProto) == 0)
+            return next(ctx);
+
+        byte proto = (byte)p.Protocol;
         int expectedRelay = isTcp ? _tcpRelayPort : _udpRelayPort;
 
         DiagnosticLogger.Log("INT", $"recv {Describe(p, ctx.Address, ctx.Length)}");

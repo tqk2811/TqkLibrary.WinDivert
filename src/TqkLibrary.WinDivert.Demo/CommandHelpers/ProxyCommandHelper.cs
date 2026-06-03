@@ -22,6 +22,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
     private readonly Option<bool> _followChildrenOpt;
     private readonly Option<string?> _redirectPortsOpt;
     private readonly Option<bool> _noDnsResolveOpt;
+    private readonly Option<bool> _secureDnsOpt;
+    private readonly Option<string?> _dohOpt;
 
     public Command Command => _command;
 
@@ -75,6 +77,14 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         {
             Description = "Disable IP -> domain name annotation in logs and console output (which reads `ipconfig /displaydns` every 15s in the background).",
         };
+        _secureDnsOpt = new Option<bool>("--secure-dns")
+        {
+            Description = "Resolve the target's DNS over HTTPS (DoH) instead of forwarding UDP/53. The original query is dropped and a DoH answer is injected back — so DNS works even though HTTP/SOCKS4 proxies can't tunnel UDP. Non-DNS UDP is still dropped (no leak).",
+        };
+        _dohOpt = new Option<string?>("--doh")
+        {
+            Description = "DoH endpoint URL (https) used by --secure-dns. Default https://1.1.1.1/dns-query. Use an IP literal to avoid a bootstrap DNS lookup.",
+        };
 
         _command.Options.Add(_proxyOpt);
         _command.Options.Add(_processOpt);
@@ -87,6 +97,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         _command.Options.Add(_followChildrenOpt);
         _command.Options.Add(_redirectPortsOpt);
         _command.Options.Add(_noDnsResolveOpt);
+        _command.Options.Add(_secureDnsOpt);
+        _command.Options.Add(_dohOpt);
 
         _command.SetAction(InvokeAsync);
     }
@@ -104,11 +116,24 @@ internal sealed class ProxyCommandHelper : ICommandHelper
         bool followChildren = parseResult.GetValue(_followChildrenOpt);
         string? redirectPortsRaw = parseResult.GetValue(_redirectPortsOpt);
         bool noDnsResolve = parseResult.GetValue(_noDnsResolveOpt);
+        bool secureDns = parseResult.GetValue(_secureDnsOpt);
+        string? dohRaw = parseResult.GetValue(_dohOpt);
 
         if (launchExe != null && processSelector != null)
         {
             Console.WriteLine("--launch and --process are mutually exclusive.");
             return 2;
+        }
+
+        Uri? dohEndpoint = null;
+        if (!string.IsNullOrWhiteSpace(dohRaw))
+        {
+            if (!Uri.TryCreate(dohRaw, UriKind.Absolute, out dohEndpoint) || dohEndpoint.Scheme != Uri.UriSchemeHttps)
+            {
+                Console.WriteLine($"--doh must be an absolute https URL, got '{dohRaw}'.");
+                return 2;
+            }
+            secureDns = true; // specifying an endpoint implies enabling secure DNS
         }
 
         ushort[]? redirectPorts = null;
@@ -169,6 +194,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
                     followChildren,
                     redirectPorts,
                     enableDnsLookup: !noDnsResolve,
+                    secureDns,
+                    dohEndpoint,
                     ct).ConfigureAwait(false);
                 return rc;
             }
@@ -205,6 +232,8 @@ internal sealed class ProxyCommandHelper : ICommandHelper
                 followChildren,
                 redirectPorts,
                 enableDnsLookup: !noDnsResolve,
+                secureDns,
+                dohEndpoint,
                 ct).ConfigureAwait(false);
         }
         finally

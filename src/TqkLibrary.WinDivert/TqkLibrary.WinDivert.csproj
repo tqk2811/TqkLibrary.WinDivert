@@ -14,4 +14,10 @@
 		<PackageReference Include="Native.WinDivert" />
 	</ItemGroup>
 
+	<!-- HttpClient (DohResolver) lives in the System.Net.Http framework assembly on net462 and
+	     is not auto-referenced by the SDK; net6/net8 ship it in the shared framework. -->
+	<ItemGroup Condition="'$(TargetFramework)' == 'net462'">
+		<Reference Include="System.Net.Http" />
+	</ItemGroup>
+
 </Project>

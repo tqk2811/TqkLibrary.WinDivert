@@ -20,6 +20,8 @@ internal static class ProxyRedirectorRunner
         bool followChildren,
         ushort[]? redirectDestinationPorts,
         bool enableDnsLookup,
+        bool secureDns,
+        Uri? dohEndpoint,
         CancellationToken ct)
     {
         string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
@@ -47,6 +49,11 @@ internal static class ProxyRedirectorRunner
             UdpDatagramHandler = (dg, innerCt) => udpForwarder?.OnDatagram(dg, innerCt) ?? DropUdpDatagram(dg, redirectorRef, innerCt),
             RedirectDestinationPorts = redirectDestinationPorts,
             EnableDnsLookup = enableDnsLookup,
+            // Serve the target's DNS over HTTPS so it survives a UDP-incapable proxy. DNS/53 is then
+            // claimed before NAT and never reaches the relay; other UDP still hits the relay where,
+            // for a non-UDP proxy, it is dropped (no leak).
+            EnableSecureDns = secureDns,
+            DohEndpoint = dohEndpoint ?? new Uri("https://1.1.1.1/dns-query"),
         };
 
         using var redirector = new ProcessRedirector(opts);
@@ -125,6 +132,8 @@ internal static class ProxyRedirectorRunner
         Console.WriteLine();
         Console.WriteLine($"Redirecting pid={pid}: TCP -> {proxyDisplay} (relay={redirector.TcpRelayPort}); UDP -> {udpMode}.");
         Console.WriteLine($"Port filter: {portFilterDesc}.");
+        if (secureDns)
+            Console.WriteLine($"DNS: served via DoH {dohEndpoint ?? new Uri("https://1.1.1.1/dns-query")} (UDP/53 intercepted; other UDP per above).");
         Console.WriteLine("IPv6 of target: BLOCKED (interceptor is IPv4-only; v6 traffic would otherwise leak direct).");
         if (followChildren) Console.WriteLine($"Child process capture: ENABLED (polling every 500ms).");
         Console.WriteLine("Press Ctrl+C to stop.");

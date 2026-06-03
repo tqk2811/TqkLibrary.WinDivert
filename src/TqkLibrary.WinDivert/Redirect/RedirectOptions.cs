@@ -66,4 +66,20 @@ public sealed class RedirectOptions
     // with their resolved domain names. Names accumulate within the redirector's lifetime, so
     // a name once seen for an IP keeps resolving even after the OS DNS cache evicts it.
     public bool EnableDnsLookup { get; set; } = true;
+
+    // When true, the target's outbound IPv4 UDP/53 (classic DNS) is intercepted and resolved over
+    // HTTPS (DoH) instead of being forwarded; the answer is injected back to the process. Lets DNS
+    // keep working when the proxy can't tunnel UDP. DNS/53 then never reaches the UDP relay or
+    // UdpDatagramHandler. See DohEndpoint.
+    public bool EnableSecureDns { get; set; } = false;
+
+    // DoH endpoint used when EnableSecureDns is true. Default Cloudflare via IP literal (avoids a
+    // bootstrap DNS lookup for the resolver's own hostname; its cert has an IP SAN).
+    public Uri DohEndpoint { get; set; } = new Uri("https://1.1.1.1/dns-query");
+
+    // When true, the target's outbound IPv4 UDP not claimed by an earlier middleware (e.g. not
+    // DNS-over-HTTPS) is dropped rather than NAT-redirected/passed. Use this when the proxy cannot
+    // carry UDP and UDP must not leak out direct. Combined with EnableSecureDns this yields
+    // "block all of the target's UDP except DNS, which is served over DoH".
+    public bool BlockUnhandledTargetUdp { get; set; } = false;
 }

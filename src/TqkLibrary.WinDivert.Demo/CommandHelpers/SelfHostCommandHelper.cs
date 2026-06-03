@@ -159,6 +159,8 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
                     followChildren: false,
                     redirectDestinationPorts: null,
                     enableDnsLookup: true,
+                    secureDns: false,
+                    dohEndpoint: null,
                     ct).ConfigureAwait(false);
             }
             finally
@@ -178,6 +180,8 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
             followChildren: false,
             redirectDestinationPorts: null,
             enableDnsLookup: true,
+            secureDns: false,
+            dohEndpoint: null,
             ct).ConfigureAwait(false);
     }
 

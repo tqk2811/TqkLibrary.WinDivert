@@ -1,5 +1,6 @@
 using System;
 using TqkLibrary.WinDivert.Flow;
+using TqkLibrary.WinDivert.SecureDns;
 using TqkLibrary.WinDivert.Native;
 using TqkLibrary.WinDivert.Pipeline;
 
@@ -23,6 +24,7 @@ public sealed class ProcessRedirector : IDisposable
     private PacketPump? _ipv4Pump;
     private PacketPump? _ipv6Pump;
     private DnsCacheLookup? _dnsLookup;
+    private DohResolver? _dohResolver;
     private readonly NatTable _nat = new();
 
     public NatTable Nat => _nat;
@@ -95,9 +97,15 @@ public sealed class ProcessRedirector : IDisposable
             DiagnosticLogger.Log("RDR", "DNS cache lookup ENABLED");
         }
 
-        // ---- IPv4 NETWORK pipeline: NAT redirect + any user-supplied middlewares ----
+        // ---- IPv4 NETWORK pipeline ----
         // `not impostor` avoids re-capturing packets we reinjected ourselves (prevents loops).
-        string proto = BuildProtoFilter(_options.Protocols);
+        // The handle must also capture UDP whenever a UDP middleware is active (DNS-over-HTTPS or
+        // UDP block), even if NAT itself only redirects TCP — otherwise those middlewares would
+        // never see the UDP packets.
+        bool captureTcp = (_options.Protocols & RedirectProtocol.Tcp) != 0;
+        bool captureUdp = (_options.Protocols & RedirectProtocol.Udp) != 0
+            || _options.EnableSecureDns || _options.BlockUnhandledTargetUdp;
+        string proto = BuildProtoFilter(captureTcp, captureUdp);
         string v4Filter = $"ip and ({proto}) and not impostor";
         string filterDesc = (_options.RedirectDestinationPorts == null || _options.RedirectDestinationPorts.Count == 0)
             ? "all"
@@ -106,10 +114,23 @@ public sealed class ProcessRedirector : IDisposable
         WinDivertHandle v4Handle = WinDivertHandle.Open(v4Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
 
         var v4Builder = new PacketPipelineBuilder();
-        // NAT must run first so it can claim the egress/reply legs before anything else.
-        v4Builder.Use(new NatRedirectMiddleware(tcpPort, udpPort, _options.RedirectDestinationPorts));
+        // DNS-over-HTTPS runs FIRST so it claims the target's DNS/53 before NAT could redirect it.
+        if (_options.EnableSecureDns)
+        {
+            _dohResolver = new DohResolver(_options.DohEndpoint);
+            v4Builder.Use(new DnsOverHttpsMiddleware(_dohResolver));
+            DiagnosticLogger.Log("RDR", $"Secure DNS ENABLED via DoH {_options.DohEndpoint}");
+        }
+        // NAT redirect (egress + loopback-reply legs) for the enabled protocols.
+        v4Builder.Use(new NatRedirectMiddleware(tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts));
         // Let callers insert their own middlewares (composable pipeline).
         _options.ConfigureNetworkPipeline?.Invoke(v4Builder);
+        // Drop any remaining target UDP last, so handled UDP (DNS above, NAT, user) is already claimed.
+        if (_options.BlockUnhandledTargetUdp)
+        {
+            v4Builder.Use(new BlockTargetUdpMiddleware());
+            DiagnosticLogger.Log("RDR", "Block-unhandled-target-UDP ENABLED");
+        }
 
         _ipv4Pump = new PacketPump("INT", v4Handle, v4Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup);
         _ipv4Pump.Start();
@@ -128,11 +149,11 @@ public sealed class ProcessRedirector : IDisposable
         }
     }
 
-    private static string BuildProtoFilter(RedirectProtocol protocols)
+    private static string BuildProtoFilter(bool tcp, bool udp)
     {
-        if (protocols == RedirectProtocol.All) return "tcp or udp";
-        if (protocols == RedirectProtocol.Tcp) return "tcp";
-        if (protocols == RedirectProtocol.Udp) return "udp";
+        if (tcp && udp) return "tcp or udp";
+        if (tcp) return "tcp";
+        if (udp) return "udp";
         return "false";
     }
 
@@ -144,6 +165,7 @@ public sealed class ProcessRedirector : IDisposable
         _tcpRelay?.Dispose();
         _udpRelay?.Dispose();
         _tracker?.Dispose();
+        _dohResolver?.Dispose();
         _dnsLookup?.Dispose();
         DiagnosticLogger.Close();
     }
