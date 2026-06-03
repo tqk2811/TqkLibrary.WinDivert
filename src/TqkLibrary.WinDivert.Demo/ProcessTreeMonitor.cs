@@ -13,7 +13,7 @@ namespace TqkLibrary.WinDivert.Demo;
 // the user already owns. PID reuse is handled by spotting "new" pids that weren't in the prior
 // snapshot, not by remembering the entire history.
 //
-// SysProcess alias is required because TqkLibrary.WinDivert.Process namespace shadows
+// SysProcess alias is required because the TqkLibrary.WinDivert.Demo.Process namespace shadows
 // System.Diagnostics.Process at name-lookup time inside the TqkLibrary.WinDivert.* tree.
 internal sealed class ProcessTreeMonitor : IDisposable
 {

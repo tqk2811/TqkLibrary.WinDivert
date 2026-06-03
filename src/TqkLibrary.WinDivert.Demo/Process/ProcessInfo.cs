@@ -1,6 +1,6 @@
-namespace TqkLibrary.WinDivert.Process;
+namespace TqkLibrary.WinDivert.Demo.Process;
 
-public sealed class ProcessInfo
+internal sealed class ProcessInfo
 {
     public uint Id { get; }
     public string Name { get; }

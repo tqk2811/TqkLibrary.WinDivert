@@ -1,9 +1,9 @@
 using System.Collections.Generic;
 using SysProcess = System.Diagnostics.Process;
 
-namespace TqkLibrary.WinDivert.Process;
+namespace TqkLibrary.WinDivert.Demo.Process;
 
-public static class ProcessFinder
+internal static class ProcessFinder
 {
     public static IReadOnlyList<ProcessInfo> ListAll()
     {
