@@ -1,6 +1,6 @@
 using System.Net;
 
-namespace TqkLibrary.WinDivert.Redirect;
+namespace TqkLibrary.WinDivert.Redirect.Models;
 
 // UDP has no connection, so each datagram is its own event. The caller receives the original
 // source/destination, the PID, and the payload. They return the bytes (possibly modified) that

@@ -1,7 +1,7 @@
 using System;
 using System.Net;
 
-namespace TqkLibrary.WinDivert.Packet;
+namespace TqkLibrary.WinDivert.Packet.Models;
 
 // IPv6 fixed header is 40 bytes; we don't walk extension headers here.
 public readonly struct Ipv6HeaderView

@@ -1,6 +1,5 @@
 using System;
 using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
 
 namespace TqkLibrary.WinDivert.Native;
 
@@ -75,19 +74,4 @@ internal static class WinDivertNative
 
     [DllImport(Dll, EntryPoint = "WinDivertHelperHtons", CallingConvention = CallingConvention.Cdecl)]
     public static extern ushort Htons(ushort x);
-}
-
-internal sealed class WinDivertSafeHandle : SafeHandleZeroOrMinusOneIsInvalid
-{
-    public WinDivertSafeHandle() : base(true) { }
-
-    internal WinDivertSafeHandle(IntPtr handle) : base(true)
-    {
-        SetHandle(handle);
-    }
-
-    protected override bool ReleaseHandle()
-    {
-        return WinDivertNative.Close(handle);
-    }
 }

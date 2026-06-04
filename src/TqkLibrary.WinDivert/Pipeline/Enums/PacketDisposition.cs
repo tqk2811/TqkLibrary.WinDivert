@@ -1,4 +1,4 @@
-namespace TqkLibrary.WinDivert.Pipeline;
+namespace TqkLibrary.WinDivert.Pipeline.Enums;
 
 // What the pump should do with a packet after the middleware chain has run.
 // Mirrors the old PacketInterceptor.ProcessResult, promoted to public so middlewares share it.

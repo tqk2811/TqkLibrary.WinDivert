@@ -1,11 +1,11 @@
-namespace TqkLibrary.WinDivert.Packet;
+namespace TqkLibrary.WinDivert.Packet.Models;
 
-public readonly struct TcpHeaderView
+public readonly struct UdpHeaderView
 {
     private readonly byte[] _buffer;
     private readonly int _offset;
 
-    public TcpHeaderView(byte[] buffer, int offset)
+    public UdpHeaderView(byte[] buffer, int offset)
     {
         _buffer = buffer;
         _offset = offset;
@@ -23,10 +23,8 @@ public readonly struct TcpHeaderView
         set { _buffer[_offset + 2] = (byte)(value >> 8); _buffer[_offset + 3] = (byte)value; }
     }
 
-    public int DataOffset => (_buffer[_offset + 12] >> 4) * 4;
+    public int Length => (_buffer[_offset + 4] << 8) | _buffer[_offset + 5];
 
-    public bool Syn => (_buffer[_offset + 13] & 0x02) != 0;
-    public bool Fin => (_buffer[_offset + 13] & 0x01) != 0;
-    public bool Ack => (_buffer[_offset + 13] & 0x10) != 0;
-    public bool Rst => (_buffer[_offset + 13] & 0x04) != 0;
+    public int PayloadOffset => _offset + 8;
+    public int PayloadLength => Length - 8;
 }

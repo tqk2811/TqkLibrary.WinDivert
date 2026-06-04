@@ -6,22 +6,6 @@ using TqkLibrary.WinDivert.Pipeline;
 
 namespace TqkLibrary.WinDivert.Redirect;
 
-[Flags]
-public enum RedirectProtocol
-{
-    None = 0,
-    Tcp = 1,
-    Udp = 2,
-    All = Tcp | Udp,
-}
-
-public delegate Task TcpConnectionHandler(RedirectedTcpConnection connection, CancellationToken ct);
-
-// Called for each outbound UDP datagram. Return the (possibly rewritten) payload to forward
-// to the original destination, or null to drop. Incoming replies are delivered to the process
-// unchanged; to modify replies, set ReplyHandler.
-public delegate byte[]? UdpDatagramHandler(RedirectedUdpDatagram datagram, CancellationToken ct);
-
 public sealed class RedirectOptions
 {
     public uint ProcessId { get; set; }

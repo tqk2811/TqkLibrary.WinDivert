@@ -1,6 +1,6 @@
 using TqkLibrary.WinDivert.Native;
 
-namespace TqkLibrary.WinDivert.Pipeline;
+namespace TqkLibrary.WinDivert.Pipeline.Interfaces;
 
 // Lets a middleware emit an out-of-band packet on the same WinDivert handle the pump owns —
 // used when a middleware produces a reply asynchronously (e.g. DNS-over-HTTPS injects the

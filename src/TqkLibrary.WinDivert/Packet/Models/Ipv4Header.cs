@@ -1,7 +1,7 @@
 using System;
 using System.Net;
 
-namespace TqkLibrary.WinDivert.Packet;
+namespace TqkLibrary.WinDivert.Packet.Models;
 
 // Provides read/write access to an IPv4 header living in a byte buffer.
 // All multi-byte fields stay in network byte order on the wire; accessors convert.

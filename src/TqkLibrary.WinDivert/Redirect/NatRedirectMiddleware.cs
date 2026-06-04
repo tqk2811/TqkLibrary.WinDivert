@@ -167,7 +167,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         return sb.Length == 0 ? "-" : sb.ToString();
     }
 
-    private static string Describe(ParsedPacket p, in Native.WinDivertAddress addr, int length)
+    private static string Describe(ParsedPacket p, in WinDivertAddress addr, int length)
     {
         string proto = p.IsTcp ? "tcp" : p.IsUdp ? "udp" : ((byte)p.Protocol).ToString();
         string flags = p.IsTcp ? $" flags={TcpFlags(p)}" : "";

@@ -1,15 +1,7 @@
 using System;
 using System.Net;
 
-namespace TqkLibrary.WinDivert.Packet;
-
-public enum IpProtocol : byte
-{
-    Icmp = 1,
-    Tcp = 6,
-    Udp = 17,
-    IcmpV6 = 58,
-}
+namespace TqkLibrary.WinDivert.Packet.Models;
 
 public sealed class ParsedPacket
 {

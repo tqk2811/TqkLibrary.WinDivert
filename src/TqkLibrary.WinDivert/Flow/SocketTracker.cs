@@ -9,22 +9,6 @@ using TqkLibrary.WinDivert.Redirect;
 
 namespace TqkLibrary.WinDivert.Flow;
 
-internal readonly struct UdpBindKey : IEquatable<UdpBindKey>
-{
-    public IPAddress Address { get; }
-    public ushort Port { get; }
-
-    public UdpBindKey(IPAddress address, ushort port)
-    {
-        Address = address;
-        Port = port;
-    }
-
-    public bool Equals(UdpBindKey other) => Port == other.Port && Equals(Address, other.Address);
-    public override bool Equals(object? obj) => obj is UdpBindKey k && Equals(k);
-    public override int GetHashCode() => (Address?.GetHashCode() ?? 0) ^ Port;
-}
-
 // Uses the SOCKET layer to learn which (localAddr:localPort, remoteAddr:remotePort) tuples
 // belong to the target process. CONNECT events fire *before* the SYN is sent, giving the
 // interceptor a chance to rewrite outbound packets from the very first one.

@@ -1,4 +1,4 @@
-namespace TqkLibrary.WinDivert.Demo.Process;
+namespace TqkLibrary.WinDivert.Demo.Process.Models;
 
 internal sealed class ProcessInfo
 {

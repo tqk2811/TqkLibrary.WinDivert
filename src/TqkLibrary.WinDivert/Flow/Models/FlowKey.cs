@@ -1,7 +1,7 @@
 using System;
 using System.Net;
 
-namespace TqkLibrary.WinDivert.Flow;
+namespace TqkLibrary.WinDivert.Flow.Models;
 
 public readonly struct FlowKey : IEquatable<FlowKey>
 {

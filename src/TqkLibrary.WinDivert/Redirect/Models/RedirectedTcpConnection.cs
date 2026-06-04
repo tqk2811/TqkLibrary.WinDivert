@@ -5,7 +5,7 @@ using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace TqkLibrary.WinDivert.Redirect;
+namespace TqkLibrary.WinDivert.Redirect.Models;
 
 // Given to the caller when a redirected TCP connection is accepted by the local relay.
 // Exposes the raw client stream (bytes coming FROM the target process) and the upstream

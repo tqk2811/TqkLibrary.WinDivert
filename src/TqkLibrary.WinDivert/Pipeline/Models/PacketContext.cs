@@ -4,7 +4,7 @@ using TqkLibrary.WinDivert.Native;
 using TqkLibrary.WinDivert.Packet;
 using TqkLibrary.WinDivert.Redirect;
 
-namespace TqkLibrary.WinDivert.Pipeline;
+namespace TqkLibrary.WinDivert.Pipeline.Models;
 
 // Per-packet state flowing through the middleware chain. Created once per recv and mutated in
 // place by middlewares. One instance is alive at a time per pump (processing is synchronous on
