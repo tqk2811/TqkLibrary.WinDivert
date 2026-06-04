@@ -3,6 +3,7 @@
 // the same way they were before the split.
 global using TqkLibrary.WinDivert.Native.Enums;
 global using TqkLibrary.WinDivert.Native.Models;
+global using TqkLibrary.WinDivert.Native.Helpers;
 global using TqkLibrary.WinDivert.Packet.Enums;
 global using TqkLibrary.WinDivert.Packet.Models;
 global using TqkLibrary.WinDivert.Flow.Models;

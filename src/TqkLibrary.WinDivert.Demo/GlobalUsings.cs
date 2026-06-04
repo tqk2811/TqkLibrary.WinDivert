@@ -11,4 +11,5 @@ global using TqkLibrary.WinDivert.Pipeline.Enums;
 global using TqkLibrary.WinDivert.Pipeline.Interfaces;
 global using TqkLibrary.WinDivert.Pipeline.Models;
 global using TqkLibrary.WinDivert.Demo.CommandHelpers.Interfaces;
+global using TqkLibrary.WinDivert.Demo.CommandHelpers.Extensions;
 global using TqkLibrary.WinDivert.Demo.Process.Models;

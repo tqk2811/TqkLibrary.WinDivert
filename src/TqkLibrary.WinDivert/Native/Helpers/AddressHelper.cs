@@ -1,6 +1,6 @@
 using System.Net;
 
-namespace TqkLibrary.WinDivert.Native;
+namespace TqkLibrary.WinDivert.Native.Helpers;
 
 internal static class AddressHelper
 {
