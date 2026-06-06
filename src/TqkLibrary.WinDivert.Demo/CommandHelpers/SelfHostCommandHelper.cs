@@ -98,7 +98,7 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
             return 2;
         }
 
-        HttpProxyAuthentication? credential = null;
+        ProxyCredential? credential = null;
         if (!string.IsNullOrWhiteSpace(auth))
         {
             int sep = auth!.IndexOf(':');
@@ -107,7 +107,7 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
                 Console.WriteLine("--auth must be in 'user:pass' format.");
                 return 2;
             }
-            credential = new HttpProxyAuthentication(auth.Substring(0, sep), auth.Substring(sep + 1));
+            credential = new ProxyCredential(auth.Substring(0, sep), auth.Substring(sep + 1));
         }
 
         var local = new LocalProxySource();
@@ -130,7 +130,7 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
 
         var clientUri = new Uri($"http://{listenEp}");
         var clientSource = new HttpProxySource(clientUri);
-        if (credential != null) clientSource.HttpProxyAuthentication = credential;
+        if (credential != null) clientSource.Credential = credential;
 
         string proxyDisplay = credential is null
             ? clientUri.ToString()
@@ -187,14 +187,14 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
 
     private sealed class RequireBasicAuthHandler : BaseProxyServerHandler
     {
-        private readonly HttpProxyAuthentication _expected;
-        public RequireBasicAuthHandler(IProxySource source, HttpProxyAuthentication expected) : base(source)
+        private readonly ProxyCredential _expected;
+        public RequireBasicAuthHandler(IProxySource source, ProxyCredential expected) : base(source)
         {
             _expected = expected;
         }
         public override Task<bool> IsAcceptUserAsync(IUserInfo userInfo, CancellationToken cancellationToken = default)
         {
-            if (userInfo.Authentication is HttpProxyAuthentication a)
+            if (userInfo.Authentication is ProxyCredential a)
                 return Task.FromResult(a.Equals(_expected));
             return Task.FromResult(false);
         }

@@ -29,7 +29,7 @@ internal static class ProxyUriParser
             {
                 var source = new HttpProxySource(uri, loggerFactory);
                 if (user != null && pass != null)
-                    source.HttpProxyAuthentication = new HttpProxyAuthentication(user, pass);
+                    source.Credential = new ProxyCredential(user, pass);
                 return source;
             }
             case "socks4":
@@ -43,7 +43,7 @@ internal static class ProxyUriParser
             {
                 IPEndPoint ep = ResolveEndpoint(uri);
                 if (user != null && pass != null)
-                    return new Socks5ProxySource(ep, new HttpProxyAuthentication(user, pass), loggerFactory);
+                    return new Socks5ProxySource(ep, new ProxyCredential(user, pass), loggerFactory);
                 return new Socks5ProxySource(ep, loggerFactory);
             }
             default:
