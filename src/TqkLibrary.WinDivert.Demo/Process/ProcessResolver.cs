@@ -3,10 +3,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using TqkLibrary.WinDivert.Demo.Process;
 using SysProcess = System.Diagnostics.Process;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.Process;
 
 internal static class ProcessResolver
 {

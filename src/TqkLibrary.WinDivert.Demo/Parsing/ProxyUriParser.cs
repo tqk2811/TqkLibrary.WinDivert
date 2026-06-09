@@ -5,7 +5,7 @@ using TqkLibrary.Proxy.Authentications;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.Proxy.ProxySources;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.Parsing;
 
 internal static class ProxyUriParser
 {

@@ -4,9 +4,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using TqkLibrary.WinDivert.Redirect;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
-internal sealed class LaunchCommandHelper : ICommandHelper
+internal sealed class LaunchCommandModule : ICommandModule
 {
     private readonly Command _command;
     private readonly Argument<string> _exeArg;
@@ -15,7 +15,7 @@ internal sealed class LaunchCommandHelper : ICommandHelper
 
     public Command Command => _command;
 
-    public LaunchCommandHelper()
+    public LaunchCommandModule()
     {
         _command = new Command("launch", "Launch an executable suspended, attach the redirector, then resume.");
 

@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.WinDivert.Redirect;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.Running;
 
 // Forwards captured UDP datagrams through a SOCKS5 UDP ASSOCIATE tunnel and routes the
 // replies back to the originating process via ProcessRedirector.InjectUdpReplyToProcessAsync.

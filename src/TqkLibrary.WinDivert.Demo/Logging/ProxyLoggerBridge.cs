@@ -2,7 +2,7 @@ using System;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.WinDivert.Redirect;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.Logging;
 
 // Routes TqkLibrary.Proxy's ILogger output to two sinks:
 //   * DiagnosticLogger (full detail, written to the windivert-interceptor.log file)

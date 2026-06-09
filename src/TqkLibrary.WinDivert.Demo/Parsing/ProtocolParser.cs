@@ -1,7 +1,7 @@
 using System;
 using TqkLibrary.WinDivert.Redirect;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.Parsing;
 
 internal static class ProtocolParser
 {

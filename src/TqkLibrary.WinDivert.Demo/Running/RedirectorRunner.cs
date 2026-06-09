@@ -4,7 +4,7 @@ using System.Threading.Tasks;
 using TqkLibrary.WinDivert.Redirect;
 using SysProcess = System.Diagnostics.Process;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.Running;
 
 internal static class RedirectorRunner
 {

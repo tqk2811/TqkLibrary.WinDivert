@@ -6,7 +6,7 @@ using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.Proxy.StreamHelpers;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers.Extensions;
+namespace TqkLibrary.WinDivert.Demo.Extensions;
 
 // Convenience wrapper around IConnectSource that the demo uses to forward a client stream
 // through an already-connected tunnel. TqkLibrary.Proxy itself only exposes the raw Stream via

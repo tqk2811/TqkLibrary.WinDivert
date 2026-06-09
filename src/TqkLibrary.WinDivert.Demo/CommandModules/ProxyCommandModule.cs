@@ -6,9 +6,9 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Interfaces;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
-internal sealed class ProxyCommandHelper : ICommandHelper
+internal sealed class ProxyCommandModule : ICommandModule
 {
     private readonly Command _command;
     private readonly Option<string> _proxyOpt;
@@ -27,7 +27,7 @@ internal sealed class ProxyCommandHelper : ICommandHelper
 
     public Command Command => _command;
 
-    public ProxyCommandHelper()
+    public ProxyCommandModule()
     {
         _command = new Command("proxy", "Route TCP traffic of a process through an HTTP/SOCKS4/SOCKS5 proxy (using TqkLibrary.Proxy).");
 

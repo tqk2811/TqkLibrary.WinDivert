@@ -9,13 +9,13 @@ using TqkLibrary.Proxy.Handlers;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.Proxy.ProxySources;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
 // End-to-end self-hosted scenario:
 //   target process -> WinDivert -> HttpProxySource (client side, in this demo)
 //                  -> TqkLibrary.Proxy.ProxyServer (server side, this demo, 127.0.0.1:ephemeral)
 //                  -> LocalProxySource (backend) -> internet
-internal sealed class SelfHostCommandHelper : ICommandHelper
+internal sealed class SelfHostCommandModule : ICommandModule
 {
     private readonly Command _command;
     private readonly Option<string?> _processOpt;
@@ -29,7 +29,7 @@ internal sealed class SelfHostCommandHelper : ICommandHelper
 
     public Command Command => _command;
 
-    public SelfHostCommandHelper()
+    public SelfHostCommandModule()
     {
         _command = new Command("selfhost",
             "Self-host an HTTP ProxyServer (TqkLibrary.Proxy) backed by LocalProxySource, then redirect the target process through it via WinDivert.");

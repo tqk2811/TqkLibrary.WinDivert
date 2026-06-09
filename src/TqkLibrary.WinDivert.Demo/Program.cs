@@ -1,7 +1,7 @@
 using System;
 using System.CommandLine;
 using System.Threading.Tasks;
-using TqkLibrary.WinDivert.Demo.CommandHelpers;
+using TqkLibrary.WinDivert.Demo.CommandModules;
 
 namespace TqkLibrary.WinDivert.Demo;
 
@@ -16,10 +16,10 @@ internal static class Program
 
         var root = new RootCommand("TqkLibrary.WinDivert Demo — redirect TCP/UDP traffic of a process via WinDivert.")
         {
-            new AttachCommandHelper().Command,
-            new LaunchCommandHelper().Command,
-            new ProxyCommandHelper().Command,
-            new SelfHostCommandHelper().Command,
+            new AttachCommandModule().Command,
+            new LaunchCommandModule().Command,
+            new ProxyCommandModule().Command,
+            new SelfHostCommandModule().Command,
         };
         return root.Parse(args).InvokeAsync();
     }

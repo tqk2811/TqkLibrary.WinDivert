@@ -4,9 +4,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using TqkLibrary.WinDivert.Redirect;
 
-namespace TqkLibrary.WinDivert.Demo.CommandHelpers;
+namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
-internal sealed class AttachCommandHelper : ICommandHelper
+internal sealed class AttachCommandModule : ICommandModule
 {
     private readonly Command _command;
     private readonly Option<string?> _processOpt;
@@ -19,7 +19,7 @@ internal sealed class AttachCommandHelper : ICommandHelper
 
     public Command Command => _command;
 
-    public AttachCommandHelper()
+    public AttachCommandModule()
     {
         _command = new Command("attach", "Attach the redirector to an existing process.");
 

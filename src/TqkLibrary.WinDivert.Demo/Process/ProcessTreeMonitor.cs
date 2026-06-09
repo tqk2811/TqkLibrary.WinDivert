@@ -5,7 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SysProcess = System.Diagnostics.Process;
 
-namespace TqkLibrary.WinDivert.Demo;
+namespace TqkLibrary.WinDivert.Demo.Process;
 
 // Polls the live process list and reports children/descendants of a root pid. Uses
 // NtQueryInformationProcess(ProcessBasicInformation) to read InheritedFromUniqueProcessId for
