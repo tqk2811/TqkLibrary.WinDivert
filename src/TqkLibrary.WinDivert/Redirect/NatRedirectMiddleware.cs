@@ -11,7 +11,9 @@ namespace TqkLibrary.WinDivert.Redirect;
 // Core NAT logic on the NETWORK layer, as a middleware. Captures both the egress path from the
 // target process (to rewrite destination onto the relay) and the loopback reply path from the
 // relay (to rewrite the source back to the original destination). Packets it does not claim are
-// deferred to the rest of the chain via next() — so it must run first in the IPv4 pipeline.
+// deferred to the rest of the chain via next() — so it must run first in its pipeline. The same
+// class serves both families: it is registered once in the IPv4 pipeline and once in the IPv6 one,
+// each time carrying the relay ports of that family (see ProcessRedirector).
 //
 // Outbound (target-process -> real destination):
 //   (srcA:sp, dstB:bp) -> (srcLoopback:sp, dstLoopback:relayPort)
@@ -24,6 +26,10 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
 {
     private readonly int _tcpRelayPort;
     private readonly int _udpRelayPort;
+    // The IPv6 relay listens on its own loopback sockets, so it has its own pair of ports. Zero
+    // means "this pipeline does not NAT IPv6" — an IPv6 packet is then deferred to next().
+    private readonly int _tcpRelayPortV6;
+    private readonly int _udpRelayPortV6;
     // Which protocols this stage NAT-redirects. The handle's filter may capture more (e.g. UDP for
     // a downstream DNS/block middleware); packets of a protocol not in this set are deferred via
     // next() so NAT never redirects them.
@@ -41,10 +47,14 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         int udpRelayPort,
         RedirectProtocol protocols,
         IReadOnlyCollection<ushort>? destinationPortFilter = null,
-        bool blockEscapedFlows = false)
+        bool blockEscapedFlows = false,
+        int tcpRelayPortV6 = 0,
+        int udpRelayPortV6 = 0)
     {
         _tcpRelayPort = tcpRelayPort;
         _udpRelayPort = udpRelayPort;
+        _tcpRelayPortV6 = tcpRelayPortV6;
+        _udpRelayPortV6 = udpRelayPortV6;
         _protocols = protocols;
         _blockEscapedFlows = blockEscapedFlows;
         _dstPortFilter = (destinationPortFilter != null && destinationPortFilter.Count > 0)
@@ -65,7 +75,14 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             return next(ctx);
 
         byte proto = (byte)p.Protocol;
-        int expectedRelay = isTcp ? _tcpRelayPort : _udpRelayPort;
+        bool isIpv6 = p.IsIpv6;
+        int expectedRelay = isTcp
+            ? (isIpv6 ? _tcpRelayPortV6 : _tcpRelayPort)
+            : (isIpv6 ? _udpRelayPortV6 : _udpRelayPort);
+        // No relay socket for this family: nothing here can redirect the packet, so let the rest
+        // of the chain (block/observe middlewares) decide what happens to it.
+        if (expectedRelay == 0)
+            return next(ctx);
 
         ctx.Logger.Log("INT", $"recv {Describe(p, ctx.Address, ctx.Length)}");
 
@@ -124,7 +141,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             // against the SYN — then redirecting the rest of it sends the two halves of one
             // connection to two different places and the connection dies. That is strictly worse
             // than the leak it was meant to prevent, so such flows are handled separately.
-            if (isTcp && !isSyn && ctx.Nat.Find(proto, srcPort) == null)
+            if (isTcp && !isSyn && ctx.Nat.Find(proto, srcPort, isIpv6) == null)
                 return HandleEscapedFlow(ctx, next, srcIp, srcPort, dstIp, dstPort);
 
             // Which tracked process this packet really belongs to. With several pids tracked at
@@ -142,7 +159,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             string dnsTag = dnsName != null ? $" name={dnsName}" : "";
             ctx.Logger.Log("INT", $"  nat.upsert {(isTcp ? "tcp" : "udp")} srcPort={srcPort} -> origDst={dstIp}:{dstPort}{dnsTag} ifIdx={ctx.Address.Network.IfIdx}");
 
-            IPAddress loopback = p.IsIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
+            IPAddress loopback = isIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
             p.SetSource(loopback, srcPort);
             p.SetDestination(loopback, (ushort)expectedRelay);
 
@@ -152,7 +169,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             ctx.Address.Loopback = true;
             ctx.Address.Network.IfIdx = 1;
             ctx.Address.Network.SubIfIdx = 0;
-            ctx.Logger.Log("INT", $"  -> REDIRECT 127.0.0.1:{srcPort} -> 127.0.0.1:{expectedRelay} (Outbound=true Loopback=true IfIdx=1)");
+            ctx.Logger.Log("INT", $"  -> REDIRECT {loopback}:{srcPort} -> {loopback}:{expectedRelay} (Outbound=true Loopback=true IfIdx=1)");
             ctx.MarkModified();
             return Task.CompletedTask;
         }
@@ -161,8 +178,8 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         if (ctx.Address.Loopback && p.SourcePort == expectedRelay)
         {
             ushort dstPort = p.DestinationPort;
-            NatEntry? entry = ctx.Nat.Find(proto, dstPort);
-            ctx.Logger.Log("INT", $"  reply candidate dstPort={dstPort} natHit={(entry != null)} addr.Outbound={ctx.Address.Outbound}");
+            NatEntry? entry = ctx.Nat.Find(proto, dstPort, isIpv6);
+            ctx.Logger.Log("INT", $"  reply candidate dstPort={dstPort} ipv6={isIpv6} natHit={(entry != null)} addr.Outbound={ctx.Address.Outbound}");
             if (entry == null) return next(ctx);
 
             // Loopback packets are captured twice (sender outbound + receiver inbound). Handle on

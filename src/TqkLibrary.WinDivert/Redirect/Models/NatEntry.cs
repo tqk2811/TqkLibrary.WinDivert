@@ -31,6 +31,12 @@ public sealed class NatEntry
         CreatedUtc = DateTime.UtcNow;
     }
 
+    /// <summary>
+    /// True when the flow this entry describes is IPv6. Part of the NatTable key, because the two
+    /// families have independent port spaces.
+    /// </summary>
+    public bool IsIpv6 => OriginalSourceAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+
     public IPEndPoint OriginalDestination => new IPEndPoint(OriginalDestinationAddress, OriginalDestinationPort);
     public IPEndPoint OriginalSource => new IPEndPoint(OriginalSourceAddress, OriginalSourcePort);
 }

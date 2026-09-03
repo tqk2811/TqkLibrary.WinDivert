@@ -4,9 +4,10 @@ using TqkLibrary.WinDivert.Pipeline;
 
 namespace TqkLibrary.WinDivert.Redirect;
 
-// Terminal "block" middleware: drops the target process's outbound IPv4 UDP that no earlier
-// middleware claimed. Place it LAST in the IPv4 pipeline so stages like DnsOverHttpsMiddleware get
-// first crack at the packets they handle (e.g. DNS/53); whatever falls through to here is swallowed.
+// Terminal "block" middleware: drops the target process's outbound UDP that no earlier middleware
+// claimed. Place it LAST in the pipeline so stages like DnsOverHttpsMiddleware get first crack at
+// the packets they handle (e.g. DNS/53); whatever falls through to here is swallowed. It is
+// family-agnostic — the pipeline it is registered in decides whether it sees IPv4 or IPv6.
 //
 // This is the safe form of "if no middleware handles it, drop": the scope is narrowed to the
 // target's own outbound real-interface UDP, so non-target traffic and the NAT loopback-reply leg
@@ -17,7 +18,7 @@ public sealed class BlockTargetUdpMiddleware : IPacketMiddleware
     public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
     {
         ParsedPacket? p = ctx.Packet;
-        if (p != null && p.IsUdp && !p.IsIpv6
+        if (p != null && p.IsUdp
             && ctx.Address.Outbound && !ctx.Address.Loopback
             && ctx.Tracker.IsTrackedUdp(p.Source, p.SourcePort))
         {

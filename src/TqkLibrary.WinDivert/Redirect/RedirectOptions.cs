@@ -40,11 +40,12 @@ public sealed class RedirectOptions
     // LoggerFactory are not used and the redirector does NOT dispose the logger.
     public RedirectLogger? Logger { get; set; }
 
-    // When true, opens a parallel WinDivert handle that drops IPv6 TCP/UDP traffic belonging
-    // to the target process. The interceptor itself is IPv4-only, so without this any AAAA-
-    // resolved connection would emit through the kernel direct and leak the real IPv6 address.
-    // Non-target IPv6 traffic is re-injected unchanged.
-    public bool BlockIpv6 { get; set; } = true;
+    // What happens to the target's IPv6 traffic. Redirect (default) opens a parallel IPv6 NETWORK
+    // handle running the same NAT pipeline as IPv4, so IPv6 connections reach the relay and the
+    // connection handler just like IPv4 ones. Block keeps the old behaviour (drop the target's
+    // IPv6 so the application falls back to IPv4); Ignore lets it out untouched. Either way
+    // non-target IPv6 traffic is re-injected unchanged.
+    public Ipv6Mode Ipv6Mode { get; set; } = Ipv6Mode.Redirect;
 
     // If null or empty, every destination port of the tracked process is NAT-redirected to the
     // local relay (current default). When set, only outbound packets whose destination port is

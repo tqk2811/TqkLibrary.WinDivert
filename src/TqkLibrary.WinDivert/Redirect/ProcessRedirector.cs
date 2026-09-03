@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Net.Sockets;
 using TqkLibrary.WinDivert.Flow;
 using TqkLibrary.WinDivert.SecureDns;
 using TqkLibrary.WinDivert.Native;
@@ -13,7 +14,8 @@ namespace TqkLibrary.WinDivert.Redirect;
 //   3) NatTable — shared translation state
 //   4) PacketPump (NETWORK-layer handles) running middleware pipelines that rewrite/drop packets:
 //        - IPv4 pump: NatRedirectMiddleware (+ user/DNS/UDP-block middlewares)
-//        - IPv6 pump: Ipv6BlockMiddleware (when BlockIpv6)
+//        - IPv6 pump: the same NAT pipeline pointed at the relay's [::1] listeners (Ipv6Mode.Redirect),
+//                     or Ipv6BlockMiddleware (Ipv6Mode.Block), or nothing at all (Ipv6Mode.Ignore)
 //
 // Lifetime: construct, call Start(), use, then Dispose().
 public sealed class ProcessRedirector : IDisposable
@@ -35,6 +37,9 @@ public sealed class ProcessRedirector : IDisposable
     public NatTable Nat => _nat;
     public int TcpRelayPort => _tcpRelay?.Port ?? 0;
     public int UdpRelayPort => _udpRelay?.Port ?? 0;
+    /// <summary>Loopback ports of the IPv6 relay listeners; 0 when IPv6 is not being redirected.</summary>
+    public int TcpRelayPortV6 => _tcpRelay?.PortV6 ?? 0;
+    public int UdpRelayPortV6 => _udpRelay?.PortV6 ?? 0;
     public DnsCacheLookup? DnsLookup => _dnsLookup;
 
     /// <summary>
@@ -48,11 +53,13 @@ public sealed class ProcessRedirector : IDisposable
     /// Inject a UDP datagram back to the target process as if it came from the original
     /// destination. Used by handlers that take over UDP forwarding (e.g. SOCKS5 UDP ASSOCIATE)
     /// and need to deliver replies the relay's default upstream socket never sees.
+    /// <paramref name="isIpv6"/> selects which loopback listener the reply is emitted from — it
+    /// must match the family of the flow, or the NAT stage will not recognise it.
     /// </summary>
-    public Task InjectUdpReplyToProcessAsync(ushort processClientPort, byte[] payload)
+    public Task InjectUdpReplyToProcessAsync(ushort processClientPort, byte[] payload, bool isIpv6 = false)
     {
         if (_udpRelay is null) throw new InvalidOperationException("UDP redirect is not enabled");
-        return _udpRelay.InjectReplyToProcessAsync(processClientPort, payload);
+        return _udpRelay.InjectReplyToProcessAsync(processClientPort, payload, isIpv6);
     }
 
     /// <summary>
@@ -121,23 +128,51 @@ public sealed class ProcessRedirector : IDisposable
         _tracker.TcpConnectClosed += k => TcpConnectClosed?.Invoke(k);
         _tracker.Start();
 
-        int tcpPort = 0, udpPort = 0;
+        // IPv6 redirect needs a second pair of loopback listeners; ask for them only when the mode
+        // says so AND the machine actually has an IPv6 stack. `ipv6Mode` is the mode we can
+        // actually deliver, which is not always the one that was asked for.
+        Ipv6Mode ipv6Mode = _options.Ipv6Mode;
+        bool redirectIpv6 = ipv6Mode == Ipv6Mode.Redirect && Socket.OSSupportsIPv6;
+        if (ipv6Mode == Ipv6Mode.Redirect && !redirectIpv6)
+        {
+            // No IPv6 stack at all means the target cannot produce IPv6 traffic either, so there
+            // is nothing to block and nothing to leak.
+            ipv6Mode = Ipv6Mode.Ignore;
+            _log.Log("RDR", "IPv6 redirect requested but the OS has no IPv6 stack — nothing to do");
+        }
+
+        int tcpPort = 0, udpPort = 0, tcpPortV6 = 0, udpPortV6 = 0;
         if ((_options.Protocols & RedirectProtocol.Tcp) != 0)
         {
-            _tcpRelay = new TcpRelayServer(_nat, _options.TcpConnectionHandler, _log);
+            _tcpRelay = new TcpRelayServer(_nat, _options.TcpConnectionHandler, _log, redirectIpv6);
             _tcpRelay.ConnectionOpened += c => TcpConnectionOpened?.Invoke(c);
             _tcpRelay.ConnectionClosed += c => TcpConnectionClosed?.Invoke(c);
             _tcpRelay.Start();
             tcpPort = _tcpRelay.Port;
+            tcpPortV6 = _tcpRelay.PortV6;
         }
         if ((_options.Protocols & RedirectProtocol.Udp) != 0)
         {
-            _udpRelay = new UdpRelayServer(_nat, _options.UdpDatagramHandler);
+            _udpRelay = new UdpRelayServer(_nat, _options.UdpDatagramHandler, redirectIpv6);
             _udpRelay.Start();
             udpPort = _udpRelay.Port;
+            udpPortV6 = _udpRelay.PortV6;
         }
 
-        _log.Log("RDR", $"Relay ports tcp={tcpPort} udp={udpPort}");
+        _log.Log("RDR", $"Relay ports tcp={tcpPort} udp={udpPort} tcpV6={tcpPortV6} udpV6={udpPortV6}");
+
+        // The relay could not take a loopback IPv6 socket, so nothing can be redirected there.
+        // Falling through to "leave IPv6 alone" would silently let the target's traffic out
+        // unproxied, so drop back to blocking it instead — a stall the user can see beats a leak
+        // they cannot.
+        if (redirectIpv6
+            && ((_options.Protocols & RedirectProtocol.Tcp) != 0 && tcpPortV6 == 0
+                || (_options.Protocols & RedirectProtocol.Udp) != 0 && udpPortV6 == 0))
+        {
+            redirectIpv6 = false;
+            ipv6Mode = Ipv6Mode.Block;
+            _log.Log("RDR", "No IPv6 loopback relay available — falling back to BLOCKING the target's IPv6");
+        }
 
         if (_options.EnableDnsLookup)
         {
@@ -192,18 +227,53 @@ public sealed class ProcessRedirector : IDisposable
         _ipv4Pump = new PacketPump("INT", v4Handle, v4Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup, _log);
         _ipv4Pump.Start();
 
-        // ---- IPv6 NETWORK pipeline: drop the target's IPv6 (the IPv4 pump is v4-only, so v6
-        // would otherwise leak the real address). Non-target v6 traffic is passed through. ----
-        if (_options.BlockIpv6)
-        {
-            string v6Filter = "ipv6 and (tcp or udp) and not impostor";
-            _log.Log("V6X", $"Open filter=\"{v6Filter}\" priority={_options.NetworkPriority}");
-            WinDivertHandle v6Handle = WinDivertHandle.Open(v6Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
-            var v6Builder = new PacketPipelineBuilder();
-            v6Builder.Use(new Ipv6BlockMiddleware());
-            _ipv6Pump = new PacketPump("V6X", v6Handle, v6Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup, _log);
-            _ipv6Pump.Start();
-        }
+        // ---- IPv6 NETWORK pipeline ----
+        // Redirect: the same NAT stage as IPv4, pointed at the relay's [::1] listeners, so an IPv6
+        //   connection is routed by the connection handler exactly like an IPv4 one.
+        // Block:    drop the target's IPv6 so the application falls back to IPv4.
+        // Ignore:   no v6 handle at all — the traffic leaves untouched.
+        // Non-target IPv6 traffic is always passed through unchanged.
+        if (redirectIpv6)
+            StartIpv6RedirectPump(captureTcp, captureUdp, tcpPortV6, udpPortV6);
+        else if (ipv6Mode == Ipv6Mode.Block)
+            StartIpv6BlockPump();
+    }
+
+    private void StartIpv6RedirectPump(bool captureTcp, bool captureUdp, int tcpPortV6, int udpPortV6)
+    {
+        string v6Filter = $"ipv6 and ({BuildProtoFilter(captureTcp, captureUdp)}) and not impostor";
+        _log.Log("IN6", $"Open filter=\"{v6Filter}\" priority={_options.NetworkPriority} tcpRelay={tcpPortV6} udpRelay={udpPortV6}");
+        WinDivertHandle handle = WinDivertHandle.Open(v6Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
+
+        var builder = new PacketPipelineBuilder();
+        // DNS answers travelling over IPv6 name the same servers as the IPv4 ones; feeding them to
+        // the same table is what lets a v6-only connection be routed by domain.
+        if (_options.EnableDnsSniff) builder.Use(new DnsAnswerSniffMiddleware(ReverseDns));
+        // DnsOverHttpsMiddleware is deliberately absent: it builds IPv4 reply packets and ignores
+        // IPv6 anyway. The target's own IPv6 DNS/53 is NAT-redirected like any other UDP and gets
+        // routed by policy; the OS resolver's DNS is untouched either way.
+        builder.Use(new NatRedirectMiddleware(
+            tcpRelayPort: 0, udpRelayPort: 0,
+            _options.Protocols, _options.RedirectDestinationPorts, _options.BlockEscapedFlows,
+            tcpRelayPortV6: tcpPortV6, udpRelayPortV6: udpPortV6));
+        // The hook is invoked once per family, so a callback that news up its middleware gets one
+        // instance per pipeline and never has to be thread-safe across the two pump threads.
+        _options.ConfigureNetworkPipeline?.Invoke(builder);
+        if (_options.BlockUnhandledTargetUdp) builder.Use(new BlockTargetUdpMiddleware());
+
+        _ipv6Pump = new PacketPump("IN6", handle, builder.Build(), _tracker!, _nat, _options.ProcessId, _dnsLookup, _log);
+        _ipv6Pump.Start();
+    }
+
+    private void StartIpv6BlockPump()
+    {
+        string v6Filter = "ipv6 and (tcp or udp) and not impostor";
+        _log.Log("V6X", $"Open filter=\"{v6Filter}\" priority={_options.NetworkPriority}");
+        WinDivertHandle v6Handle = WinDivertHandle.Open(v6Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
+        var v6Builder = new PacketPipelineBuilder();
+        v6Builder.Use(new Ipv6BlockMiddleware());
+        _ipv6Pump = new PacketPump("V6X", v6Handle, v6Builder.Build(), _tracker!, _nat, _options.ProcessId, _dnsLookup, _log);
+        _ipv6Pump.Start();
     }
 
     private static string BuildProtoFilter(bool tcp, bool udp)
