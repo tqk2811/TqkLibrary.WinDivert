@@ -28,6 +28,7 @@ public sealed class PacketPump : IPacketInjector, IDisposable
     private readonly NatTable _nat;
     private readonly uint _pid;
     private readonly DnsCacheLookup? _dnsLookup;
+    private readonly RedirectLogger _log;
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _pumpTask;
@@ -40,7 +41,8 @@ public sealed class PacketPump : IPacketInjector, IDisposable
         SocketTracker tracker,
         NatTable nat,
         uint processId,
-        DnsCacheLookup? dnsLookup)
+        DnsCacheLookup? dnsLookup,
+        RedirectLogger? logger = null)
     {
         _tag = tag ?? throw new ArgumentNullException(nameof(tag));
         _handle = handle ?? throw new ArgumentNullException(nameof(handle));
@@ -49,6 +51,7 @@ public sealed class PacketPump : IPacketInjector, IDisposable
         _nat = nat;
         _pid = processId;
         _dnsLookup = dnsLookup;
+        _log = logger ?? RedirectLogger.Null;
     }
 
     public void Start()
@@ -64,7 +67,7 @@ public sealed class PacketPump : IPacketInjector, IDisposable
             if (!_handle.TryRecv(buffer, out int length, out WinDivertAddress addr))
                 break;
 
-            var ctx = new PacketContext(buffer, _tracker, _nat, _pid, _dnsLookup, this, ct)
+            var ctx = new PacketContext(buffer, _tracker, _nat, _pid, _dnsLookup, this, _log, ct)
             {
                 Length = length,
                 Address = addr,
@@ -77,7 +80,7 @@ public sealed class PacketPump : IPacketInjector, IDisposable
             }
             catch (Exception ex)
             {
-                DiagnosticLogger.Log(_tag, $"pipeline threw: {ex.GetType().Name}: {ex.Message}");
+                _log.Log(_tag, $"pipeline threw: {ex.GetType().Name}: {ex.Message}");
                 ctx.Disposition = PacketDisposition.Pass;
             }
 
@@ -89,7 +92,7 @@ public sealed class PacketPump : IPacketInjector, IDisposable
 
             bool sent = _handle.TrySend(buffer, ctx.Length, ref ctx.Address);
             if (ctx.Disposition == PacketDisposition.Modified && !sent)
-                DiagnosticLogger.Log(_tag, $"  TrySend FAILED win32={Marshal.GetLastWin32Error()}");
+                _log.Log(_tag, $"  TrySend FAILED win32={Marshal.GetLastWin32Error()}");
         }
     }
 

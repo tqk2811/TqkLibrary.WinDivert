@@ -76,7 +76,7 @@ public sealed class Ipv6BlockMiddleware : IPacketMiddleware
 
         if (target)
         {
-            DiagnosticLogger.Log("V6X",
+            ctx.Logger.Log("V6X",
                 $"DROP {(ctx.Address.Outbound ? "out" : "in")} {(nextHeader == 6 ? "tcp" : "udp")} {srcIp}:{srcPort} -> {dstIp}:{dstPort} len={length}");
         }
         return target;

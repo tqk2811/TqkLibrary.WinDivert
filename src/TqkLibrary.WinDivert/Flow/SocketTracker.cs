@@ -10,8 +10,11 @@ using TqkLibrary.WinDivert.Redirect;
 namespace TqkLibrary.WinDivert.Flow;
 
 // Uses the SOCKET layer to learn which (localAddr:localPort, remoteAddr:remotePort) tuples
-// belong to the target process. CONNECT events fire *before* the SYN is sent, giving the
+// belong to the tracked processes. CONNECT events fire *before* the SYN is sent, giving the
 // interceptor a chance to rewrite outbound packets from the very first one.
+//
+// Every flow records the pid that owns it, so a tracker following several processes can tell the
+// NAT stage which process a packet really came from (per-process routing policies).
 //
 // Two reliability tricks layered on top of the raw event stream:
 //   * Pre-populate from kernel TCP/UDP tables on Start() to cover sockets that existed
@@ -23,13 +26,15 @@ namespace TqkLibrary.WinDivert.Flow;
 //     packets would otherwise fall through and leak.
 public sealed class SocketTracker : IDisposable
 {
-    // 0 = live; positive = TickCount at which the flow may be reaped.
-    private readonly ConcurrentDictionary<FlowKey, long> _tcpFlows = new();
-    private readonly ConcurrentDictionary<UdpBindKey, byte> _udpBinds = new();
+    private readonly ConcurrentDictionary<FlowKey, TcpFlowState> _tcpFlows = new();
+    private readonly ConcurrentDictionary<UdpBindKey, UdpBindState> _udpBinds = new();
 
     private readonly uint _processId;
+    private readonly short _socketPriority;
+    private readonly RedirectLogger _log;
     private readonly CancellationTokenSource _cts = new();
     private Task? _cleanupTask;
+    private bool _started;
 
     // One WinDivert SOCKET handle per tracked pid. Each handle has its own pump task and writes
     // to the shared _tcpFlows / _udpBinds dictionaries. AddProcess opens a new handle on demand
@@ -58,20 +63,45 @@ public sealed class SocketTracker : IDisposable
     public event Action<IPAddress, ushort>? UdpBindAdded;
     public event Action<IPAddress, ushort>? UdpBindRemoved;
 
-    public SocketTracker(uint processId)
+    // processId 0 means "start with nothing tracked" — pids are then added via AddProcess as a
+    // process watcher discovers them.
+    public SocketTracker(uint processId, RedirectLogger? logger = null, short socketPriority = 0)
     {
         _processId = processId;
+        _socketPriority = socketPriority;
+        _log = logger ?? RedirectLogger.Null;
         _lastReconcileTicks = Environment.TickCount - ReconcileMinIntervalMs;
     }
 
     public bool IsTrackedTcp(FlowKey key) => _tcpFlows.ContainsKey(key);
 
     public bool IsTrackedUdp(IPAddress localAddr, ushort localPort)
+        => TryGetUdpProcessId(localAddr, localPort, out _);
+
+    // Owner of a tracked TCP flow. False when the flow is unknown.
+    public bool TryGetTcpProcessId(FlowKey key, out uint processId)
     {
-        if (_udpBinds.ContainsKey(new UdpBindKey(localAddr, localPort))) return true;
-        // BIND on ANY (0.0.0.0 / ::) accepts any source address at that port.
-        if (_udpBinds.ContainsKey(new UdpBindKey(IPAddress.Any, localPort))) return true;
-        if (_udpBinds.ContainsKey(new UdpBindKey(IPAddress.IPv6Any, localPort))) return true;
+        if (_tcpFlows.TryGetValue(key, out TcpFlowState? state))
+        {
+            processId = state.ProcessId;
+            return true;
+        }
+        processId = 0;
+        return false;
+    }
+
+    // Owner of a tracked UDP bind. A bind on ANY (0.0.0.0 / ::) accepts any source address at
+    // that port, so it is checked as a fallback.
+    public bool TryGetUdpProcessId(IPAddress localAddr, ushort localPort, out uint processId)
+    {
+        if (_udpBinds.TryGetValue(new UdpBindKey(localAddr, localPort), out UdpBindState? state)
+            || _udpBinds.TryGetValue(new UdpBindKey(IPAddress.Any, localPort), out state)
+            || _udpBinds.TryGetValue(new UdpBindKey(IPAddress.IPv6Any, localPort), out state))
+        {
+            processId = state.ProcessId;
+            return true;
+        }
+        processId = 0;
         return false;
     }
 
@@ -81,8 +111,9 @@ public sealed class SocketTracker : IDisposable
 
     public void Start()
     {
-        if (_pidHandles.Count > 0) throw new InvalidOperationException("Already started");
-        AddProcess(_processId);
+        if (_started) throw new InvalidOperationException("Already started");
+        _started = true;
+        if (_processId != 0) AddProcess(_processId);
         _cleanupTask = Task.Run(() => CleanupLoop(_cts.Token));
     }
 
@@ -96,19 +127,19 @@ public sealed class SocketTracker : IDisposable
         if (_pidHandles.ContainsKey(pid)) return;
 
         string filter = $"processId == {pid} and (tcp or udp)";
-        DiagnosticLogger.Log("TRK", $"AddProcess pid={pid} filter=\"{filter}\"");
+        _log.Log("TRK", $"AddProcess pid={pid} filter=\"{filter}\"");
         WinDivertHandle handle;
         try
         {
             handle = WinDivertHandle.Open(
                 filter,
                 WinDivertLayer.Socket,
-                priority: 0,
+                priority: _socketPriority,
                 flags: WinDivertOpenFlags.Sniff | WinDivertOpenFlags.RecvOnly);
         }
         catch (Exception ex)
         {
-            DiagnosticLogger.Log("TRK", $"AddProcess pid={pid} OPEN FAILED: {ex.GetType().Name}: {ex.Message}");
+            _log.Log("TRK", $"AddProcess pid={pid} OPEN FAILED: {ex.GetType().Name}: {ex.Message}");
             return;
         }
         Task pumpTask = Task.Run(() => PumpLoop(handle, pid, _cts.Token));
@@ -126,6 +157,46 @@ public sealed class SocketTracker : IDisposable
         PrePopulateForPid(pid);
     }
 
+    // Removes a pid from the tracked set: closes its SOCKET handle and forgets every flow/bind
+    // that belongs to it, so a process the user un-selects stops being redirected without tearing
+    // down the whole redirector. Unknown pid = no-op.
+    //
+    // Flows are dropped immediately (no linger): the caller asked to stop touching this process,
+    // so trailing packets should reach the kernel unmodified rather than keep hitting the relay.
+    public bool RemoveProcess(uint pid)
+    {
+        if (!_pidHandles.TryRemove(pid, out PerPidHandle? entry)) return false;
+
+        _log.Log("TRK", $"RemoveProcess pid={pid}");
+        try { entry.Handle.Shutdown(); } catch { }
+        try { entry.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+        entry.Handle.Dispose();
+
+        int tcpRemoved = 0, udpRemoved = 0;
+        foreach (var kv in _tcpFlows)
+        {
+            if (kv.Value.ProcessId != pid) continue;
+            if (_tcpFlows.TryRemove(kv.Key, out _))
+            {
+                tcpRemoved++;
+                TcpConnectClosed?.Invoke(kv.Key);
+            }
+        }
+        foreach (var kv in _udpBinds)
+        {
+            if (kv.Value.ProcessId != pid) continue;
+            if (_udpBinds.TryRemove(kv.Key, out _))
+            {
+                udpRemoved++;
+                UdpBindRemoved?.Invoke(kv.Key.Address, kv.Key.Port);
+            }
+        }
+        _log.Log("TRK", $"RemoveProcess pid={pid} done tcpRemoved={tcpRemoved} udpRemoved={udpRemoved}");
+        return true;
+    }
+
+    public bool IsTrackedProcess(uint pid) => _pidHandles.ContainsKey(pid);
+
     private void PrePopulateForPid(uint pid)
     {
         int tcpAdded = 0, udpAdded = 0;
@@ -134,7 +205,7 @@ public sealed class SocketTracker : IDisposable
             foreach (var f in IpHlpApi.EnumerateProcessTcpFlows(pid))
             {
                 var key = new FlowKey(6, f.LocalAddr, f.LocalPort, f.RemoteAddr, f.RemotePort);
-                if (_tcpFlows.TryAdd(key, 0L))
+                if (_tcpFlows.TryAdd(key, new TcpFlowState(pid)))
                 {
                     tcpAdded++;
                     TcpConnectEstablished?.Invoke(key);
@@ -142,7 +213,7 @@ public sealed class SocketTracker : IDisposable
             }
             foreach (var b in IpHlpApi.EnumerateProcessUdpBinds(pid))
             {
-                if (_udpBinds.TryAdd(new UdpBindKey(b.LocalAddr, b.LocalPort), 1))
+                if (_udpBinds.TryAdd(new UdpBindKey(b.LocalAddr, b.LocalPort), new UdpBindState(pid)))
                 {
                     udpAdded++;
                     UdpBindAdded?.Invoke(b.LocalAddr, b.LocalPort);
@@ -151,14 +222,14 @@ public sealed class SocketTracker : IDisposable
         }
         catch (Exception ex)
         {
-            DiagnosticLogger.Log("TRK", $"PrePopulate pid={pid} failed: {ex.GetType().Name}: {ex.Message}");
+            _log.Log("TRK", $"PrePopulate pid={pid} failed: {ex.GetType().Name}: {ex.Message}");
         }
-        DiagnosticLogger.Log("TRK", $"PrePopulate pid={pid} done tcpAdded={tcpAdded} udpAdded={udpAdded}");
+        _log.Log("TRK", $"PrePopulate pid={pid} done tcpAdded={tcpAdded} udpAdded={udpAdded}");
     }
 
     // Snapshot the kernel's TCP/UDP tables for every tracked pid and add anything new. Used by
-    // PacketInterceptor when an egress packet doesn't match a known flow — covers the race where
-    // the SYN reaches the Network layer before SocketConnect has been processed.
+    // NatRedirectMiddleware when an egress packet doesn't match a known flow — covers the race
+    // where the SYN reaches the Network layer before SocketConnect has been processed.
     //
     // Throttled so a flood of unmatched packets doesn't trigger a snapshot per packet.
     internal bool TryReconcileFromKernel(out int tcpAdded, out int udpAdded)
@@ -178,7 +249,7 @@ public sealed class SocketTracker : IDisposable
                 foreach (var f in IpHlpApi.EnumerateProcessTcpFlows(pid))
                 {
                     var key = new FlowKey(6, f.LocalAddr, f.LocalPort, f.RemoteAddr, f.RemotePort);
-                    if (_tcpFlows.TryAdd(key, 0L))
+                    if (_tcpFlows.TryAdd(key, new TcpFlowState(pid)))
                     {
                         tcpAdded++;
                         TcpConnectEstablished?.Invoke(key);
@@ -186,7 +257,7 @@ public sealed class SocketTracker : IDisposable
                 }
                 foreach (var b in IpHlpApi.EnumerateProcessUdpBinds(pid))
                 {
-                    if (_udpBinds.TryAdd(new UdpBindKey(b.LocalAddr, b.LocalPort), 1))
+                    if (_udpBinds.TryAdd(new UdpBindKey(b.LocalAddr, b.LocalPort), new UdpBindState(pid)))
                     {
                         udpAdded++;
                         UdpBindAdded?.Invoke(b.LocalAddr, b.LocalPort);
@@ -196,11 +267,11 @@ public sealed class SocketTracker : IDisposable
         }
         catch (Exception ex)
         {
-            DiagnosticLogger.Log("TRK", $"Reconcile failed: {ex.GetType().Name}: {ex.Message}");
+            _log.Log("TRK", $"Reconcile failed: {ex.GetType().Name}: {ex.Message}");
             return false;
         }
         if (tcpAdded > 0 || udpAdded > 0)
-            DiagnosticLogger.Log("TRK", $"Reconcile added tcp={tcpAdded} udp={udpAdded}");
+            _log.Log("TRK", $"Reconcile added tcp={tcpAdded} udp={udpAdded}");
         return tcpAdded > 0 || udpAdded > 0;
     }
 
@@ -213,7 +284,7 @@ public sealed class SocketTracker : IDisposable
                 break;
             HandleEvent(addr);
         }
-        DiagnosticLogger.Log("TRK", $"PumpLoop pid={pid} exited");
+        _log.Log("TRK", $"PumpLoop pid={pid} exited");
     }
 
     private async Task CleanupLoop(CancellationToken ct)
@@ -227,7 +298,7 @@ public sealed class SocketTracker : IDisposable
             int reaped = 0;
             foreach (var kv in _tcpFlows)
             {
-                long expireTick = kv.Value;
+                long expireTick = kv.Value.ExpireTick;
                 if (expireTick == 0) continue;
                 // (int)(now - expireTick) handles TickCount wrap correctly via two's-complement.
                 if ((int)(now - (int)expireTick) >= 0)
@@ -236,7 +307,7 @@ public sealed class SocketTracker : IDisposable
                 }
             }
             if (reaped > 0)
-                DiagnosticLogger.Log("TRK", $"Cleanup reaped tcp={reaped} remaining={_tcpFlows.Count}");
+                _log.Log("TRK", $"Cleanup reaped tcp={reaped} remaining={_tcpFlows.Count}");
         }
     }
 
@@ -250,8 +321,9 @@ public sealed class SocketTracker : IDisposable
         ushort lp = data.LocalPort;
         ushort rp = data.RemotePort;
         byte proto = data.Protocol;
+        uint pid = data.ProcessId;
 
-        DiagnosticLogger.Log("TRK", $"evt={addr.Event} proto={proto} pid={data.ProcessId} {local}:{lp} -> {remote}:{rp}");
+        _log.Log("TRK", $"evt={addr.Event} proto={proto} pid={pid} {local}:{lp} -> {remote}:{rp}");
 
         switch (addr.Event)
         {
@@ -260,9 +332,10 @@ public sealed class SocketTracker : IDisposable
                 {
                     var key = new FlowKey(proto, local, lp, remote, rp);
                     // (Re-)mark as live: clear any pending expiry from a previous close.
-                    bool added = _tcpFlows.TryAdd(key, 0L);
-                    if (!added) _tcpFlows[key] = 0L;
-                    DiagnosticLogger.Log("TRK", $"  tcpFlows.add={added} count={_tcpFlows.Count} key={key}");
+                    var state = new TcpFlowState(pid);
+                    bool added = _tcpFlows.TryAdd(key, state);
+                    if (!added) _tcpFlows[key] = state;
+                    _log.Log("TRK", $"  tcpFlows.add={added} count={_tcpFlows.Count} key={key}");
                     if (added) TcpConnectEstablished?.Invoke(key);
                 }
                 break;
@@ -274,9 +347,10 @@ public sealed class SocketTracker : IDisposable
                     // Don't remove immediately — kernel still retransmits trailing FIN/ACK packets
                     // for several seconds. Mark with an expiry tick; the cleanup task purges later.
                     long expireAt = Environment.TickCount + TcpCloseGraceMs;
-                    bool wasLive = _tcpFlows.TryGetValue(key, out long current) && current == 0;
-                    _tcpFlows[key] = expireAt;
-                    DiagnosticLogger.Log("TRK", $"  tcpFlows.markClose wasLive={wasLive} graceMs={TcpCloseGraceMs} count={_tcpFlows.Count} key={key}");
+                    bool wasLive = _tcpFlows.TryGetValue(key, out TcpFlowState? current) && current.ExpireTick == 0;
+                    if (current != null) current.ExpireTick = expireAt;
+                    else _tcpFlows[key] = new TcpFlowState(pid, expireAt);
+                    _log.Log("TRK", $"  tcpFlows.markClose wasLive={wasLive} graceMs={TcpCloseGraceMs} count={_tcpFlows.Count} key={key}");
                     if (wasLive) TcpConnectClosed?.Invoke(key);
                 }
                 else if (proto == 17)
@@ -289,7 +363,7 @@ public sealed class SocketTracker : IDisposable
             case WinDivertEvent.SocketBind:
                 if (proto == 17)
                 {
-                    if (_udpBinds.TryAdd(new UdpBindKey(local, lp), 1))
+                    if (_udpBinds.TryAdd(new UdpBindKey(local, lp), new UdpBindState(pid)))
                         UdpBindAdded?.Invoke(local, lp);
                 }
                 break;

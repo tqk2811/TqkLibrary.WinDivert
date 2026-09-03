@@ -34,10 +34,19 @@ public sealed class PacketContext
     // Shared per-redirector services available to every middleware.
     public SocketTracker Tracker { get; }
     public NatTable Nat { get; }
+
+    // The redirector's ROOT pid — useful for log lines only. A redirector can track many pids at
+    // once, so the owner of the packet in hand must come from Tracker.TryGetTcpProcessId /
+    // TryGetUdpProcessId, not from here.
     public uint ProcessId { get; }
     public DnsCacheLookup? DnsLookup { get; }
     public IPacketInjector Injector { get; }
     public CancellationToken CancellationToken { get; }
+
+    // Diagnostic sink of the owning redirector. Never null (RedirectLogger.Null when logging is
+    // off), so a middleware can log unconditionally. A middleware that logs from a background
+    // task must capture this reference before returning — the context itself is reused.
+    public RedirectLogger Logger { get; }
 
     public PacketContext(
         byte[] buffer,
@@ -46,6 +55,7 @@ public sealed class PacketContext
         uint processId,
         DnsCacheLookup? dnsLookup,
         IPacketInjector injector,
+        RedirectLogger logger,
         CancellationToken cancellationToken)
     {
         Buffer = buffer;
@@ -54,6 +64,7 @@ public sealed class PacketContext
         ProcessId = processId;
         DnsLookup = dnsLookup;
         Injector = injector;
+        Logger = logger ?? RedirectLogger.Null;
         CancellationToken = cancellationToken;
     }
 

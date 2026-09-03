@@ -2,9 +2,9 @@ using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 
-namespace TqkLibrary.WinDivert.Demo.Process;
+namespace TqkLibrary.WinDivert.ProcessControl;
 
-internal static partial class SuspendedProcessLauncher
+public static partial class SuspendedProcessLauncher
 {
     private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;

@@ -22,10 +22,15 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
 
     private readonly DohResolver _resolver;
     private readonly SemaphoreSlim _concurrency;
+    // Optional: DoH answers are the only DNS the process ever sees when this stage is on, so they
+    // are also the only source of IP -> domain knowledge. Feeding them here keeps domain-based
+    // routing working with secure DNS enabled.
+    private readonly ReverseDnsTable? _reverseDns;
 
-    public DnsOverHttpsMiddleware(DohResolver resolver, int maxConcurrentQueries = 32)
+    public DnsOverHttpsMiddleware(DohResolver resolver, ReverseDnsTable? reverseDns = null, int maxConcurrentQueries = 32)
     {
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _reverseDns = reverseDns;
         if (maxConcurrentQueries < 1) maxConcurrentQueries = 1;
         _concurrency = new SemaphoreSlim(maxConcurrentQueries, maxConcurrentQueries);
     }
@@ -59,18 +64,20 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         uint ifIdx = ctx.Address.Network.IfIdx;
         uint subIfIdx = ctx.Address.Network.SubIfIdx;
         IPacketInjector injector = ctx.Injector;
+        // Captured now: the context is reused for the next packet the moment this method returns.
+        RedirectLogger log = ctx.Logger;
         CancellationToken token = ctx.CancellationToken;
 
         // Swallow the original query; the resolved answer is injected later (or never, on failure).
         ctx.Drop();
 
-        _ = Task.Run(() => ResolveAndInjectAsync(query, clientIp, clientPort, serverIp, ifIdx, subIfIdx, injector, token));
+        _ = Task.Run(() => ResolveAndInjectAsync(query, clientIp, clientPort, serverIp, ifIdx, subIfIdx, injector, log, token));
         return Task.CompletedTask;
     }
 
     private async Task ResolveAndInjectAsync(
         byte[] query, IPAddress clientIp, ushort clientPort, IPAddress serverIp,
-        uint ifIdx, uint subIfIdx, IPacketInjector injector, CancellationToken token)
+        uint ifIdx, uint subIfIdx, IPacketInjector injector, RedirectLogger log, CancellationToken token)
     {
         try { await _concurrency.WaitAsync(token).ConfigureAwait(false); }
         catch (OperationCanceledException) { return; }
@@ -80,14 +87,20 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             byte[]? response = await _resolver.ResolveAsync(query, token).ConfigureAwait(false);
             if (response == null || response.Length == 0) return;
 
+            if (_reverseDns != null)
+            {
+                var records = DnsMessageParser.ParseAddressAnswers(response, 0, response.Length);
+                if (records.Count > 0) _reverseDns.AddRange(records);
+            }
+
             byte[] packet = BuildInboundReply(serverIp, clientIp, clientPort, response);
             WinDivertAddress addr = BuildInboundAddress(ifIdx, subIfIdx);
             bool ok = injector.Inject(packet, packet.Length, addr);
-            DiagnosticLogger.Log("DOH", $"{clientIp}:{clientPort} <- {serverIp}:{DnsPort} resp={response.Length}B inject={ok}");
+            log.Log("DOH", $"{clientIp}:{clientPort} <- {serverIp}:{DnsPort} resp={response.Length}B inject={ok}");
         }
         catch (Exception ex)
         {
-            DiagnosticLogger.Log("DOH", $"inject failed: {ex.GetType().Name}: {ex.Message}");
+            log.Log("DOH", $"inject failed: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {

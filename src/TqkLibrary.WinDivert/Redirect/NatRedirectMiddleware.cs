@@ -61,7 +61,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         byte proto = (byte)p.Protocol;
         int expectedRelay = isTcp ? _tcpRelayPort : _udpRelayPort;
 
-        DiagnosticLogger.Log("INT", $"recv {Describe(p, ctx.Address, ctx.Length)}");
+        ctx.Logger.Log("INT", $"recv {Describe(p, ctx.Address, ctx.Length)}");
 
         // Case 1: egress from target process on a real interface → redirect to local relay.
         if (ctx.Address.Outbound && !ctx.Address.Loopback)
@@ -84,10 +84,10 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
                     ? ctx.Tracker.IsTrackedTcp(tcpKey)
                     : ctx.Tracker.IsTrackedUdp(srcIp, srcPort);
                 if (tracked)
-                    DiagnosticLogger.Log("INT", "  egress reconciled from kernel table");
+                    ctx.Logger.Log("INT", "  egress reconciled from kernel table");
             }
 
-            DiagnosticLogger.Log("INT", $"  egress tracked={tracked} tcpFlows={ctx.Tracker.TcpSnapshot.Count} natCount={ctx.Nat.Count}");
+            ctx.Logger.Log("INT", $"  egress tracked={tracked} tcpFlows={ctx.Tracker.TcpSnapshot.Count} natCount={ctx.Nat.Count}");
             if (!tracked) return next(ctx);
 
             // Destination-port whitelist: tracked packets whose dstPort is outside the configured
@@ -95,16 +95,24 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             // they DO NOT traverse the relay/proxy — caller opts into this trade-off explicitly.
             if (_dstPortFilter != null && !_dstPortFilter.Contains(dstPort))
             {
-                DiagnosticLogger.Log("INT", $"  -> SKIP redirect, dstPort={dstPort} not in filter (passthrough)");
+                ctx.Logger.Log("INT", $"  -> SKIP redirect, dstPort={dstPort} not in filter (passthrough)");
                 return next(ctx);
             }
 
+            // Which tracked process this packet really belongs to. With several pids tracked at
+            // once (root + children, or several unrelated targets) the redirector's root pid says
+            // nothing, and the NAT entry is what later tells the relay handler whose routing
+            // policy applies. Fall back to the root pid only if the flow lookup misses.
+            uint flowPid = isTcp
+                ? (ctx.Tracker.TryGetTcpProcessId(tcpKey, out uint tcpPid) ? tcpPid : ctx.ProcessId)
+                : (ctx.Tracker.TryGetUdpProcessId(srcIp, srcPort, out uint udpPid) ? udpPid : ctx.ProcessId);
+
             // Store the real-interface IfIdx so the reply path can reinject on the same interface.
-            var entry = new NatEntry(ctx.ProcessId, proto, srcIp, srcPort, dstIp, dstPort, ctx.Address.Network.IfIdx, ctx.Address.Network.SubIfIdx);
+            var entry = new NatEntry(flowPid, proto, srcIp, srcPort, dstIp, dstPort, ctx.Address.Network.IfIdx, ctx.Address.Network.SubIfIdx);
             ctx.Nat.Upsert(entry);
             string? dnsName = ctx.DnsLookup?.Resolve(dstIp);
             string dnsTag = dnsName != null ? $" name={dnsName}" : "";
-            DiagnosticLogger.Log("INT", $"  nat.upsert {(isTcp ? "tcp" : "udp")} srcPort={srcPort} -> origDst={dstIp}:{dstPort}{dnsTag} ifIdx={ctx.Address.Network.IfIdx}");
+            ctx.Logger.Log("INT", $"  nat.upsert {(isTcp ? "tcp" : "udp")} srcPort={srcPort} -> origDst={dstIp}:{dstPort}{dnsTag} ifIdx={ctx.Address.Network.IfIdx}");
 
             IPAddress loopback = p.IsIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
             p.SetSource(loopback, srcPort);
@@ -116,7 +124,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             ctx.Address.Loopback = true;
             ctx.Address.Network.IfIdx = 1;
             ctx.Address.Network.SubIfIdx = 0;
-            DiagnosticLogger.Log("INT", $"  -> REDIRECT 127.0.0.1:{srcPort} -> 127.0.0.1:{expectedRelay} (Outbound=true Loopback=true IfIdx=1)");
+            ctx.Logger.Log("INT", $"  -> REDIRECT 127.0.0.1:{srcPort} -> 127.0.0.1:{expectedRelay} (Outbound=true Loopback=true IfIdx=1)");
             ctx.MarkModified();
             return Task.CompletedTask;
         }
@@ -126,7 +134,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         {
             ushort dstPort = p.DestinationPort;
             NatEntry? entry = ctx.Nat.Find(proto, dstPort);
-            DiagnosticLogger.Log("INT", $"  reply candidate dstPort={dstPort} natHit={(entry != null)} addr.Outbound={ctx.Address.Outbound}");
+            ctx.Logger.Log("INT", $"  reply candidate dstPort={dstPort} natHit={(entry != null)} addr.Outbound={ctx.Address.Outbound}");
             if (entry == null) return next(ctx);
 
             // Loopback packets are captured twice (sender outbound + receiver inbound). Handle on
@@ -134,7 +142,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             // and produce a spurious RST, so drop it.
             if (!ctx.Address.Outbound)
             {
-                DiagnosticLogger.Log("INT", "  -> DROP loopback inbound duplicate");
+                ctx.Logger.Log("INT", "  -> DROP loopback inbound duplicate");
                 ctx.Drop();
                 return Task.CompletedTask;
             }
@@ -147,7 +155,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             ctx.Address.Outbound = false;
             ctx.Address.Network.IfIdx = entry.IfIdx;
             ctx.Address.Network.SubIfIdx = entry.SubIfIdx;
-            DiagnosticLogger.Log("INT", $"  -> REPLY rewrite to {entry.OriginalDestinationAddress}:{entry.OriginalDestinationPort} -> {entry.OriginalSourceAddress}:{entry.OriginalSourcePort} ifIdx={entry.IfIdx}");
+            ctx.Logger.Log("INT", $"  -> REPLY rewrite to {entry.OriginalDestinationAddress}:{entry.OriginalDestinationPort} -> {entry.OriginalSourceAddress}:{entry.OriginalSourcePort} ifIdx={entry.IfIdx}");
             ctx.MarkModified();
             return Task.CompletedTask;
         }

@@ -5,6 +5,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Interfaces;
+using TqkLibrary.WinDivert.Logging;
+using System.IO;
 
 namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
@@ -159,7 +161,12 @@ internal sealed class ProxyCommandModule : ICommandModule
         string proxyDisplay = MaskUserInfo(proxyUrl);
         // Construct bridge once so the same instance services every tunnel for this run.
         // Disposed implicitly when the process exits — no per-tunnel teardown needed.
-        ILoggerFactory loggerFactory = new ProxyLoggerBridge(minConsoleLevel: LogLevel.Warning);
+        // One diagnostic sink for the whole run: the redirector writes packet-level trace into it
+        // and the proxy bridge writes tunnel logs into the same file.
+        string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
+            ?? Path.Combine(Environment.CurrentDirectory, "windivert-interceptor.log");
+        using var diagnosticLog = new RedirectLogger(filePath: logPath);
+        ILoggerFactory loggerFactory = new ProxyLoggerBridge(diagnosticLog, minConsoleLevel: LogLevel.Warning);
         try
         {
             proxySource = ProxyUriParser.Parse(proxyUrl, loggerFactory);
@@ -196,6 +203,7 @@ internal sealed class ProxyCommandModule : ICommandModule
                     enableDnsLookup: !noDnsResolve,
                     secureDns,
                     dohEndpoint,
+                    diagnosticLog,
                     ct).ConfigureAwait(false);
                 return rc;
             }
@@ -234,6 +242,7 @@ internal sealed class ProxyCommandModule : ICommandModule
                 enableDnsLookup: !noDnsResolve,
                 secureDns,
                 dohEndpoint,
+                diagnosticLog,
                 ct).ConfigureAwait(false);
         }
         finally

@@ -21,7 +21,7 @@ public sealed class BlockTargetUdpMiddleware : IPacketMiddleware
             && ctx.Address.Outbound && !ctx.Address.Loopback
             && ctx.Tracker.IsTrackedUdp(p.Source, p.SourcePort))
         {
-            DiagnosticLogger.Log("UDX", $"DROP udp {p.Source}:{p.SourcePort} -> {p.Destination}:{p.DestinationPort} len={ctx.Length}");
+            ctx.Logger.Log("UDX", $"DROP udp {p.Source}:{p.SourcePort} -> {p.Destination}:{p.DestinationPort} len={ctx.Length}");
             ctx.Drop();
             return Task.CompletedTask;
         }

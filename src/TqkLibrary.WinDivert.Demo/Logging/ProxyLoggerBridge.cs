@@ -1,11 +1,11 @@
 using System;
 using Microsoft.Extensions.Logging;
-using TqkLibrary.WinDivert.Redirect;
+using TqkLibrary.WinDivert.Logging;
 
 namespace TqkLibrary.WinDivert.Demo.Logging;
 
 // Routes TqkLibrary.Proxy's ILogger output to two sinks:
-//   * DiagnosticLogger (full detail, written to the windivert-interceptor.log file)
+//   * the redirector's RedirectLogger (full detail, same file as the packet-level trace)
 //   * Console for Warning and above, so connection failures surface in the live demo output
 //
 // TqkLibrary.Proxy reads Singleton.LoggerFactory once at the construction of any BaseLogger
@@ -13,14 +13,17 @@ namespace TqkLibrary.WinDivert.Demo.Logging;
 // proxySource.GetConnectSourceAsync / GetUdpAssociateSourceAsync call.
 internal sealed class ProxyLoggerBridge : ILoggerFactory
 {
+    private readonly RedirectLogger _log;
     private readonly LogLevel _minConsoleLevel;
 
-    public ProxyLoggerBridge(LogLevel minConsoleLevel = LogLevel.Warning)
+    // The logger is owned by the caller (the command module), not by this bridge.
+    public ProxyLoggerBridge(RedirectLogger log, LogLevel minConsoleLevel = LogLevel.Warning)
     {
+        _log = log ?? throw new ArgumentNullException(nameof(log));
         _minConsoleLevel = minConsoleLevel;
     }
 
-    public ILogger CreateLogger(string categoryName) => new BridgeLogger(ShortName(categoryName), _minConsoleLevel);
+    public ILogger CreateLogger(string categoryName) => new BridgeLogger(_log, ShortName(categoryName), _minConsoleLevel);
 
     public void AddProvider(ILoggerProvider provider) { }
     public void Dispose() { }
@@ -33,11 +36,13 @@ internal sealed class ProxyLoggerBridge : ILoggerFactory
 
     private sealed class BridgeLogger : ILogger
     {
+        private readonly RedirectLogger _log;
         private readonly string _category;
         private readonly LogLevel _minConsoleLevel;
 
-        public BridgeLogger(string category, LogLevel minConsoleLevel)
+        public BridgeLogger(RedirectLogger log, string category, LogLevel minConsoleLevel)
         {
+            _log = log;
             _category = category;
             _minConsoleLevel = minConsoleLevel;
         }
@@ -54,7 +59,7 @@ internal sealed class ProxyLoggerBridge : ILoggerFactory
 
             // Replace newlines so multi-line proxy traces stay in one log line.
             string flat = body.Replace("\r\n", " \\n ").Replace("\n", " \\n ");
-            DiagnosticLogger.Log($"PXY/{LevelChar(logLevel)}/{_category}", flat);
+            _log.Log($"PXY/{LevelChar(logLevel)}/{_category}", flat);
 
             if (logLevel >= _minConsoleLevel)
                 Console.WriteLine($"  [proxy {LevelText(logLevel)}] {_category}: {body}");

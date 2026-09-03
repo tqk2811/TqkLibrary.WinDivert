@@ -18,11 +18,13 @@ namespace TqkLibrary.WinDivert.SecureDns;
 public sealed class DohResolver : IDisposable
 {
     private readonly HttpClient _http;
+    private readonly RedirectLogger _log;
 
     public Uri Endpoint { get; }
 
-    public DohResolver(Uri? endpoint = null, TimeSpan? timeout = null)
+    public DohResolver(Uri? endpoint = null, TimeSpan? timeout = null, RedirectLogger? logger = null)
     {
+        _log = logger ?? RedirectLogger.Null;
         Endpoint = endpoint ?? new Uri("https://1.1.1.1/dns-query");
 #if NET462
         // net462 does not negotiate TLS 1.2 by default; without this the DoH handshake fails.
@@ -47,14 +49,14 @@ public sealed class DohResolver : IDisposable
             using HttpResponseMessage response = await _http.SendAsync(request, ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                DiagnosticLogger.Log("DOH", $"HTTP {(int)response.StatusCode} from {Endpoint}");
+                _log.Log("DOH", $"HTTP {(int)response.StatusCode} from {Endpoint}");
                 return null;
             }
             return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            DiagnosticLogger.Log("DOH", $"resolve failed via {Endpoint}: {ex.GetType().Name}: {ex.Message}");
+            _log.Log("DOH", $"resolve failed via {Endpoint}: {ex.GetType().Name}: {ex.Message}");
             return null;
         }
     }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using TqkLibrary.WinDivert.Pipeline;
 
 namespace TqkLibrary.WinDivert.Redirect;
@@ -11,7 +12,9 @@ public sealed class RedirectOptions
     public uint ProcessId { get; set; }
     public RedirectProtocol Protocols { get; set; } = RedirectProtocol.Tcp;
 
-    // If null, RedirectedTcpConnection.RelayAsync() is called for a default pass-through pipe.
+    // If null, RedirectedTcpConnection.RelayDirectAsync() is called: the relay opens a socket to
+    // the original destination and pipes verbatim. Set a handler to route the connection somewhere
+    // else (upstream proxy, VPN, block) — nothing is connected until the handler asks for it.
     public TcpConnectionHandler? TcpConnectionHandler { get; set; }
 
     // If null, UDP datagrams are forwarded unchanged.
@@ -19,11 +22,23 @@ public sealed class RedirectOptions
 
     // Applied to the WinDivert NETWORK handle priority (-30000..30000; higher = earlier).
     public short NetworkPriority { get; set; } = 100;
-    public short SocketPriority { get; set; } = 100;
+
+    // Applied to the per-process WinDivert SOCKET handles. These are sniffing handles, so the
+    // priority only decides the order relative to other WinDivert clients; 0 keeps this tracker
+    // out of the way of anything the user runs alongside it.
+    public short SocketPriority { get; set; } = 0;
 
     // If set, every captured packet, redirect, NAT entry, and socket event is appended to this
-    // file with a UTC timestamp. Null disables diagnostic logging (no overhead).
+    // file with a UTC timestamp. Null disables file logging. Ignored when Logger is set.
     public string? LogFilePath { get; set; }
+
+    // Host logging for the same stream. Ignored when Logger is set; not disposed by the redirector.
+    public ILoggerFactory? LoggerFactory { get; set; }
+
+    // A logger built by the caller — use this to subscribe to RedirectLogger.EntryWritten (e.g. a
+    // UI log pane) or to share one sink across several redirectors. When set, LogFilePath and
+    // LoggerFactory are not used and the redirector does NOT dispose the logger.
+    public RedirectLogger? Logger { get; set; }
 
     // When true, opens a parallel WinDivert handle that drops IPv6 TCP/UDP traffic belonging
     // to the target process. The interceptor itself is IPv4-only, so without this any AAAA-
@@ -50,6 +65,16 @@ public sealed class RedirectOptions
     // with their resolved domain names. Names accumulate within the redirector's lifetime, so
     // a name once seen for an IP keeps resolving even after the OS DNS cache evicts it.
     public bool EnableDnsLookup { get; set; } = true;
+
+    // When true, DNS answers seen on the wire (UDP source port 53) are parsed and their
+    // IP -> domain mappings kept in ProcessRedirector.ReverseDns. This is what makes domain-based
+    // routing possible for connections that expose no name of their own (no SNI, no Host header),
+    // and it works even when the lookup was made by the Windows resolver service rather than by
+    // the target process. Implies capturing UDP on the NETWORK handle.
+    //
+    // With EnableSecureDns the classic answers never appear, but the DoH answers feed the same
+    // table, so domain routing keeps working either way.
+    public bool EnableDnsSniff { get; set; } = true;
 
     // When true, the target's outbound IPv4 UDP/53 (classic DNS) is intercepted and resolved over
     // HTTPS (DoH) instead of being forwarded; the answer is injected back to the process. Lets DNS

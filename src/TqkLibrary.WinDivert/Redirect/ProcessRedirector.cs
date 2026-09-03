@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using TqkLibrary.WinDivert.Flow;
 using TqkLibrary.WinDivert.SecureDns;
 using TqkLibrary.WinDivert.Native;
@@ -18,6 +19,10 @@ namespace TqkLibrary.WinDivert.Redirect;
 public sealed class ProcessRedirector : IDisposable
 {
     private readonly RedirectOptions _options;
+    private readonly RedirectLogger _log;
+    // True when this redirector created the logger and must dispose it. A logger handed in through
+    // RedirectOptions.Logger belongs to the caller.
+    private readonly bool _ownsLog;
     private SocketTracker? _tracker;
     private TcpRelayServer? _tcpRelay;
     private UdpRelayServer? _udpRelay;
@@ -31,6 +36,13 @@ public sealed class ProcessRedirector : IDisposable
     public int TcpRelayPort => _tcpRelay?.Port ?? 0;
     public int UdpRelayPort => _udpRelay?.Port ?? 0;
     public DnsCacheLookup? DnsLookup => _dnsLookup;
+
+    /// <summary>
+    /// IP -&gt; domain learned from DNS answers (classic sniff and/or DoH). Populated only while
+    /// RedirectOptions.EnableDnsSniff or EnableSecureDns is on; always non-null so a connection
+    /// handler can query it without a null check.
+    /// </summary>
+    public ReverseDnsTable ReverseDns { get; } = new ReverseDnsTable();
 
     /// <summary>
     /// Inject a UDP datagram back to the target process as if it came from the original
@@ -54,22 +66,57 @@ public sealed class ProcessRedirector : IDisposable
         _tracker.AddProcess(pid);
     }
 
+    /// <summary>
+    /// Drop a process from the redirect scope: its SOCKET handle is closed and its flows forgotten,
+    /// so new connections go out untouched. Returns false when the pid wasn't tracked. Existing
+    /// relayed connections of that process keep running until they close on their own.
+    /// </summary>
+    public bool RemoveTrackedProcessId(uint pid)
+    {
+        if (_tracker is null) throw new InvalidOperationException("Redirector not started");
+        return _tracker.RemoveProcess(pid);
+    }
+
+    /// <summary>Process ids currently in the redirect scope.</summary>
+    public IReadOnlyCollection<uint> TrackedProcessIds
+        => _tracker?.TrackedProcessIds ?? Array.Empty<uint>();
+
+    public bool IsTrackedProcessId(uint pid) => _tracker?.IsTrackedProcess(pid) == true;
+
     public event Action<FlowKey>? TcpConnectEstablished;
     public event Action<FlowKey>? TcpConnectClosed;
+
+    /// <summary>Raised when the relay accepts / finishes a redirected TCP connection.</summary>
+    public event Action<RedirectedTcpConnection>? TcpConnectionOpened;
+    public event Action<RedirectedTcpConnection>? TcpConnectionClosed;
+
+    /// <summary>Diagnostic sink used by every component of this redirector.</summary>
+    public RedirectLogger Logger => _log;
 
     public ProcessRedirector(RedirectOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        if (options.ProcessId == 0) throw new ArgumentException("ProcessId is required", nameof(options));
+        // ProcessId 0 is allowed: the redirector then starts with an empty scope and the caller
+        // feeds pids in with AddTrackedProcessId as a process watcher discovers them.
         if (options.Protocols == RedirectProtocol.None) throw new ArgumentException("At least one protocol required", nameof(options));
+
+        if (options.Logger != null)
+        {
+            _log = options.Logger;
+            _ownsLog = false;
+        }
+        else
+        {
+            _log = new RedirectLogger(options.LoggerFactory, options.LogFilePath);
+            _ownsLog = true;
+        }
     }
 
     public void Start()
     {
-        DiagnosticLogger.Configure(_options.LogFilePath);
-        DiagnosticLogger.Log("RDR", $"Start pid={_options.ProcessId} protocols={_options.Protocols} netPri={_options.NetworkPriority} sockPri={_options.SocketPriority}");
+        _log.Log("RDR", $"Start pid={_options.ProcessId} protocols={_options.Protocols} netPri={_options.NetworkPriority} sockPri={_options.SocketPriority}");
 
-        _tracker = new SocketTracker(_options.ProcessId);
+        _tracker = new SocketTracker(_options.ProcessId, _log, _options.SocketPriority);
         _tracker.TcpConnectEstablished += k => TcpConnectEstablished?.Invoke(k);
         _tracker.TcpConnectClosed += k => TcpConnectClosed?.Invoke(k);
         _tracker.Start();
@@ -77,7 +124,9 @@ public sealed class ProcessRedirector : IDisposable
         int tcpPort = 0, udpPort = 0;
         if ((_options.Protocols & RedirectProtocol.Tcp) != 0)
         {
-            _tcpRelay = new TcpRelayServer(_nat, _options.TcpConnectionHandler);
+            _tcpRelay = new TcpRelayServer(_nat, _options.TcpConnectionHandler, _log);
+            _tcpRelay.ConnectionOpened += c => TcpConnectionOpened?.Invoke(c);
+            _tcpRelay.ConnectionClosed += c => TcpConnectionClosed?.Invoke(c);
             _tcpRelay.Start();
             tcpPort = _tcpRelay.Port;
         }
@@ -88,13 +137,13 @@ public sealed class ProcessRedirector : IDisposable
             udpPort = _udpRelay.Port;
         }
 
-        DiagnosticLogger.Log("RDR", $"Relay ports tcp={tcpPort} udp={udpPort}");
+        _log.Log("RDR", $"Relay ports tcp={tcpPort} udp={udpPort}");
 
         if (_options.EnableDnsLookup)
         {
             _dnsLookup = new DnsCacheLookup();
             _dnsLookup.Start();
-            DiagnosticLogger.Log("RDR", "DNS cache lookup ENABLED");
+            _log.Log("RDR", "DNS cache lookup ENABLED");
         }
 
         // ---- IPv4 NETWORK pipeline ----
@@ -104,22 +153,30 @@ public sealed class ProcessRedirector : IDisposable
         // never see the UDP packets.
         bool captureTcp = (_options.Protocols & RedirectProtocol.Tcp) != 0;
         bool captureUdp = (_options.Protocols & RedirectProtocol.Udp) != 0
-            || _options.EnableSecureDns || _options.BlockUnhandledTargetUdp;
+            || _options.EnableSecureDns || _options.BlockUnhandledTargetUdp || _options.EnableDnsSniff;
         string proto = BuildProtoFilter(captureTcp, captureUdp);
         string v4Filter = $"ip and ({proto}) and not impostor";
         string filterDesc = (_options.RedirectDestinationPorts == null || _options.RedirectDestinationPorts.Count == 0)
             ? "all"
             : string.Join(",", _options.RedirectDestinationPorts);
-        DiagnosticLogger.Log("INT", $"Open filter=\"{v4Filter}\" priority={_options.NetworkPriority} tcpRelay={tcpPort} udpRelay={udpPort} pid={_options.ProcessId} dstPortFilter={filterDesc}");
+        _log.Log("INT", $"Open filter=\"{v4Filter}\" priority={_options.NetworkPriority} tcpRelay={tcpPort} udpRelay={udpPort} pid={_options.ProcessId} dstPortFilter={filterDesc}");
         WinDivertHandle v4Handle = WinDivertHandle.Open(v4Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
 
         var v4Builder = new PacketPipelineBuilder();
-        // DNS-over-HTTPS runs FIRST so it claims the target's DNS/53 before NAT could redirect it.
+        // Learn IP -> domain from DNS answers before anything can claim or rewrite them. Answers
+        // never belong to the egress or reply legs NAT handles, so ordering is free here; putting
+        // it first just guarantees it also sees answers a later stage might drop.
+        if (_options.EnableDnsSniff)
+        {
+            v4Builder.Use(new DnsAnswerSniffMiddleware(ReverseDns));
+            _log.Log("RDR", "DNS answer sniffing ENABLED");
+        }
+        // DNS-over-HTTPS runs before NAT so it claims the target's DNS/53 before NAT could redirect it.
         if (_options.EnableSecureDns)
         {
-            _dohResolver = new DohResolver(_options.DohEndpoint);
-            v4Builder.Use(new DnsOverHttpsMiddleware(_dohResolver));
-            DiagnosticLogger.Log("RDR", $"Secure DNS ENABLED via DoH {_options.DohEndpoint}");
+            _dohResolver = new DohResolver(_options.DohEndpoint, logger: _log);
+            v4Builder.Use(new DnsOverHttpsMiddleware(_dohResolver, ReverseDns));
+            _log.Log("RDR", $"Secure DNS ENABLED via DoH {_options.DohEndpoint}");
         }
         // NAT redirect (egress + loopback-reply legs) for the enabled protocols.
         v4Builder.Use(new NatRedirectMiddleware(tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts));
@@ -129,10 +186,10 @@ public sealed class ProcessRedirector : IDisposable
         if (_options.BlockUnhandledTargetUdp)
         {
             v4Builder.Use(new BlockTargetUdpMiddleware());
-            DiagnosticLogger.Log("RDR", "Block-unhandled-target-UDP ENABLED");
+            _log.Log("RDR", "Block-unhandled-target-UDP ENABLED");
         }
 
-        _ipv4Pump = new PacketPump("INT", v4Handle, v4Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup);
+        _ipv4Pump = new PacketPump("INT", v4Handle, v4Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup, _log);
         _ipv4Pump.Start();
 
         // ---- IPv6 NETWORK pipeline: drop the target's IPv6 (the IPv4 pump is v4-only, so v6
@@ -140,11 +197,11 @@ public sealed class ProcessRedirector : IDisposable
         if (_options.BlockIpv6)
         {
             string v6Filter = "ipv6 and (tcp or udp) and not impostor";
-            DiagnosticLogger.Log("V6X", $"Open filter=\"{v6Filter}\" priority={_options.NetworkPriority}");
+            _log.Log("V6X", $"Open filter=\"{v6Filter}\" priority={_options.NetworkPriority}");
             WinDivertHandle v6Handle = WinDivertHandle.Open(v6Filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
             var v6Builder = new PacketPipelineBuilder();
             v6Builder.Use(new Ipv6BlockMiddleware());
-            _ipv6Pump = new PacketPump("V6X", v6Handle, v6Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup);
+            _ipv6Pump = new PacketPump("V6X", v6Handle, v6Builder.Build(), _tracker, _nat, _options.ProcessId, _dnsLookup, _log);
             _ipv6Pump.Start();
         }
     }
@@ -159,7 +216,7 @@ public sealed class ProcessRedirector : IDisposable
 
     public void Dispose()
     {
-        DiagnosticLogger.Log("RDR", "Dispose");
+        _log.Log("RDR", "Dispose");
         _ipv6Pump?.Dispose();
         _ipv4Pump?.Dispose();
         _tcpRelay?.Dispose();
@@ -167,6 +224,6 @@ public sealed class ProcessRedirector : IDisposable
         _tracker?.Dispose();
         _dohResolver?.Dispose();
         _dnsLookup?.Dispose();
-        DiagnosticLogger.Close();
+        if (_ownsLog) _log.Dispose();
     }
 }

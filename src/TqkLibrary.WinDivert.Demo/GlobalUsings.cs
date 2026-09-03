@@ -16,4 +16,5 @@ global using TqkLibrary.WinDivert.Demo.Running;
 global using TqkLibrary.WinDivert.Demo.Logging;
 global using TqkLibrary.WinDivert.Demo.Extensions;
 global using TqkLibrary.WinDivert.Demo.Process;
-global using TqkLibrary.WinDivert.Demo.Process.Models;
+global using TqkLibrary.WinDivert.ProcessControl;
+global using TqkLibrary.WinDivert.ProcessControl.Models;

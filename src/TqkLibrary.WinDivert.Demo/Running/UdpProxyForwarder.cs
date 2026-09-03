@@ -8,105 +8,163 @@ using TqkLibrary.WinDivert.Redirect;
 
 namespace TqkLibrary.WinDivert.Demo.Running;
 
-// Forwards captured UDP datagrams through a SOCKS5 UDP ASSOCIATE tunnel and routes the
-// replies back to the originating process via ProcessRedirector.InjectUdpReplyToProcessAsync.
+// Forwards captured UDP datagrams through SOCKS5 UDP ASSOCIATE tunnels and routes the replies
+// back to the originating process via ProcessRedirector.InjectUdpReplyToProcessAsync.
 //
-// Limitation: SOCKS5 UDP responses identify the peer only by (server endpoint), so if two
-// process sockets target the same server we route the reply to whichever client port we
-// saw last for that server. For ordinary game/app traffic each (process port -> server)
-// flow is unique, so this is rarely an issue in practice.
+// One tunnel per PROCESS SOURCE PORT. A SOCKS5 UDP reply identifies only the remote peer, never
+// the local socket it belongs to, so a single shared tunnel cannot tell two process sockets
+// talking to the same server apart — replies would go to whichever port was seen last. Giving
+// each source port its own tunnel makes the tunnel itself the correlation key.
 internal sealed class UdpProxyForwarder : IDisposable
 {
     private readonly IProxySource _proxySource;
     private readonly ProcessRedirector _redirector;
-    private readonly CancellationToken _externalCt;
     private readonly CancellationTokenSource _cts;
-    private readonly ConcurrentDictionary<IPEndPoint, ushort> _serverToClientPort = new();
-    private IUdpAssociateSource? _tunnel;
-    private Task? _receiveLoop;
+    private readonly ConcurrentDictionary<ushort, PortTunnel> _tunnels = new();
+    private volatile bool _disposed;
 
     public UdpProxyForwarder(IProxySource proxySource, ProcessRedirector redirector, CancellationToken ct)
     {
         _proxySource = proxySource ?? throw new ArgumentNullException(nameof(proxySource));
         _redirector = redirector ?? throw new ArgumentNullException(nameof(redirector));
-        _externalCt = ct;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
     }
 
-    public IPEndPoint? RelayEndPoint => _tunnel?.RelayEndPoint;
+    // Endpoint of the tunnel opened first, purely for the startup banner.
+    public IPEndPoint? RelayEndPoint { get; private set; }
 
+    // Opens one probe tunnel so a proxy that refuses UDP ASSOCIATE fails fast at startup instead
+    // of silently dropping the first datagram. The probe is kept and reused by the first port
+    // that needs it, so nothing is wasted.
     public async Task InitAsync()
     {
-        _tunnel = await _proxySource.GetUdpAssociateSourceAsync(Guid.NewGuid(), _cts.Token).ConfigureAwait(false);
-        await _tunnel.AssociateAsync(_cts.Token).ConfigureAwait(false);
-        _receiveLoop = Task.Run(() => ReceiveLoopAsync(_cts.Token));
+        IUdpAssociateSource probe = await _proxySource.GetUdpAssociateSourceAsync(Guid.NewGuid(), _cts.Token).ConfigureAwait(false);
+        await probe.AssociateAsync(_cts.Token).ConfigureAwait(false);
+        RelayEndPoint = probe.RelayEndPoint;
+        probe.Dispose();
     }
 
     // Plug this into RedirectOptions.UdpDatagramHandler. Returning null tells the relay NOT to
     // do its default direct upstream send — this forwarder owns the egress and reply legs.
     public byte[]? OnDatagram(RedirectedUdpDatagram dg, CancellationToken ct)
     {
-        if (_tunnel is null)
-        {
-            Console.WriteLine($"  [UDP drop ] pid={dg.ProcessId} {dg.OriginalSource} -> {dg.OriginalDestination}: tunnel not ready");
-            return null;
-        }
+        if (_disposed) return null;
 
-        _serverToClientPort[dg.OriginalDestination] = (ushort)dg.OriginalSource.Port;
-        try
-        {
-            // Fire-and-forget the tunnel send. We can't await inside this sync handler without
-            // blocking the relay's receive loop; SendAsync issues the OS call and returns quickly.
-            _ = _tunnel.SendAsync(dg.OriginalDestination, dg.Payload, 0, dg.Payload.Length, ct);
-            Console.WriteLine($"  [UDP -> px] pid={dg.ProcessId} {dg.OriginalSource} -> {dg.OriginalDestination} ({dg.Payload.Length} bytes)");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  [UDP err  ] {dg.OriginalDestination}: {ex.GetType().Name}: {ex.Message}");
-        }
+        ushort clientPort = (ushort)dg.OriginalSource.Port;
+        PortTunnel tunnel = _tunnels.GetOrAdd(clientPort, p => new PortTunnel(this, p));
+        tunnel.Send(dg.OriginalDestination, dg.Payload);
         return null;
     }
 
-    private async Task ReceiveLoopAsync(CancellationToken ct)
+    private void OnReply(ushort clientPort, IPEndPoint from, byte[] payload)
     {
-        while (!ct.IsCancellationRequested && _tunnel != null)
+        try
         {
-            UdpAssociateDatagram dg;
-            try
-            {
-                dg = await _tunnel.ReceiveAsync(ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) { return; }
-            catch (ObjectDisposedException) { return; }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  [UDP recv ] tunnel error: {ex.GetType().Name}: {ex.Message}");
-                return;
-            }
-
-            if (!_serverToClientPort.TryGetValue(dg.Source, out ushort clientPort))
-            {
-                Console.WriteLine($"  [UDP drop ] reply from {dg.Source} ({dg.Payload.Length} bytes): no matching client port");
-                continue;
-            }
-
-            try
-            {
-                await _redirector.InjectUdpReplyToProcessAsync(clientPort, dg.Payload).ConfigureAwait(false);
-                Console.WriteLine($"  [UDP <- px] {dg.Source} -> :{clientPort} ({dg.Payload.Length} bytes)");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  [UDP inj  ] :{clientPort} error: {ex.GetType().Name}: {ex.Message}");
-            }
+            _redirector.InjectUdpReplyToProcessAsync(clientPort, payload).GetAwaiter().GetResult();
+            Console.WriteLine($"  [UDP <- px] {from} -> :{clientPort} ({payload.Length} bytes)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  [UDP inj  ] :{clientPort} error: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
     public void Dispose()
     {
+        _disposed = true;
         try { _cts.Cancel(); } catch { }
-        try { _tunnel?.Dispose(); } catch { }
-        try { _receiveLoop?.Wait(TimeSpan.FromSeconds(1)); } catch { }
+        foreach (var kv in _tunnels) kv.Value.Dispose();
+        _tunnels.Clear();
         _cts.Dispose();
+    }
+
+    // One SOCKS5 UDP ASSOCIATE tunnel dedicated to a single process source port. The tunnel is
+    // associated lazily on the first datagram; datagrams that arrive while the handshake is still
+    // running are dropped (UDP is lossy by contract, and the app will retry).
+    private sealed class PortTunnel : IDisposable
+    {
+        private readonly UdpProxyForwarder _owner;
+        private readonly ushort _clientPort;
+        private readonly CancellationTokenSource _cts;
+        private readonly Task _ready;
+        private IUdpAssociateSource? _tunnel;
+        private Task? _receiveLoop;
+
+        public PortTunnel(UdpProxyForwarder owner, ushort clientPort)
+        {
+            _owner = owner;
+            _clientPort = clientPort;
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(owner._cts.Token);
+            _ready = Task.Run(() => AssociateAsync(_cts.Token));
+        }
+
+        private async Task AssociateAsync(CancellationToken ct)
+        {
+            try
+            {
+                IUdpAssociateSource tunnel = await _owner._proxySource
+                    .GetUdpAssociateSourceAsync(Guid.NewGuid(), ct).ConfigureAwait(false);
+                await tunnel.AssociateAsync(ct).ConfigureAwait(false);
+                _tunnel = tunnel;
+                _receiveLoop = Task.Run(() => ReceiveLoopAsync(ct));
+                Console.WriteLine($"  [UDP assoc] :{_clientPort} -> relay={tunnel.RelayEndPoint}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  [UDP assoc] :{_clientPort} FAILED: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        public void Send(IPEndPoint destination, byte[] payload)
+        {
+            IUdpAssociateSource? tunnel = _tunnel;
+            if (tunnel is null)
+            {
+                Console.WriteLine($"  [UDP drop ] :{_clientPort} -> {destination}: tunnel not ready");
+                return;
+            }
+            try
+            {
+                // Fire-and-forget: awaiting here would block the relay's receive loop.
+                _ = tunnel.SendAsync(destination, payload, 0, payload.Length, _cts.Token);
+                Console.WriteLine($"  [UDP -> px] :{_clientPort} -> {destination} ({payload.Length} bytes)");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  [UDP err  ] {destination}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private async Task ReceiveLoopAsync(CancellationToken ct)
+        {
+            IUdpAssociateSource? tunnel = _tunnel;
+            while (!ct.IsCancellationRequested && tunnel != null)
+            {
+                UdpAssociateDatagram dg;
+                try
+                {
+                    dg = await tunnel.ReceiveAsync(ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { return; }
+                catch (ObjectDisposedException) { return; }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  [UDP recv ] :{_clientPort} tunnel error: {ex.GetType().Name}: {ex.Message}");
+                    return;
+                }
+
+                // The tunnel belongs to exactly one process port, so no lookup can go wrong here.
+                _owner.OnReply(_clientPort, dg.Source, dg.Payload);
+            }
+        }
+
+        public void Dispose()
+        {
+            try { _cts.Cancel(); } catch { }
+            try { _ready.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            try { _tunnel?.Dispose(); } catch { }
+            try { _receiveLoop?.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            _cts.Dispose();
+        }
     }
 }

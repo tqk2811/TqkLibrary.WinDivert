@@ -8,6 +8,7 @@ using TqkLibrary.Proxy.Authentications;
 using TqkLibrary.Proxy.Handlers;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.Proxy.ProxySources;
+using TqkLibrary.WinDivert.Logging;
 
 namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
@@ -110,6 +111,11 @@ internal sealed class SelfHostCommandModule : ICommandModule
             credential = new ProxyCredential(auth.Substring(0, sep), auth.Substring(sep + 1));
         }
 
+        // Same sink the redirector will use for its packet-level trace.
+        string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
+            ?? System.IO.Path.Combine(Environment.CurrentDirectory, "windivert-interceptor.log");
+        using var diagnosticLog = new RedirectLogger(filePath: logPath);
+
         var local = new LocalProxySource();
         var handler = credential is null
             ? new BaseProxyServerHandler(local)
@@ -161,6 +167,7 @@ internal sealed class SelfHostCommandModule : ICommandModule
                     enableDnsLookup: true,
                     secureDns: false,
                     dohEndpoint: null,
+                    diagnosticLog,
                     ct).ConfigureAwait(false);
             }
             finally
@@ -182,6 +189,7 @@ internal sealed class SelfHostCommandModule : ICommandModule
             enableDnsLookup: true,
             secureDns: false,
             dohEndpoint: null,
+            diagnosticLog,
             ct).ConfigureAwait(false);
     }
 

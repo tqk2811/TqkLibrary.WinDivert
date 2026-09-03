@@ -2,8 +2,16 @@ using System.Collections.Concurrent;
 
 namespace TqkLibrary.WinDivert.Redirect;
 
-// Keyed by (protocol, origSrcPort). Safe within one target PID since src ports are unique
-// per flow for that PID; the relay uses srcPort as the identifier to recover the original destination.
+// Keyed by (protocol, origSrcPort) — no pid in the key, on purpose.
+//
+// The assumption this rests on: Windows hands out a source port that is unique MACHINE-WIDE for a
+// given protocol, so two processes can never hold the same (protocol, srcPort) at the same moment.
+// That is what makes the key safe even when the redirector tracks many pids: the relay only knows
+// the source port of the loopback connection it accepted, and that port identifies exactly one
+// flow. The owning pid is carried in the value (NatEntry.ProcessId), not in the key.
+//
+// An entry is overwritten when the OS recycles a source port for a new flow, which is the correct
+// behaviour — the old flow is gone by then.
 public sealed class NatTable
 {
     private readonly ConcurrentDictionary<NatKey, NatEntry> _entries = new();

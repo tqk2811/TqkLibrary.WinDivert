@@ -2,9 +2,9 @@ using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 
-namespace TqkLibrary.WinDivert.Demo.Process;
+namespace TqkLibrary.WinDivert.ProcessControl;
 
-internal static partial class SuspendedProcessLauncher
+public static partial class SuspendedProcessLauncher
 {
     public sealed class SuspendedProcess : IDisposable
     {

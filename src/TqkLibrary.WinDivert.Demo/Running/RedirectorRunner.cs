@@ -30,7 +30,7 @@ internal static class RedirectorRunner
                 Console.WriteLine($"  [TCP open ] pid={conn.ProcessId} {conn.OriginalSource} -> {conn.OriginalDestination}");
                 try
                 {
-                    await conn.RelayAsync(innerCt).ConfigureAwait(false);
+                    await conn.RelayDirectAsync(innerCt).ConfigureAwait(false);
                 }
                 finally
                 {

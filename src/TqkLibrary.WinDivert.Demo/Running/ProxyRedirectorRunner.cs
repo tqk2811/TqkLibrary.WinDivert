@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.WinDivert.Redirect;
+using TqkLibrary.WinDivert.Logging;
 using SysProcess = System.Diagnostics.Process;
 
 namespace TqkLibrary.WinDivert.Demo.Running;
@@ -22,11 +23,9 @@ internal static class ProxyRedirectorRunner
         bool enableDnsLookup,
         bool secureDns,
         Uri? dohEndpoint,
+        RedirectLogger diagnosticLog,
         CancellationToken ct)
     {
-        string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
-            ?? Path.Combine(Environment.CurrentDirectory, "windivert-interceptor.log");
-        Console.WriteLine($"Diagnostic log: {logPath}");
         Console.WriteLine($"Upstream proxy : {proxyDisplay}");
 
         // TCP -> upstream proxy via IConnectSource (CONNECT or SOCKS5 CMD=1).
@@ -44,7 +43,7 @@ internal static class ProxyRedirectorRunner
         {
             ProcessId = pid,
             Protocols = RedirectProtocol.All,
-            LogFilePath = logPath,
+            Logger = diagnosticLog,
             TcpConnectionHandler = (conn, innerCt) => HandleTcpAsync(conn, proxySource, loggerFactory, redirectorRef, innerCt),
             UdpDatagramHandler = (dg, innerCt) => udpForwarder?.OnDatagram(dg, innerCt) ?? DropUdpDatagram(dg, redirectorRef, innerCt),
             RedirectDestinationPorts = redirectDestinationPorts,

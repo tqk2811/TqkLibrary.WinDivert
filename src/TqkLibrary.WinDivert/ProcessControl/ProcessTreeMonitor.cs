@@ -3,9 +3,10 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using TqkLibrary.WinDivert.Redirect;
 using SysProcess = System.Diagnostics.Process;
 
-namespace TqkLibrary.WinDivert.Demo.Process;
+namespace TqkLibrary.WinDivert.ProcessControl;
 
 // Polls the live process list and reports children/descendants of a root pid. Uses
 // NtQueryInformationProcess(ProcessBasicInformation) to read InheritedFromUniqueProcessId for
@@ -13,9 +14,9 @@ namespace TqkLibrary.WinDivert.Demo.Process;
 // the user already owns. PID reuse is handled by spotting "new" pids that weren't in the prior
 // snapshot, not by remembering the entire history.
 //
-// SysProcess alias is required because the TqkLibrary.WinDivert.Demo.Process namespace shadows
-// System.Diagnostics.Process at name-lookup time inside the TqkLibrary.WinDivert.* tree.
-internal sealed class ProcessTreeMonitor : IDisposable
+// The SysProcess alias keeps the intent readable; the namespace is "ProcessControl" rather than
+// "Process" so it can never shadow System.Diagnostics.Process elsewhere in the assembly.
+public sealed class ProcessTreeMonitor : IDisposable
 {
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     private const int ProcessBasicInformationClass = 0;
@@ -44,16 +45,18 @@ internal sealed class ProcessTreeMonitor : IDisposable
 
     private readonly uint _rootPid;
     private readonly int _pollIntervalMs;
+    private readonly RedirectLogger _log;
     private readonly CancellationTokenSource _cts = new();
     private readonly HashSet<uint> _knownDescendants = new();
     private Task? _pollTask;
 
     public event Action<uint, uint>? ChildSpawned; // (childPid, parentPid)
 
-    public ProcessTreeMonitor(uint rootPid, int pollIntervalMs = 500)
+    public ProcessTreeMonitor(uint rootPid, int pollIntervalMs = 500, RedirectLogger? logger = null)
     {
         _rootPid = rootPid;
         _pollIntervalMs = pollIntervalMs;
+        _log = logger ?? RedirectLogger.Null;
         _knownDescendants.Add(rootPid);
     }
 
@@ -70,7 +73,7 @@ internal sealed class ProcessTreeMonitor : IDisposable
             try { Scan(); }
             catch (Exception ex)
             {
-                Console.WriteLine($"  [tree err ] {ex.GetType().Name}: {ex.Message}");
+                _log.Log("TREE", $"Scan failed: {ex.GetType().Name}: {ex.Message}");
             }
             try { await Task.Delay(_pollIntervalMs, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
