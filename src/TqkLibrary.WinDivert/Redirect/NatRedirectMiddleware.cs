@@ -32,15 +32,21 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     // NAT-redirected, all others pass through to their real destination).
     private readonly HashSet<ushort>? _dstPortFilter;
 
+    // What to do with a TCP flow whose handshake started before this stage could claim it — see
+    // HandleEscapedFlow.
+    private readonly bool _blockEscapedFlows;
+
     public NatRedirectMiddleware(
         int tcpRelayPort,
         int udpRelayPort,
         RedirectProtocol protocols,
-        IReadOnlyCollection<ushort>? destinationPortFilter = null)
+        IReadOnlyCollection<ushort>? destinationPortFilter = null,
+        bool blockEscapedFlows = false)
     {
         _tcpRelayPort = tcpRelayPort;
         _udpRelayPort = udpRelayPort;
         _protocols = protocols;
+        _blockEscapedFlows = blockEscapedFlows;
         _dstPortFilter = (destinationPortFilter != null && destinationPortFilter.Count > 0)
             ? new HashSet<ushort>(destinationPortFilter)
             : null;
@@ -76,15 +82,29 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
                 ? ctx.Tracker.IsTrackedTcp(tcpKey)
                 : ctx.Tracker.IsTrackedUdp(srcIp, srcPort);
 
-            // Race fallback: kernel may emit the SYN to the Network layer before the SOCKET-layer
-            // pump has added the FlowKey. Refresh from the kernel TCP/UDP table (throttled) and recheck.
-            if (!tracked && ctx.Tracker.TryReconcileFromKernel(out _, out _))
+            // Race fallback: the kernel emits the SYN to the NETWORK layer while the SOCKET event
+            // announcing the same connection is still in flight, so a brand-new connection often
+            // arrives here "untracked". connect() has already registered the socket in the kernel
+            // table by then, so asking the kernel settles it.
+            //
+            // For a SYN this lookup is not throttled: it is the difference between capturing a new
+            // connection and losing it for its whole lifetime. Later packets keep the throttle,
+            // since by then the answer cannot change anything (see HandleEscapedFlow).
+            bool isSyn = isTcp && IsHandshakeStart(p);
+            if (!tracked)
             {
+                ctx.Tracker.TryReconcileFromKernel(out _, out _, force: isSyn);
+
+                // Re-check unconditionally, NOT only when the reconcile added something. The two
+                // pumps run in parallel, so the SOCKET pump often records this very flow in the
+                // microseconds between the lookup above and this line — and then the reconcile
+                // reports "nothing new" precisely because the flow is already there. Trusting that
+                // return value cost every first connection its capture.
                 tracked = isTcp
                     ? ctx.Tracker.IsTrackedTcp(tcpKey)
                     : ctx.Tracker.IsTrackedUdp(srcIp, srcPort);
                 if (tracked)
-                    ctx.Logger.Log("INT", "  egress reconciled from kernel table");
+                    ctx.Logger.Log("INT", "  egress tracked on re-check (socket event landed meanwhile)");
             }
 
             ctx.Logger.Log("INT", $"  egress tracked={tracked} tcpFlows={ctx.Tracker.TcpSnapshot.Count} natCount={ctx.Nat.Count}");
@@ -98,6 +118,14 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
                 ctx.Logger.Log("INT", $"  -> SKIP redirect, dstPort={dstPort} not in filter (passthrough)");
                 return next(ctx);
             }
+
+            // A TCP flow may only be captured from its SYN. If the handshake already started
+            // without us — the process was attached mid-flight, or the SOCKET event lost the race
+            // against the SYN — then redirecting the rest of it sends the two halves of one
+            // connection to two different places and the connection dies. That is strictly worse
+            // than the leak it was meant to prevent, so such flows are handled separately.
+            if (isTcp && !isSyn && ctx.Nat.Find(proto, srcPort) == null)
+                return HandleEscapedFlow(ctx, next, srcIp, srcPort, dstIp, dstPort);
 
             // Which tracked process this packet really belongs to. With several pids tracked at
             // once (root + children, or several unrelated targets) the redirector's root pid says
@@ -160,6 +188,31 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             return Task.CompletedTask;
         }
 
+        return next(ctx);
+    }
+
+    // The opening SYN (no ACK): the only packet a flow can be captured from.
+    private static bool IsHandshakeStart(ParsedPacket p) => p.Tcp.Syn && !p.Tcp.Ack;
+
+    // A flow that started outside our control. Two honest choices, neither of them "redirect it":
+    //   * pass it through (default) — the connection keeps working, but its packets reach the
+    //     destination directly, so that one connection reveals the real IP. Sockets a process
+    //     already had open when it was attached land here, which is why this is the default:
+    //     killing every existing connection of a running browser is not a reasonable greeting.
+    //   * block it — nothing leaks; the application sees the connection die and opens a new one,
+    //     which is then captured from its SYN. Use when a leak is worse than a stall.
+    // Launching the process suspended avoids the situation entirely.
+    private Task HandleEscapedFlow(
+        PacketContext ctx, PacketDelegate next, IPAddress srcIp, ushort srcPort, IPAddress dstIp, ushort dstPort)
+    {
+        if (_blockEscapedFlows)
+        {
+            ctx.Logger.Log("INT", $"  -> DROP escaped flow {srcIp}:{srcPort} -> {dstIp}:{dstPort} (started before capture)");
+            ctx.Drop();
+            return Task.CompletedTask;
+        }
+
+        ctx.Logger.Log("INT", $"  -> PASS escaped flow {srcIp}:{srcPort} -> {dstIp}:{dstPort} (started before capture; IP is exposed to this destination)");
         return next(ctx);
     }
 

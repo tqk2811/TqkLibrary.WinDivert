@@ -53,6 +53,20 @@ public sealed class RedirectOptions
     // get IP-leak protection. Applies to whatever protocols are enabled via Protocols.
     public IReadOnlyCollection<ushort>? RedirectDestinationPorts { get; set; }
 
+    // What to do with a TCP flow whose handshake began before the redirector could claim it
+    // (a process attached while it already had sockets open, or the SOCKET event losing the race
+    // against the SYN).
+    //
+    // false (default): let it through. The connection keeps working, but its packets reach the
+    //   destination directly, so the real IP is exposed for that one connection.
+    // true: drop it. Nothing leaks; the application sees the connection fail and opens a new one,
+    //   which is captured properly from its SYN. Note this also kills every connection a process
+    //   already had open at the moment it was attached.
+    //
+    // Either way the flow is NEVER redirected mid-stream: half a connection going direct and half
+    // through the relay breaks it outright.
+    public bool BlockEscapedFlows { get; set; } = false;
+
     // Hook to insert custom packet middlewares into the IPv4 NETWORK pipeline. Invoked after the
     // built-in NatRedirectMiddleware is registered, so user middlewares run on packets the NAT
     // stage did not claim (its egress/reply legs short-circuit before reaching them). Use this to

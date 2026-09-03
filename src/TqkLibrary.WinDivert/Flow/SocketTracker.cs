@@ -131,16 +131,38 @@ public sealed class SocketTracker : IDisposable
         WinDivertHandle handle;
         try
         {
+            // Deliberately NOT a sniffing handle. In sniff mode the socket operation continues
+            // while the event is still on its way to us, so the SYN can reach the NETWORK layer
+            // before the flow is recorded — the interceptor then sees an unknown flow, lets the
+            // handshake out, and that connection is lost to us for good.
+            //
+            // A blocking handle holds the socket operation until PumpLoop re-injects the event,
+            // which is what makes "capture from the very first packet" actually true. The work
+            // done per event is a dictionary insert, so the hold is measured in microseconds.
             handle = WinDivertHandle.Open(
                 filter,
                 WinDivertLayer.Socket,
                 priority: _socketPriority,
-                flags: WinDivertOpenFlags.Sniff | WinDivertOpenFlags.RecvOnly);
+                flags: WinDivertOpenFlags.None);
         }
         catch (Exception ex)
         {
-            _log.Log("TRK", $"AddProcess pid={pid} OPEN FAILED: {ex.GetType().Name}: {ex.Message}");
-            return;
+            _log.Log("TRK", $"AddProcess pid={pid} blocking open failed ({ex.GetType().Name} win32={(ex as System.ComponentModel.Win32Exception)?.NativeErrorCode}); falling back to sniffing");
+            try
+            {
+                // Sniffing still works, it just cannot close the race — better than not tracking
+                // the process at all.
+                handle = WinDivertHandle.Open(
+                    filter,
+                    WinDivertLayer.Socket,
+                    priority: _socketPriority,
+                    flags: WinDivertOpenFlags.Sniff | WinDivertOpenFlags.RecvOnly);
+            }
+            catch (Exception fallbackEx)
+            {
+                _log.Log("TRK", $"AddProcess pid={pid} OPEN FAILED: {fallbackEx.GetType().Name}: {fallbackEx.Message}");
+                return;
+            }
         }
         Task pumpTask = Task.Run(() => PumpLoop(handle, pid, _cts.Token));
         var entry = new PerPidHandle(handle, pumpTask);
@@ -232,15 +254,26 @@ public sealed class SocketTracker : IDisposable
     // where the SYN reaches the Network layer before SocketConnect has been processed.
     //
     // Throttled so a flood of unmatched packets doesn't trigger a snapshot per packet.
-    internal bool TryReconcileFromKernel(out int tcpAdded, out int udpAdded)
+    // force skips the throttle. The caller passes it for a SYN, where the answer decides whether
+    // a brand-new connection is captured or lost: connect() has already put the socket in the
+    // kernel table by the time the SYN reaches the NETWORK layer, so this lookup is what closes
+    // the race the sniffing SOCKET handle cannot.
+    internal bool TryReconcileFromKernel(out int tcpAdded, out int udpAdded, bool force = false)
     {
         tcpAdded = 0;
         udpAdded = 0;
         int now = Environment.TickCount;
         int prev = Volatile.Read(ref _lastReconcileTicks);
-        // Unchecked subtraction is safe across TickCount wrap (results in a small negative).
-        if (now - prev < ReconcileMinIntervalMs) return false;
-        if (Interlocked.CompareExchange(ref _lastReconcileTicks, now, prev) != prev) return false;
+        if (!force)
+        {
+            // Unchecked subtraction is safe across TickCount wrap (results in a small negative).
+            if (now - prev < ReconcileMinIntervalMs) return false;
+            if (Interlocked.CompareExchange(ref _lastReconcileTicks, now, prev) != prev) return false;
+        }
+        else
+        {
+            Volatile.Write(ref _lastReconcileTicks, now);
+        }
 
         try
         {
@@ -282,7 +315,19 @@ public sealed class SocketTracker : IDisposable
         {
             if (!handle.TryRecv(dummy, out _, out WinDivertAddress addr))
                 break;
-            HandleEvent(addr);
+
+            try
+            {
+                HandleEvent(addr);
+            }
+            finally
+            {
+                // Release the held socket operation. This MUST happen even if HandleEvent throws:
+                // on a blocking handle an event that is never re-injected leaves the process's
+                // socket call hanging. (On a sniffing fallback handle the send simply fails, which
+                // is harmless.)
+                handle.TrySend(dummy, 0, ref addr);
+            }
         }
         _log.Log("TRK", $"PumpLoop pid={pid} exited");
     }

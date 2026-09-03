@@ -25,23 +25,26 @@ public sealed class PeekableStream : Stream
     // Bytes already read from the socket and not yet handed to a reader.
     public int BufferedCount => _peekedLength - _peekedConsumed;
 
-    // Reads until at least `count` bytes are buffered (or the peer stops sending) and returns a
-    // view of what is available WITHOUT consuming it. The returned array is the internal buffer:
-    // read `length` bytes from index 0 and do not keep the reference.
-    public async Task<int> PeekAsync(int count, CancellationToken ct)
+    // Performs ONE read into the peek buffer (unless it already holds maxTotal bytes) and returns
+    // how many bytes are buffered afterwards, WITHOUT consuming them. The returned count is what a
+    // parser may read from PeekBuffer starting at index 0.
+    //
+    // One read, not "read until full", on purpose: the caller cannot know how many bytes the first
+    // flight will be. A TLS ClientHello is ~500 bytes, so waiting for a 2 KB buffer to fill would
+    // block until the peer sends something else — which for a request/response protocol never
+    // happens, and the peek would time out with the name sitting unparsed in the buffer.
+    // Callers loop: parse what is here, ask for more only if the message is still incomplete.
+    public async Task<int> PeekAsync(int maxTotal, CancellationToken ct)
     {
-        if (count <= 0) return BufferedCount;
+        if (maxTotal <= 0) return BufferedCount;
         // Peeking twice in a row should extend the window, not restart it, so compaction happens
         // only when a reader has already consumed part of the buffer.
         Compact();
-        if (_peeked.Length < count) Array.Resize(ref _peeked, count);
+        if (_peekedLength >= maxTotal) return _peekedLength;
+        if (_peeked.Length < maxTotal) Array.Resize(ref _peeked, maxTotal);
 
-        while (_peekedLength < count)
-        {
-            int read = await _inner.ReadAsync(_peeked, _peekedLength, count - _peekedLength, ct).ConfigureAwait(false);
-            if (read <= 0) break;
-            _peekedLength += read;
-        }
+        int read = await _inner.ReadAsync(_peeked, _peekedLength, maxTotal - _peekedLength, ct).ConfigureAwait(false);
+        if (read > 0) _peekedLength += read;
         return _peekedLength;
     }
 

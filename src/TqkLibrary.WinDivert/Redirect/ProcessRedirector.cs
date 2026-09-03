@@ -179,7 +179,7 @@ public sealed class ProcessRedirector : IDisposable
             _log.Log("RDR", $"Secure DNS ENABLED via DoH {_options.DohEndpoint}");
         }
         // NAT redirect (egress + loopback-reply legs) for the enabled protocols.
-        v4Builder.Use(new NatRedirectMiddleware(tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts));
+        v4Builder.Use(new NatRedirectMiddleware(tcpPort, udpPort, _options.Protocols, _options.RedirectDestinationPorts, _options.BlockEscapedFlows));
         // Let callers insert their own middlewares (composable pipeline).
         _options.ConfigureNetworkPipeline?.Invoke(v4Builder);
         // Drop any remaining target UDP last, so handled UDP (DNS above, NAT, user) is already claimed.

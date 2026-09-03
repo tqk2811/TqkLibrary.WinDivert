@@ -42,12 +42,29 @@ public static class RedirectedTcpConnectionExtensions
         {
             PeekableStream stream = connection.ClientStream;
             int peekSize = Math.Max(TlsClientHelloParser.RecommendedPeekSize, HttpHostParser.RecommendedPeekSize);
-            int available = await stream.PeekAsync(peekSize, timeoutCts.Token).ConfigureAwait(false);
-            if (available <= 0) return null;
 
-            byte[] buffer = stream.PeekBuffer;
-            if (TlsClientHelloParser.TryReadServerName(buffer, available, out string sni)) return sni;
-            if (HttpHostParser.TryReadHost(buffer, available, out string host)) return host;
+            // Read a chunk, try to parse, and only ask for more when the message is still
+            // incomplete. The client sends its first flight and then waits for the server, so
+            // reading past the end of that flight would block until the peek times out.
+            int available = 0;
+            int previous = -1;
+            while (available < peekSize && available != previous)
+            {
+                previous = available;
+                available = await stream.PeekAsync(peekSize, timeoutCts.Token).ConfigureAwait(false);
+                if (available <= 0) return null;
+
+                byte[] chunk = stream.PeekBuffer;
+                if (TlsClientHelloParser.TryReadServerName(chunk, available, out string name)) return name;
+                if (HttpHostParser.TryReadHost(chunk, available, out string host)) return host;
+
+                // Not TLS and not HTTP: nothing more to learn from this connection.
+                if (!TlsClientHelloParser.LooksLikeTls(chunk, available)
+                    && !HttpHostParser.LooksLikeHttp(chunk, available))
+                {
+                    return null;
+                }
+            }
         }
         catch (OperationCanceledException)
         {

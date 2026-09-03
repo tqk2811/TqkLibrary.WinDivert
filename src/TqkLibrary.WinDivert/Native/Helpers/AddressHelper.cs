@@ -16,11 +16,15 @@ internal static class AddressHelper
             b[3] = (byte)w0;
             return new IPAddress(b);
         }
+        // WinDivert stores an IPv6 address as four 32-bit words with the LEAST significant word
+        // first, so word 0 holds the LAST 32 bits of the address. Writing them in declaration
+        // order produces a reversed address: 2402:800:6e08:4ced:5864:c98:a516:8e47 came out as
+        // a516:8e47:5864:c98:6e08:4ced:2402:800.
         byte[] ip6 = new byte[16];
-        WriteWord(ip6, 0, w0);
-        WriteWord(ip6, 4, w1);
-        WriteWord(ip6, 8, w2);
-        WriteWord(ip6, 12, w3);
+        WriteWord(ip6, 0, w3);
+        WriteWord(ip6, 4, w2);
+        WriteWord(ip6, 8, w1);
+        WriteWord(ip6, 12, w0);
         return new IPAddress(ip6);
     }
 
