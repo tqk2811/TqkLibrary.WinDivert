@@ -1,30 +1,41 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using TqkLibrary.WinDivert.ProcessControl.Interfaces;
 using TqkLibrary.WinDivert.Redirect;
+using TqkLibrary.WinDivert.Redirect.Interfaces;
 using SysProcess = System.Diagnostics.Process;
 
 namespace TqkLibrary.WinDivert.Demo.Running;
 
-internal static class RedirectorRunner
+// The simplest thing the library can do: capture a process and relay every connection straight to
+// where it was already going. Nothing is rerouted — this exists to show that the capture itself
+// works, and to print what it sees.
+internal sealed class RedirectorRunner
 {
-    public static async Task<int> RunAsync(
+    private readonly IProcessRedirectorFactory _redirectorFactory;
+    private readonly IProcessTreeMonitorFactory _treeMonitorFactory;
+
+    public RedirectorRunner(IServiceProvider services)
+    {
+        if (services is null) throw new ArgumentNullException(nameof(services));
+        _redirectorFactory = services.GetRequiredService<IProcessRedirectorFactory>();
+        _treeMonitorFactory = services.GetRequiredService<IProcessTreeMonitorFactory>();
+    }
+
+    public async Task<int> RunAsync(
         uint pid,
         RedirectProtocol proto,
         bool exitWhenProcessGone,
-        SuspendedProcessLauncher.SuspendedProcess? suspended,
+        ISuspendedProcess? suspended,
         bool followChildren,
         CancellationToken ct)
     {
-        string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
-            ?? System.IO.Path.Combine(Environment.CurrentDirectory, "windivert-interceptor.log");
-        Console.WriteLine($"Diagnostic log: {logPath}");
-
         var opts = new RedirectOptions
         {
             ProcessId = pid,
             Protocols = proto,
-            LogFilePath = logPath,
             TcpConnectionHandler = async (conn, innerCt) =>
             {
                 Console.WriteLine($"  [TCP open ] pid={conn.ProcessId} {conn.OriginalSource} -> {conn.OriginalDestination}");
@@ -44,7 +55,7 @@ internal static class RedirectorRunner
             },
         };
 
-        using var redirector = new ProcessRedirector(opts);
+        using IProcessRedirector redirector = _redirectorFactory.Create(opts);
         redirector.TcpConnectEstablished += k => Console.WriteLine($"  [track +  ] {k}");
         redirector.TcpConnectClosed += k => Console.WriteLine($"  [track -  ] {k}");
 
@@ -59,10 +70,10 @@ internal static class RedirectorRunner
             return 1;
         }
 
-        ProcessTreeMonitor? treeMonitor = null;
+        IProcessTreeMonitor? treeMonitor = null;
         if (followChildren)
         {
-            treeMonitor = new ProcessTreeMonitor(pid);
+            treeMonitor = _treeMonitorFactory.Create(pid);
             treeMonitor.ChildSpawned += (childPid, parentPid) =>
             {
                 Console.WriteLine($"  [child +  ] pid={childPid} parent={parentPid} -> tracking");

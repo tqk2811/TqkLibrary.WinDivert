@@ -6,7 +6,7 @@ using TqkLibrary.WinDivert.Redirect;
 
 namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
-internal sealed class AttachCommandModule : ICommandModule
+internal sealed class AttachCommandModule : CommandModuleBase
 {
     private readonly Command _command;
     private readonly Option<string?> _processOpt;
@@ -17,9 +17,9 @@ internal sealed class AttachCommandModule : ICommandModule
     private readonly Option<bool> _suspendOnAttachOpt;
     private readonly Option<bool> _followChildrenOpt;
 
-    public Command Command => _command;
+    public override Command Command => _command;
 
-    public AttachCommandModule()
+    public AttachCommandModule(IServiceProvider services) : base(services)
     {
         _command = new Command("attach", "Attach the redirector to an existing process.");
 
@@ -85,18 +85,18 @@ internal sealed class AttachCommandModule : ICommandModule
             }
         }
 
-        uint? pid = await ProcessResolver.ResolveAsync(processSelector, wait, waitTimeout, ct).ConfigureAwait(false);
+        uint? pid = await Resolver.ResolveAsync(processSelector, wait, waitTimeout, ct).ConfigureAwait(false);
         if (pid == null) return 0;
 
         RedirectProtocol proto = protocol ?? ProtocolParser.SelectInteractive();
         if (proto == RedirectProtocol.None) return 0;
 
-        SuspendedProcessLauncher.SuspendedProcess? attachSuspended = null;
+        ISuspendedProcess? attachSuspended = null;
         if (suspendOnAttach)
         {
             try
             {
-                attachSuspended = SuspendedProcessLauncher.AttachSuspend(pid.Value);
+                attachSuspended = Launcher.AttachSuspend(pid.Value);
                 Console.WriteLine($"Suspended running pid={pid} until tracker ready.");
             }
             catch (Exception ex)
@@ -107,7 +107,7 @@ internal sealed class AttachCommandModule : ICommandModule
         }
         try
         {
-            return await RedirectorRunner.RunAsync(pid.Value, proto, exitWhenGone, attachSuspended, followChildren, ct).ConfigureAwait(false);
+            return await new RedirectorRunner(Services).RunAsync(pid.Value, proto, exitWhenGone, attachSuspended, followChildren, ct).ConfigureAwait(false);
         }
         finally
         {

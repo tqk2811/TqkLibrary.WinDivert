@@ -3,13 +3,21 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using TqkLibrary.WinDivert.ProcessControl.Interfaces;
 using SysProcess = System.Diagnostics.Process;
 
 namespace TqkLibrary.WinDivert.Demo.Process;
 
-internal static class ProcessResolver
+internal sealed class ProcessResolver
 {
-    public static async Task<uint?> ResolveAsync(string? selector, bool wait, int timeoutSeconds, CancellationToken ct)
+    private readonly IProcessFinder _finder;
+
+    public ProcessResolver(IProcessFinder finder)
+    {
+        _finder = finder ?? throw new ArgumentNullException(nameof(finder));
+    }
+
+    public async Task<uint?> ResolveAsync(string? selector, bool wait, int timeoutSeconds, CancellationToken ct)
     {
         if (selector == null)
             return SelectInteractive();
@@ -39,7 +47,7 @@ internal static class ProcessResolver
         return null;
     }
 
-    private static uint? TryResolve(string selector)
+    private uint? TryResolve(string selector)
     {
         if (uint.TryParse(selector, out uint pid))
         {
@@ -51,7 +59,7 @@ internal static class ProcessResolver
             catch { return null; }
         }
 
-        var matches = ProcessFinder.ListAll()
+        var matches = _finder.ListAll()
             .Where(p => p.Name.IndexOf(selector, StringComparison.OrdinalIgnoreCase) >= 0)
             .ToList();
         if (matches.Count == 0) return null;
@@ -60,7 +68,7 @@ internal static class ProcessResolver
         return matches[0].Id;
     }
 
-    public static uint? SelectInteractive()
+    public uint? SelectInteractive()
     {
         while (true)
         {
@@ -74,11 +82,11 @@ internal static class ProcessResolver
 
             if (input.Equals("list", StringComparison.OrdinalIgnoreCase))
             {
-                PrintProcesses(ProcessFinder.ListAll().Take(200));
+                PrintProcesses(_finder.ListAll().Take(200));
                 continue;
             }
 
-            var matches = ProcessFinder.ListAll()
+            var matches = _finder.ListAll()
                 .Where(p => p.Name.IndexOf(input, StringComparison.OrdinalIgnoreCase) >= 0)
                 .ToList();
             if (matches.Count == 0)

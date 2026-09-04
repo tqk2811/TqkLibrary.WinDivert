@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<Import Project="..\ProjectBuildProperties.targets" />
+
+	<PropertyGroup>
+		<RootNamespace>TqkLibrary.WinDivert.Redirect</RootNamespace>
+		<AssemblyName>TqkLibrary.WinDivert.Redirect</AssemblyName>
+		<Description>Process-targeted TCP/UDP redirection: NAT onto a loopback relay so another component decides where each connection really goes.</Description>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
+		<ProjectReference Include="..\TqkLibrary.WinDivert.SecureDns\TqkLibrary.WinDivert.SecureDns.csproj" />
+		<ProjectReference Include="..\TqkLibrary.WinDivert.Inspection\TqkLibrary.WinDivert.Inspection.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.Extensions.Options" />
+	</ItemGroup>
+
+</Project>

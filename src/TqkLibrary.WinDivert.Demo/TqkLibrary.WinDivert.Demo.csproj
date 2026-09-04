@@ -1,10 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-	<Import Project="..\..\src\ProjectBuildProperties.targets" />
+	<Import Project="..\ProjectBuildProperties.targets" />
 
 	<PropertyGroup>
+		<!-- The demo pulls TqkLibrary.Proxy, which needs Microsoft.Extensions.* 10.x — and those do not
+		     support net6.0. The libraries themselves still target both. -->
+		<TargetFrameworks>net8.0-windows</TargetFrameworks>
 		<OutputType>Exe</OutputType>
-		<TargetFrameworks>net462;net6.0-windows;net8.0-windows</TargetFrameworks>
 		<RootNamespace>TqkLibrary.WinDivert.Demo</RootNamespace>
 		<AssemblyName>TqkLibrary.WinDivert.Demo</AssemblyName>
 		<ApplicationManifest>app.manifest</ApplicationManifest>
@@ -13,12 +15,14 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<ProjectReference Include="..\..\src\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
+		<ProjectReference Include="..\TqkLibrary.WinDivert.Redirect\TqkLibrary.WinDivert.Redirect.csproj" />
+		<ProjectReference Include="..\TqkLibrary.WinDivert.ProcessControl\TqkLibrary.WinDivert.ProcessControl.csproj" />
 	</ItemGroup>
 
 	<ItemGroup>
 	  <PackageReference Include="System.CommandLine" />
 	  <PackageReference Include="TqkLibrary.Proxy" />
+	  <PackageReference Include="Microsoft.Extensions.Logging" />
 	</ItemGroup>
 
 </Project>

@@ -3,22 +3,15 @@
 	<Import Project="..\ProjectBuildProperties.targets" />
 
 	<PropertyGroup>
-		<TargetFrameworks>net462;net6.0-windows;net8.0-windows</TargetFrameworks>
 		<RootNamespace>TqkLibrary.WinDivert</RootNamespace>
 		<AssemblyName>TqkLibrary.WinDivert</AssemblyName>
-		<Description>Process-targeted TCP/UDP packet redirection over sockets, built on WinDivert.</Description>
-		<Platforms>AnyCPU;x64;x86</Platforms>
+		<Description>WinDivert core: driver handles, packet parsing, the middleware pipeline, and per-process socket tracking.</Description>
 	</PropertyGroup>
 
 	<ItemGroup>
 		<PackageReference Include="Native.WinDivert" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
-	</ItemGroup>
-
-	<!-- HttpClient (DohResolver) lives in the System.Net.Http framework assembly on net462 and
-	     is not auto-referenced by the SDK; net6/net8 ship it in the shared framework. -->
-	<ItemGroup Condition="'$(TargetFramework)' == 'net462'">
-		<Reference Include="System.Net.Http" />
+		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
 	</ItemGroup>
 
 </Project>

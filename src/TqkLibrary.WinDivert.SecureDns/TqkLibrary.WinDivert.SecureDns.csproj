@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<Import Project="..\ProjectBuildProperties.targets" />
+
+	<PropertyGroup>
+		<RootNamespace>TqkLibrary.WinDivert.SecureDns</RootNamespace>
+		<AssemblyName>TqkLibrary.WinDivert.SecureDns</AssemblyName>
+		<Description>DNS middlewares for the WinDivert pipeline: answer sniffing into a reverse-DNS table, and DNS-over-HTTPS.</Description>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.Extensions.Options" />
+	</ItemGroup>
+
+</Project>

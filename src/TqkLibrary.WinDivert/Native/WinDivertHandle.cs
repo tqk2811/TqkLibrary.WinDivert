@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 
 namespace TqkLibrary.WinDivert.Native;
 
-public sealed class WinDivertHandle : IDisposable
+public sealed class WinDivertHandle : IWinDivertHandle
 {
     private readonly WinDivertSafeHandle _handle;
 

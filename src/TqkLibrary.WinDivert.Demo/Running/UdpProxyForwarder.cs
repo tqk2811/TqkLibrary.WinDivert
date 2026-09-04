@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.WinDivert.Redirect;
+using TqkLibrary.WinDivert.Redirect.Interfaces;
 
 namespace TqkLibrary.WinDivert.Demo.Running;
 
@@ -18,12 +19,12 @@ namespace TqkLibrary.WinDivert.Demo.Running;
 internal sealed class UdpProxyForwarder : IDisposable
 {
     private readonly IProxySource _proxySource;
-    private readonly ProcessRedirector _redirector;
+    private readonly IProcessRedirector _redirector;
     private readonly CancellationTokenSource _cts;
     private readonly ConcurrentDictionary<ushort, PortTunnel> _tunnels = new();
     private volatile bool _disposed;
 
-    public UdpProxyForwarder(IProxySource proxySource, ProcessRedirector redirector, CancellationToken ct)
+    public UdpProxyForwarder(IProxySource proxySource, IProcessRedirector redirector, CancellationToken ct)
     {
         _proxySource = proxySource ?? throw new ArgumentNullException(nameof(proxySource));
         _redirector = redirector ?? throw new ArgumentNullException(nameof(redirector));

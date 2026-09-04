@@ -1,8 +1,15 @@
 namespace TqkLibrary.WinDivert.Packet;
 
-public static class PacketParser
+/// <summary>
+/// The IPv4/IPv6 parser used by the pump. Stateless and allocation-free apart from the returned
+/// view, so one instance serves every pipeline.
+/// </summary>
+public sealed class PacketParser : IPacketParser
 {
-    public static ParsedPacket? TryParse(byte[] buffer, int length)
+    /// <summary>Shared instance for callers outside the container.</summary>
+    public static PacketParser Default { get; } = new PacketParser();
+
+    public ParsedPacket? TryParse(byte[] buffer, int length)
     {
         if (buffer is null || length < 1) return null;
 

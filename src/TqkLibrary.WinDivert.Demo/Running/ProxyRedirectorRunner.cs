@@ -4,26 +4,38 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.WinDivert.Redirect;
-using TqkLibrary.WinDivert.Logging;
+using Microsoft.Extensions.DependencyInjection;
+using TqkLibrary.WinDivert.ProcessControl.Interfaces;
+using TqkLibrary.WinDivert.Redirect.Interfaces;
 using SysProcess = System.Diagnostics.Process;
 
 namespace TqkLibrary.WinDivert.Demo.Running;
 
-internal static class ProxyRedirectorRunner
+internal sealed class ProxyRedirectorRunner
 {
-    public static async Task<int> RunAsync(
+    private readonly IProcessRedirectorFactory _redirectorFactory;
+    private readonly IProcessTreeMonitorFactory _treeMonitorFactory;
+    private readonly ILoggerFactory _loggerFactory;
+
+    public ProxyRedirectorRunner(IServiceProvider services)
+    {
+        if (services is null) throw new ArgumentNullException(nameof(services));
+        _redirectorFactory = services.GetRequiredService<IProcessRedirectorFactory>();
+        _treeMonitorFactory = services.GetRequiredService<IProcessTreeMonitorFactory>();
+        _loggerFactory = services.GetRequiredService<ILoggerFactory>();
+    }
+
+    public async Task<int> RunAsync(
         uint pid,
         IProxySource proxySource,
         string proxyDisplay,
         bool exitWhenProcessGone,
-        SuspendedProcessLauncher.SuspendedProcess? resumeBeforeRun,
-        ILoggerFactory? loggerFactory,
+        ISuspendedProcess? resumeBeforeRun,
         bool followChildren,
         ushort[]? redirectDestinationPorts,
         bool enableDnsLookup,
         bool secureDns,
         Uri? dohEndpoint,
-        RedirectLogger diagnosticLog,
         CancellationToken ct)
     {
         Console.WriteLine($"Upstream proxy : {proxyDisplay}");
@@ -38,13 +50,12 @@ internal static class ProxyRedirectorRunner
         UdpProxyForwarder? udpForwarder = null;
         // Captured by handler lambdas below; assigned just after construction so the handlers can
         // call into the redirector (e.g. DnsLookup.Resolve) without a circular constructor dep.
-        ProcessRedirector? redirectorRef = null;
+        IProcessRedirector? redirectorRef = null;
         var opts = new RedirectOptions
         {
             ProcessId = pid,
             Protocols = RedirectProtocol.All,
-            Logger = diagnosticLog,
-            TcpConnectionHandler = (conn, innerCt) => HandleTcpAsync(conn, proxySource, loggerFactory, redirectorRef, innerCt),
+            TcpConnectionHandler = (conn, innerCt) => HandleTcpAsync(conn, proxySource, _loggerFactory, redirectorRef, innerCt),
             UdpDatagramHandler = (dg, innerCt) => udpForwarder?.OnDatagram(dg, innerCt) ?? DropUdpDatagram(dg, redirectorRef, innerCt),
             RedirectDestinationPorts = redirectDestinationPorts,
             EnableDnsLookup = enableDnsLookup,
@@ -52,10 +63,10 @@ internal static class ProxyRedirectorRunner
             // claimed before NAT and never reaches the relay; other UDP still hits the relay where,
             // for a non-UDP proxy, it is dropped (no leak).
             EnableSecureDns = secureDns,
-            DohEndpoint = dohEndpoint ?? new Uri("https://1.1.1.1/dns-query"),
+            DohEndpoint = dohEndpoint,
         };
 
-        using var redirector = new ProcessRedirector(opts);
+        using IProcessRedirector redirector = _redirectorFactory.Create(opts);
         redirectorRef = redirector;
         redirector.TcpConnectEstablished += k => Console.WriteLine($"  [track +  ] {k}");
         redirector.TcpConnectClosed += k => Console.WriteLine($"  [track -  ] {k}");
@@ -93,10 +104,10 @@ internal static class ProxyRedirectorRunner
             udpMode = $"BLOCKED (relay={redirector.UdpRelayPort}) — proxy does not advertise IsSupportUdp";
         }
 
-        ProcessTreeMonitor? treeMonitor = null;
+        IProcessTreeMonitor? treeMonitor = null;
         if (followChildren)
         {
-            treeMonitor = new ProcessTreeMonitor(pid);
+            treeMonitor = _treeMonitorFactory.Create(pid);
             treeMonitor.ChildSpawned += (childPid, parentPid) =>
             {
                 Console.WriteLine($"  [child +  ] pid={childPid} parent={parentPid} -> tracking");
@@ -132,8 +143,8 @@ internal static class ProxyRedirectorRunner
         Console.WriteLine($"Redirecting pid={pid}: TCP -> {proxyDisplay} (relay={redirector.TcpRelayPort}); UDP -> {udpMode}.");
         Console.WriteLine($"Port filter: {portFilterDesc}.");
         if (secureDns)
-            Console.WriteLine($"DNS: served via DoH {dohEndpoint ?? new Uri("https://1.1.1.1/dns-query")} (UDP/53 intercepted; other UDP per above).");
-        Console.WriteLine("IPv6 of target: BLOCKED (interceptor is IPv4-only; v6 traffic would otherwise leak direct).");
+            Console.WriteLine("DNS: served over HTTPS (UDP/53 intercepted; other UDP per above).");
+        Console.WriteLine($"IPv6 of target: {opts.Ipv6Mode} (relay=[::1]:{redirector.TcpRelayPortV6}).");
         if (followChildren) Console.WriteLine($"Child process capture: ENABLED (polling every 500ms).");
         Console.WriteLine("Press Ctrl+C to stop.");
 
@@ -152,20 +163,22 @@ internal static class ProxyRedirectorRunner
     // Returning null tells UdpRelayServer to skip the upstream direct send — without this the
     // datagram would leak the real client IP. Used both when the proxy refuses UDP ASSOCIATE
     // and when the proxy doesn't advertise UDP support at all.
-    private static byte[]? DropUdpDatagram(RedirectedUdpDatagram dg, ProcessRedirector? redirector, CancellationToken ct)
+    private static byte[]? DropUdpDatagram(RedirectedUdpDatagram dg, IProcessRedirector? redirector, CancellationToken ct)
     {
         string dst = FormatEndpoint(dg.OriginalDestination, redirector);
         Console.WriteLine($"  [UDP DROP ] pid={dg.ProcessId} {dg.OriginalSource} -> {dst} ({dg.Payload.Length} bytes)");
         return null;
     }
 
-    private static string FormatEndpoint(System.Net.IPEndPoint ep, ProcessRedirector? redirector)
+    private static string FormatEndpoint(System.Net.IPEndPoint ep, IProcessRedirector? redirector)
     {
         string? name = redirector?.DnsLookup?.Resolve(ep.Address);
         return name != null ? $"{ep} [{name}]" : ep.ToString();
     }
 
-    private static async Task HandleTcpAsync(RedirectedTcpConnection conn, IProxySource proxySource, ILoggerFactory? loggerFactory, ProcessRedirector? redirector, CancellationToken ct)
+    private static async Task HandleTcpAsync(
+        RedirectedTcpConnection conn, IProxySource proxySource, ILoggerFactory? loggerFactory,
+        IProcessRedirector? redirector, CancellationToken ct)
     {
         Guid tunnelId = Guid.NewGuid();
         string dstLabel = FormatEndpoint(conn.OriginalDestination, redirector);

@@ -21,7 +21,7 @@ namespace TqkLibrary.WinDivert.Flow;
 //   - Locale labels in ipconfig output (English / Japanese / Vietnamese / ...) differ; the
 //     parser is structural and only depends on the universal ` : ` separator and the dashed
 //     line that delimits each record block — so it is locale-independent.
-public sealed class DnsCacheLookup : IDisposable
+public sealed class DnsCacheLookup : IDnsCacheLookup
 {
     private readonly Dictionary<IPAddress, HashSet<string>> _map = new();
     private readonly object _lock = new();

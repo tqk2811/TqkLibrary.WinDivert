@@ -8,7 +8,6 @@ using TqkLibrary.Proxy.Authentications;
 using TqkLibrary.Proxy.Handlers;
 using TqkLibrary.Proxy.Interfaces;
 using TqkLibrary.Proxy.ProxySources;
-using TqkLibrary.WinDivert.Logging;
 
 namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
@@ -16,7 +15,7 @@ namespace TqkLibrary.WinDivert.Demo.CommandModules;
 //   target process -> WinDivert -> HttpProxySource (client side, in this demo)
 //                  -> TqkLibrary.Proxy.ProxyServer (server side, this demo, 127.0.0.1:ephemeral)
 //                  -> LocalProxySource (backend) -> internet
-internal sealed class SelfHostCommandModule : ICommandModule
+internal sealed class SelfHostCommandModule : CommandModuleBase
 {
     private readonly Command _command;
     private readonly Option<string?> _processOpt;
@@ -28,9 +27,9 @@ internal sealed class SelfHostCommandModule : ICommandModule
     private readonly Option<string?> _authOpt;
     private readonly Option<int> _serverPortOpt;
 
-    public Command Command => _command;
+    public override Command Command => _command;
 
-    public SelfHostCommandModule()
+    public SelfHostCommandModule(IServiceProvider services) : base(services)
     {
         _command = new Command("selfhost",
             "Self-host an HTTP ProxyServer (TqkLibrary.Proxy) backed by LocalProxySource, then redirect the target process through it via WinDivert.");
@@ -111,11 +110,6 @@ internal sealed class SelfHostCommandModule : ICommandModule
             credential = new ProxyCredential(auth.Substring(0, sep), auth.Substring(sep + 1));
         }
 
-        // Same sink the redirector will use for its packet-level trace.
-        string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
-            ?? System.IO.Path.Combine(Environment.CurrentDirectory, "windivert-interceptor.log");
-        using var diagnosticLog = new RedirectLogger(filePath: logPath);
-
         var local = new LocalProxySource();
         var handler = credential is null
             ? new BaseProxyServerHandler(local)
@@ -144,12 +138,12 @@ internal sealed class SelfHostCommandModule : ICommandModule
 
         if (launchExe != null)
         {
-            SuspendedProcessLauncher.SuspendedProcess? suspended = null;
+            ISuspendedProcess? suspended = null;
             try
             {
                 try
                 {
-                    suspended = SuspendedProcessLauncher.Launch(launchExe, launchArgs);
+                    suspended = Launcher.Launch(launchExe, launchArgs);
                     Console.WriteLine($"Launched (suspended) pid={suspended.Pid}: \"{launchExe}\" {launchArgs}");
                 }
                 catch (Exception ex)
@@ -157,17 +151,17 @@ internal sealed class SelfHostCommandModule : ICommandModule
                     Console.WriteLine("Failed to launch process: " + ex.Message);
                     return 1;
                 }
-                return await ProxyRedirectorRunner.RunAsync(
+                return await new ProxyRedirectorRunner(Services).RunAsync(
                     suspended.Pid, clientSource, proxyDisplay,
                     exitWhenProcessGone: true,
                     resumeBeforeRun: suspended,
-                    loggerFactory: null,
+
                     followChildren: false,
                     redirectDestinationPorts: null,
                     enableDnsLookup: true,
                     secureDns: false,
                     dohEndpoint: null,
-                    diagnosticLog,
+
                     ct).ConfigureAwait(false);
             }
             finally
@@ -176,20 +170,20 @@ internal sealed class SelfHostCommandModule : ICommandModule
             }
         }
 
-        uint? pid = await ProcessResolver.ResolveAsync(processSelector, wait, waitTimeout, ct).ConfigureAwait(false);
+        uint? pid = await Resolver.ResolveAsync(processSelector, wait, waitTimeout, ct).ConfigureAwait(false);
         if (pid == null) return 0;
 
-        return await ProxyRedirectorRunner.RunAsync(
+        return await new ProxyRedirectorRunner(Services).RunAsync(
             pid.Value, clientSource, proxyDisplay,
             exitWhenGone,
             resumeBeforeRun: null,
-            loggerFactory: null,
+
             followChildren: false,
             redirectDestinationPorts: null,
             enableDnsLookup: true,
             secureDns: false,
             dohEndpoint: null,
-            diagnosticLog,
+
             ct).ConfigureAwait(false);
     }
 

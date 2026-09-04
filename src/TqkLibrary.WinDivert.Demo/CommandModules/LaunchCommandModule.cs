@@ -6,16 +6,16 @@ using TqkLibrary.WinDivert.Redirect;
 
 namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
-internal sealed class LaunchCommandModule : ICommandModule
+internal sealed class LaunchCommandModule : CommandModuleBase
 {
     private readonly Command _command;
     private readonly Argument<string> _exeArg;
     private readonly Option<string?> _argsOpt;
     private readonly Option<string?> _protocolOpt;
 
-    public Command Command => _command;
+    public override Command Command => _command;
 
-    public LaunchCommandModule()
+    public LaunchCommandModule(IServiceProvider services) : base(services)
     {
         _command = new Command("launch", "Launch an executable suspended, attach the redirector, then resume.");
 
@@ -53,12 +53,12 @@ internal sealed class LaunchCommandModule : ICommandModule
             return 2;
         }
 
-        SuspendedProcessLauncher.SuspendedProcess? suspended = null;
+        ISuspendedProcess? suspended = null;
         try
         {
             try
             {
-                suspended = SuspendedProcessLauncher.Launch(exe, args);
+                suspended = Launcher.Launch(exe, args);
                 Console.WriteLine($"Launched (suspended) pid={suspended.Pid}: \"{exe}\" {args}");
             }
             catch (Exception ex)
@@ -67,7 +67,7 @@ internal sealed class LaunchCommandModule : ICommandModule
                 return 1;
             }
 
-            return await RedirectorRunner.RunAsync(suspended.Pid, proto.Value, exitWhenProcessGone: true, suspended, followChildren: false, ct).ConfigureAwait(false);
+            return await new RedirectorRunner(Services).RunAsync(suspended.Pid, proto.Value, exitWhenProcessGone: true, suspended, followChildren: false, ct).ConfigureAwait(false);
         }
         finally
         {

@@ -3,14 +3,14 @@ using System.CommandLine;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.Proxy.Interfaces;
-using TqkLibrary.WinDivert.Logging;
 using System.IO;
 
 namespace TqkLibrary.WinDivert.Demo.CommandModules;
 
-internal sealed class ProxyCommandModule : ICommandModule
+internal sealed class ProxyCommandModule : CommandModuleBase
 {
     private readonly Command _command;
     private readonly Option<string> _proxyOpt;
@@ -27,9 +27,9 @@ internal sealed class ProxyCommandModule : ICommandModule
     private readonly Option<bool> _secureDnsOpt;
     private readonly Option<string?> _dohOpt;
 
-    public Command Command => _command;
+    public override Command Command => _command;
 
-    public ProxyCommandModule()
+    public ProxyCommandModule(IServiceProvider services) : base(services)
     {
         _command = new Command("proxy", "Route TCP traffic of a process through an HTTP/SOCKS4/SOCKS5 proxy (using TqkLibrary.Proxy).");
 
@@ -159,14 +159,9 @@ internal sealed class ProxyCommandModule : ICommandModule
 
         IProxySource proxySource;
         string proxyDisplay = MaskUserInfo(proxyUrl);
-        // Construct bridge once so the same instance services every tunnel for this run.
-        // Disposed implicitly when the process exits — no per-tunnel teardown needed.
-        // One diagnostic sink for the whole run: the redirector writes packet-level trace into it
-        // and the proxy bridge writes tunnel logs into the same file.
-        string logPath = Environment.GetEnvironmentVariable("WINDIVERT_LOG")
-            ?? Path.Combine(Environment.CurrentDirectory, "windivert-interceptor.log");
-        using var diagnosticLog = new RedirectLogger(filePath: logPath);
-        ILoggerFactory loggerFactory = new ProxyLoggerBridge(diagnosticLog, minConsoleLevel: LogLevel.Warning);
+        // TqkLibrary.Proxy logs through ILogger too, so it goes to the same place everything else
+        // does — the host built one logging setup and both libraries write into it.
+        ILoggerFactory loggerFactory = Services.GetRequiredService<ILoggerFactory>();
         try
         {
             proxySource = ProxyUriParser.Parse(proxyUrl, loggerFactory);
@@ -179,12 +174,12 @@ internal sealed class ProxyCommandModule : ICommandModule
 
         if (launchExe != null)
         {
-            SuspendedProcessLauncher.SuspendedProcess? suspended = null;
+            ISuspendedProcess? suspended = null;
             try
             {
                 try
                 {
-                    suspended = SuspendedProcessLauncher.Launch(launchExe, launchArgs);
+                    suspended = Launcher.Launch(launchExe, launchArgs);
                     Console.WriteLine($"Launched (suspended) pid={suspended.Pid}: \"{launchExe}\" {launchArgs}");
                 }
                 catch (Exception ex)
@@ -193,17 +188,17 @@ internal sealed class ProxyCommandModule : ICommandModule
                     return 1;
                 }
 
-                int rc = await ProxyRedirectorRunner.RunAsync(
+                int rc = await new ProxyRedirectorRunner(Services).RunAsync(
                     suspended.Pid, proxySource, proxyDisplay,
                     exitWhenProcessGone: true,
                     resumeBeforeRun: suspended,
-                    loggerFactory,
+
                     followChildren,
                     redirectPorts,
                     enableDnsLookup: !noDnsResolve,
                     secureDns,
                     dohEndpoint,
-                    diagnosticLog,
+
                     ct).ConfigureAwait(false);
                 return rc;
             }
@@ -213,15 +208,15 @@ internal sealed class ProxyCommandModule : ICommandModule
             }
         }
 
-        uint? pid = await ProcessResolver.ResolveAsync(processSelector, wait, waitTimeout, ct).ConfigureAwait(false);
+        uint? pid = await Resolver.ResolveAsync(processSelector, wait, waitTimeout, ct).ConfigureAwait(false);
         if (pid == null) return 0;
 
-        SuspendedProcessLauncher.SuspendedProcess? attachSuspended = null;
+        ISuspendedProcess? attachSuspended = null;
         if (suspendOnAttach)
         {
             try
             {
-                attachSuspended = SuspendedProcessLauncher.AttachSuspend(pid.Value);
+                attachSuspended = Launcher.AttachSuspend(pid.Value);
                 Console.WriteLine($"Suspended running pid={pid} until tracker ready.");
             }
             catch (Exception ex)
@@ -232,17 +227,17 @@ internal sealed class ProxyCommandModule : ICommandModule
         }
         try
         {
-            return await ProxyRedirectorRunner.RunAsync(
+            return await new ProxyRedirectorRunner(Services).RunAsync(
                 pid.Value, proxySource, proxyDisplay,
                 exitWhenGone,
                 resumeBeforeRun: attachSuspended,
-                loggerFactory,
+
                 followChildren,
                 redirectPorts,
                 enableDnsLookup: !noDnsResolve,
                 secureDns,
                 dohEndpoint,
-                diagnosticLog,
+
                 ct).ConfigureAwait(false);
         }
         finally
