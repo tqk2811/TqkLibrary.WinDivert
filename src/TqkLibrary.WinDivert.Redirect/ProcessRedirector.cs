@@ -286,7 +286,8 @@ public sealed class ProcessRedirector : IProcessRedirector
             _loggerFactory.CreateLogger<NatRedirectMiddleware>(),
             _dnsLookupStarted ? _dnsCacheLookup : null,
             _options.RedirectDestinationPorts,
-            _options.BlockEscapedFlows);
+            _options.BlockEscapedFlows,
+            _options.ShouldRedirectUdp);
 
     // The caller's own middlewares, then the UDP block last — so everything already handled (DNS,
     // NAT, the caller's stages) has been claimed before anything is swallowed.

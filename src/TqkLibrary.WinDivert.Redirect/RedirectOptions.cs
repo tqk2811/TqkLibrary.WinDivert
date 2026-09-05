@@ -35,6 +35,21 @@ public sealed class RedirectOptions
     /// <summary>Null forwards UDP datagrams unchanged.</summary>
     public UdpDatagramHandler? UdpDatagramHandler { get; set; }
 
+    /// <summary>
+    /// Consulted before a tracked UDP flow is redirected. Returning false leaves the datagram
+    /// completely untouched — it reaches the original destination from the process's own socket,
+    /// so the reply comes straight back and the flow carries the machine's real address. Null
+    /// (the default) redirects every UDP flow.
+    /// </summary>
+    /// <remarks>
+    /// Only UDP has this hook, and only because the UDP relay cannot deliver a direct route: it
+    /// forwards from its own socket, on a port the NAT table has no entry for, so nothing can
+    /// route the reply back to the process. TCP needs no equivalent — the relay owns both ends of
+    /// a stream socket — and a TCP flow must not be diverted at packet level anyway, since the
+    /// name it is routed by only appears after the handshake.
+    /// </remarks>
+    public UdpRedirectPredicate? ShouldRedirectUdp { get; set; }
+
     /// <summary>WinDivert NETWORK handle priority (-30000..30000; higher runs earlier).</summary>
     public short NetworkPriority { get; set; } = 100;
 

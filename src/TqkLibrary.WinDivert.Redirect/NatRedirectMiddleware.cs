@@ -44,6 +44,9 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     // HandleEscapedFlow.
     private readonly bool _blockEscapedFlows;
 
+    // Asked before a UDP flow is redirected; null redirects every one. See UdpRedirectPredicate.
+    private readonly UdpRedirectPredicate? _shouldRedirectUdp;
+
     // The redirector's ROOT pid, used only as a fallback when the flow lookup misses. A redirector
     // can follow many pids, so the owner of the packet in hand comes from the tracker.
     private readonly uint _rootProcessId;
@@ -57,7 +60,8 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         ILogger<NatRedirectMiddleware> logger,
         IDnsCacheLookup? dnsLookup = null,
         IReadOnlyCollection<ushort>? destinationPortFilter = null,
-        bool blockEscapedFlows = false)
+        bool blockEscapedFlows = false,
+        UdpRedirectPredicate? shouldRedirectUdp = null)
     {
         _nat = nat ?? throw new ArgumentNullException(nameof(nat));
         _tracker = tracker ?? throw new ArgumentNullException(nameof(tracker));
@@ -67,6 +71,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         _protocols = protocols;
         _rootProcessId = rootProcessId;
         _blockEscapedFlows = blockEscapedFlows;
+        _shouldRedirectUdp = shouldRedirectUdp;
         _dstPortFilter = (destinationPortFilter != null && destinationPortFilter.Count > 0)
             ? new HashSet<ushort>(destinationPortFilter)
             : null;
@@ -174,6 +179,21 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             ? (_tracker.TryGetTcpProcessId(tcpKey, out uint tcpPid) ? tcpPid : _rootProcessId)
             : (_tracker.TryGetUdpProcessId(srcIp, srcPort, out uint udpPid) ? udpPid : _rootProcessId);
 
+        // The host may want this UDP flow left alone entirely — see UdpRedirectPredicate for why
+        // "direct" is something only a non-redirected datagram can deliver.
+        //
+        // Asked once per flow, and only while the flow has no NAT entry: a flow already redirected
+        // keeps being redirected even if the answer would change now (a name learned from a DNS
+        // answer in the meantime). Half a flow through the relay and half around it would leave
+        // the two halves expecting replies in two different places.
+        if (!isTcp && _shouldRedirectUdp != null && _nat.Find(proto, srcPort, isIpv6) == null
+            && !AsksToRedirect(flowPid, dstIp, dstPort, isIpv6))
+        {
+            _logger.LogTrace("  not redirecting udp {Source}:{SourcePort} -> {Destination}:{DestinationPort}, the host routes it direct (passthrough)",
+                srcIp, srcPort, dstIp, dstPort);
+            return next(ctx);
+        }
+
         // Store the real-interface IfIdx so the reply path can reinject on the same interface.
         var entry = new NatEntry(flowPid, proto, srcIp, srcPort, dstIp, dstPort,
             ctx.Address.Network.IfIdx, ctx.Address.Network.SubIfIdx);
@@ -234,6 +254,23 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             entry.OriginalSourceAddress, entry.OriginalSourcePort, entry.IfIdx);
         ctx.MarkModified();
         return Task.CompletedTask;
+    }
+
+    // The host's answer, with a failure treated as "redirect". Erring towards the relay is the
+    // safe half of the trade: a datagram redirected when it need not have been costs a lost reply,
+    // while one passed by mistake has already put the machine's real address on the wire.
+    private bool AsksToRedirect(uint processId, IPAddress destination, ushort destinationPort, bool isIpv6)
+    {
+        try
+        {
+            return _shouldRedirectUdp!(processId, destination, destinationPort, isIpv6);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "the UDP redirect predicate threw for pid={Pid} -> {Destination}:{DestinationPort}; redirecting, which never leaks",
+                processId, destination, destinationPort);
+            return true;
+        }
     }
 
     // The opening SYN (no ACK): the only packet a flow can be captured from.
