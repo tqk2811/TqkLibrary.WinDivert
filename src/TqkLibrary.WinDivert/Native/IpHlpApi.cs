@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -9,12 +10,27 @@ namespace TqkLibrary.WinDivert.Native;
 // sockets that already existed before the SOCKET-layer filter attached — those sockets never
 // fire SocketConnect/SocketBind events, so without this snapshot every packet from them falls
 // through `IsTracked*` and leaks past the redirect.
+//
+// The API is deliberately shaped around a PREDICATE over pids rather than a single pid. The
+// kernel tables are machine-wide: asking about one process still reads every row of every table,
+// so a caller tracking N processes used to pay N full reads of the same four tables. Chrome alone
+// runs dozens of processes, and this ran on the packet pump thread for every SYN — the single
+// largest source of connection-setup latency this redirector had. One sweep now answers for the
+// whole tracked set.
 internal static class IpHlpApi
 {
     private const string Dll = "iphlpapi.dll";
     private const int AF_INET = 2;
     private const int AF_INET6 = 23;
     private const uint MIB_TCP_STATE_LISTEN = 2;
+    private const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+    // Sizes of the MIB_*_OWNER_PID rows. Every member is a DWORD or a fixed 16-byte array, so the
+    // structures are packed at 4-byte alignment on every architecture and these are exact.
+    private const int TcpRow4Size = 24;   // State, LocalAddr, LocalPort, RemoteAddr, RemotePort, Pid
+    private const int TcpRow6Size = 56;   // LocalAddr[16], LocalScope, LocalPort, RemoteAddr[16], RemoteScope, RemotePort, State, Pid
+    private const int UdpRow4Size = 12;   // LocalAddr, LocalPort, Pid
+    private const int UdpRow6Size = 28;   // LocalAddr[16], LocalScope, LocalPort, Pid
 
     private enum TCP_TABLE_CLASS
     {
@@ -43,50 +59,6 @@ internal static class IpHlpApi
         int ulAf,
         UDP_TABLE_CLASS tableClass,
         int reserved);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MIB_TCPROW_OWNER_PID
-    {
-        public uint State;
-        public uint LocalAddr;
-        public uint LocalPort;
-        public uint RemoteAddr;
-        public uint RemotePort;
-        public uint OwningPid;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MIB_TCP6ROW_OWNER_PID
-    {
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-        public byte[] LocalAddr;
-        public uint LocalScopeId;
-        public uint LocalPort;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-        public byte[] RemoteAddr;
-        public uint RemoteScopeId;
-        public uint RemotePort;
-        public uint State;
-        public uint OwningPid;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MIB_UDPROW_OWNER_PID
-    {
-        public uint LocalAddr;
-        public uint LocalPort;
-        public uint OwningPid;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MIB_UDP6ROW_OWNER_PID
-    {
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-        public byte[] LocalAddr;
-        public uint LocalScopeId;
-        public uint LocalPort;
-        public uint OwningPid;
-    }
 
     public readonly struct TcpFlow
     {
@@ -121,149 +93,183 @@ internal static class IpHlpApi
         return (ushort)((lo << 8) | (lo >> 8));
     }
 
+    /// <summary>
+    /// Reads the kernel TCP tables (IPv4 and IPv6) once and reports every non-listening row whose
+    /// owner <paramref name="wanted"/> accepts. The predicate is tested before any object is built,
+    /// so rows belonging to untracked processes cost only a few span reads.
+    /// </summary>
+    public static void SnapshotTcpFlows(Func<uint, bool> wanted, Action<uint, TcpFlow> visit)
+    {
+        SnapshotTcp4(wanted, visit);
+        SnapshotTcp6(wanted, visit);
+    }
+
+    /// <summary>Same, for the UDP bind tables.</summary>
+    public static void SnapshotUdpBinds(Func<uint, bool> wanted, Action<uint, UdpBind> visit)
+    {
+        SnapshotUdp4(wanted, visit);
+        SnapshotUdp6(wanted, visit);
+    }
+
     public static IEnumerable<TcpFlow> EnumerateProcessTcpFlows(uint pid)
     {
-        foreach (var f in EnumerateTcp4(pid)) yield return f;
-        foreach (var f in EnumerateTcp6(pid)) yield return f;
+        var found = new List<TcpFlow>();
+        SnapshotTcpFlows(p => p == pid, (_, f) => found.Add(f));
+        return found;
     }
 
     public static IEnumerable<UdpBind> EnumerateProcessUdpBinds(uint pid)
     {
-        foreach (var b in EnumerateUdp4(pid)) yield return b;
-        foreach (var b in EnumerateUdp6(pid)) yield return b;
+        var found = new List<UdpBind>();
+        SnapshotUdpBinds(p => p == pid, (_, b) => found.Add(b));
+        return found;
     }
 
-    private static IEnumerable<TcpFlow> EnumerateTcp4(uint pid)
+    // Copies one kernel table into managed memory. Returns null when the table cannot be read.
+    //
+    // The size is queried and then re-queried on ERROR_INSUFFICIENT_BUFFER: the table can grow
+    // between the sizing call and the read on a machine that is opening connections, and treating
+    // that as "no table" would silently lose every tracked flow for that sweep.
+    private static byte[]? ReadTable(bool tcp, int af, out int length)
     {
-        IntPtr buf = IntPtr.Zero;
+        length = 0;
         int size = 0;
-        try
+        for (int attempt = 0; attempt < 4; attempt++)
         {
-            GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET,
-                TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0);
-            if (size <= 0) yield break;
-            buf = Marshal.AllocHGlobal(size);
-            int ret = GetExtendedTcpTable(buf, ref size, false, AF_INET,
-                TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0);
-            if (ret != 0) yield break;
-
-            int count = Marshal.ReadInt32(buf);
-            int rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
-            for (int i = 0; i < count; i++)
+            if (size <= 0)
             {
-                IntPtr rowPtr = IntPtr.Add(buf, 4 + i * rowSize);
-                var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
-                if (row.OwningPid != pid) continue;
-                if (row.State == MIB_TCP_STATE_LISTEN) continue;
-                yield return new TcpFlow(
-                    new IPAddress(BitConverter.GetBytes(row.LocalAddr)),
-                    PortFromDword(row.LocalPort),
-                    new IPAddress(BitConverter.GetBytes(row.RemoteAddr)),
-                    PortFromDword(row.RemotePort));
+                int probe = tcp
+                    ? GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0)
+                    : GetExtendedUdpTable(IntPtr.Zero, ref size, false, af, UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
+                if (probe != ERROR_INSUFFICIENT_BUFFER && probe != 0) return null;
+                if (size <= 0) return null;
+            }
+
+            // Ask for a little more than the driver reported, so the common "one more connection
+            // appeared" case is absorbed without a second round trip.
+            size += size / 8 + 256;
+            IntPtr buf = Marshal.AllocHGlobal(size);
+            try
+            {
+                int ret = tcp
+                    ? GetExtendedTcpTable(buf, ref size, false, af, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0)
+                    : GetExtendedUdpTable(buf, ref size, false, af, UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
+                if (ret == ERROR_INSUFFICIENT_BUFFER) continue;  // size now holds what it really needs
+                if (ret != 0) return null;
+
+                byte[] managed = new byte[size];
+                Marshal.Copy(buf, managed, 0, size);
+                length = size;
+                return managed;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
             }
         }
-        finally
-        {
-            if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
-        }
+        return null;
     }
 
-    private static IEnumerable<TcpFlow> EnumerateTcp6(uint pid)
+    // Row count plus the offset the rows start at, or false when the buffer is too short to hold
+    // even the header.
+    private static bool TryReadHeader(ReadOnlySpan<byte> table, out int count)
     {
-        IntPtr buf = IntPtr.Zero;
-        int size = 0;
-        try
-        {
-            GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET6,
-                TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0);
-            if (size <= 0) yield break;
-            buf = Marshal.AllocHGlobal(size);
-            int ret = GetExtendedTcpTable(buf, ref size, false, AF_INET6,
-                TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0);
-            if (ret != 0) yield break;
-
-            int count = Marshal.ReadInt32(buf);
-            int rowSize = Marshal.SizeOf<MIB_TCP6ROW_OWNER_PID>();
-            for (int i = 0; i < count; i++)
-            {
-                IntPtr rowPtr = IntPtr.Add(buf, 4 + i * rowSize);
-                var row = Marshal.PtrToStructure<MIB_TCP6ROW_OWNER_PID>(rowPtr);
-                if (row.OwningPid != pid) continue;
-                if (row.State == MIB_TCP_STATE_LISTEN) continue;
-                yield return new TcpFlow(
-                    new IPAddress(row.LocalAddr),
-                    PortFromDword(row.LocalPort),
-                    new IPAddress(row.RemoteAddr),
-                    PortFromDword(row.RemotePort));
-            }
-        }
-        finally
-        {
-            if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
-        }
+        if (table.Length < 4) { count = 0; return false; }
+        count = BinaryPrimitives.ReadInt32LittleEndian(table);
+        return count >= 0;
     }
 
-    private static IEnumerable<UdpBind> EnumerateUdp4(uint pid)
+    private static void SnapshotTcp4(Func<uint, bool> wanted, Action<uint, TcpFlow> visit)
     {
-        IntPtr buf = IntPtr.Zero;
-        int size = 0;
-        try
-        {
-            GetExtendedUdpTable(IntPtr.Zero, ref size, false, AF_INET,
-                UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
-            if (size <= 0) yield break;
-            buf = Marshal.AllocHGlobal(size);
-            int ret = GetExtendedUdpTable(buf, ref size, false, AF_INET,
-                UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
-            if (ret != 0) yield break;
+        byte[]? table = ReadTable(tcp: true, AF_INET, out int length);
+        if (table == null) return;
+        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        if (!TryReadHeader(span, out int count)) return;
 
-            int count = Marshal.ReadInt32(buf);
-            int rowSize = Marshal.SizeOf<MIB_UDPROW_OWNER_PID>();
-            for (int i = 0; i < count; i++)
-            {
-                IntPtr rowPtr = IntPtr.Add(buf, 4 + i * rowSize);
-                var row = Marshal.PtrToStructure<MIB_UDPROW_OWNER_PID>(rowPtr);
-                if (row.OwningPid != pid) continue;
-                yield return new UdpBind(
-                    new IPAddress(BitConverter.GetBytes(row.LocalAddr)),
-                    PortFromDword(row.LocalPort));
-            }
-        }
-        finally
+        for (int i = 0; i < count; i++)
         {
-            if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
+            int offset = 4 + i * TcpRow4Size;
+            if (offset + TcpRow4Size > length) return;
+            ReadOnlySpan<byte> row = span.Slice(offset, TcpRow4Size);
+
+            uint pid = BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(20, 4));
+            if (!wanted(pid)) continue;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(0, 4)) == MIB_TCP_STATE_LISTEN) continue;
+
+            visit(pid, new TcpFlow(
+                new IPAddress(row.Slice(4, 4)),
+                PortFromDword(BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(8, 4))),
+                new IPAddress(row.Slice(12, 4)),
+                PortFromDword(BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(16, 4)))));
         }
     }
 
-    private static IEnumerable<UdpBind> EnumerateUdp6(uint pid)
+    private static void SnapshotTcp6(Func<uint, bool> wanted, Action<uint, TcpFlow> visit)
     {
-        IntPtr buf = IntPtr.Zero;
-        int size = 0;
-        try
-        {
-            GetExtendedUdpTable(IntPtr.Zero, ref size, false, AF_INET6,
-                UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
-            if (size <= 0) yield break;
-            buf = Marshal.AllocHGlobal(size);
-            int ret = GetExtendedUdpTable(buf, ref size, false, AF_INET6,
-                UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
-            if (ret != 0) yield break;
+        byte[]? table = ReadTable(tcp: true, AF_INET6, out int length);
+        if (table == null) return;
+        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        if (!TryReadHeader(span, out int count)) return;
 
-            int count = Marshal.ReadInt32(buf);
-            int rowSize = Marshal.SizeOf<MIB_UDP6ROW_OWNER_PID>();
-            for (int i = 0; i < count; i++)
-            {
-                IntPtr rowPtr = IntPtr.Add(buf, 4 + i * rowSize);
-                var row = Marshal.PtrToStructure<MIB_UDP6ROW_OWNER_PID>(rowPtr);
-                if (row.OwningPid != pid) continue;
-                yield return new UdpBind(
-                    new IPAddress(row.LocalAddr),
-                    PortFromDword(row.LocalPort));
-            }
-        }
-        finally
+        for (int i = 0; i < count; i++)
         {
-            if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
+            int offset = 4 + i * TcpRow6Size;
+            if (offset + TcpRow6Size > length) return;
+            ReadOnlySpan<byte> row = span.Slice(offset, TcpRow6Size);
+
+            uint pid = BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(52, 4));
+            if (!wanted(pid)) continue;
+            if (BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(48, 4)) == MIB_TCP_STATE_LISTEN) continue;
+
+            visit(pid, new TcpFlow(
+                new IPAddress(row.Slice(0, 16)),
+                PortFromDword(BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(20, 4))),
+                new IPAddress(row.Slice(24, 16)),
+                PortFromDword(BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(44, 4)))));
+        }
+    }
+
+    private static void SnapshotUdp4(Func<uint, bool> wanted, Action<uint, UdpBind> visit)
+    {
+        byte[]? table = ReadTable(tcp: false, AF_INET, out int length);
+        if (table == null) return;
+        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        if (!TryReadHeader(span, out int count)) return;
+
+        for (int i = 0; i < count; i++)
+        {
+            int offset = 4 + i * UdpRow4Size;
+            if (offset + UdpRow4Size > length) return;
+            ReadOnlySpan<byte> row = span.Slice(offset, UdpRow4Size);
+
+            uint pid = BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(8, 4));
+            if (!wanted(pid)) continue;
+
+            visit(pid, new UdpBind(
+                new IPAddress(row.Slice(0, 4)),
+                PortFromDword(BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(4, 4)))));
+        }
+    }
+
+    private static void SnapshotUdp6(Func<uint, bool> wanted, Action<uint, UdpBind> visit)
+    {
+        byte[]? table = ReadTable(tcp: false, AF_INET6, out int length);
+        if (table == null) return;
+        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        if (!TryReadHeader(span, out int count)) return;
+
+        for (int i = 0; i < count; i++)
+        {
+            int offset = 4 + i * UdpRow6Size;
+            if (offset + UdpRow6Size > length) return;
+            ReadOnlySpan<byte> row = span.Slice(offset, UdpRow6Size);
+
+            uint pid = BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(24, 4));
+            if (!wanted(pid)) continue;
+
+            visit(pid, new UdpBind(
+                new IPAddress(row.Slice(0, 16)),
+                PortFromDword(BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(20, 4)))));
         }
     }
 }
