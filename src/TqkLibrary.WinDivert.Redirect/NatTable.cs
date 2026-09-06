@@ -17,8 +17,19 @@ public sealed class NatTable : INatTable
 {
     private readonly ConcurrentDictionary<NatKey, NatEntry> _entries = new();
 
-    public void Upsert(NatEntry entry)
-        => _entries[new NatKey(entry.Protocol, entry.OriginalSourcePort, entry.IsIpv6)] = entry;
+    // Returns true when this is a flow the table had not seen — a brand-new source port, or a
+    // recycled one now going somewhere else. Callers use it to do the per-flow work (logging, the
+    // reverse name lookup) exactly once instead of on every packet of the flow, which is where the
+    // cost of that work actually lands.
+    public bool Upsert(NatEntry entry)
+    {
+        var key = new NatKey(entry.Protocol, entry.OriginalSourcePort, entry.IsIpv6);
+        bool isNew = !_entries.TryGetValue(key, out NatEntry? previous)
+            || previous.OriginalDestinationPort != entry.OriginalDestinationPort
+            || !previous.OriginalDestinationAddress.Equals(entry.OriginalDestinationAddress);
+        _entries[key] = entry;
+        return isNew;
+    }
 
     public NatEntry? Find(byte protocol, ushort srcPort, bool isIpv6)
         => _entries.TryGetValue(new NatKey(protocol, srcPort, isIpv6), out var e) ? e : null;

@@ -51,6 +51,12 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     // can follow many pids, so the owner of the packet in hand comes from the tracker.
     private readonly uint _rootProcessId;
 
+    // Escaped flows already reported, so the warning is one per flow rather than one per packet.
+    // Cleared wholesale once it grows past the cap: this is log de-duplication, and a flow warned
+    // about twice after a long run is a far smaller problem than an unbounded set.
+    private const int MaxRememberedEscapedFlows = 4096;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<FlowKey, byte> _warnedEscapedFlows = new();
+
     public NatRedirectMiddleware(
         INatTable nat,
         ISocketTracker tracker,
@@ -197,8 +203,12 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         // Store the real-interface IfIdx so the reply path can reinject on the same interface.
         var entry = new NatEntry(flowPid, proto, srcIp, srcPort, dstIp, dstPort,
             ctx.Address.Network.IfIdx, ctx.Address.Network.SubIfIdx);
-        _nat.Upsert(entry);
-        if (_logger.IsEnabled(LogLevel.Debug))
+        // Only the flow's first packet is worth a line. Logging every packet of every flow put a
+        // string format, a locked reverse-name lookup and a file write on the pump thread for each
+        // one — thousands a second on a browser, and the pump is what the whole machine's traffic
+        // waits behind.
+        bool isNewFlow = _nat.Upsert(entry);
+        if (isNewFlow && _logger.IsEnabled(LogLevel.Debug))
         {
             _logger.LogDebug("  nat {Protocol} srcPort={SrcPort} -> {Destination}:{DestinationPort}{Name} ifIdx={IfIdx}",
                 isTcp ? "tcp" : "udp", srcPort, dstIp, dstPort,
@@ -295,8 +305,15 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             return Task.CompletedTask;
         }
 
-        _logger.LogWarning("passing escaped flow {Source}:{SourcePort} -> {Destination}:{DestinationPort} — it started before capture, so the real IP is exposed to this destination",
-            srcIp, srcPort, dstIp, dstPort);
+        // Once per flow, not once per packet: an escaped connection carrying a video stream would
+        // otherwise write this warning thousands of times, from the pump thread, saying the same
+        // thing about the same flow.
+        if (_warnedEscapedFlows.TryAdd(new FlowKey(6, srcIp, srcPort, dstIp, dstPort), 0))
+        {
+            if (_warnedEscapedFlows.Count > MaxRememberedEscapedFlows) _warnedEscapedFlows.Clear();
+            _logger.LogWarning("passing escaped flow {Source}:{SourcePort} -> {Destination}:{DestinationPort} — it started before capture, so the real IP is exposed to this destination",
+                srcIp, srcPort, dstIp, dstPort);
+        }
         return next(ctx);
     }
 

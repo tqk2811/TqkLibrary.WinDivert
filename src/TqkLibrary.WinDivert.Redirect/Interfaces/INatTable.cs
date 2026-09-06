@@ -20,7 +20,11 @@ public interface INatTable
     /// Records a flow, replacing whatever held that key. Overwriting is correct: the OS only
     /// recycles a source port once the previous flow is gone.
     /// </summary>
-    void Upsert(NatEntry entry);
+    /// <returns>
+    /// True when the key was free or held a flow to a different destination — i.e. this call is
+    /// the flow's first packet. Per-flow work belongs behind this, not behind every packet.
+    /// </returns>
+    bool Upsert(NatEntry entry);
 
     /// <summary>The flow that used this source port, or null when there is none.</summary>
     NatEntry? Find(byte protocol, ushort srcPort, bool isIpv6);
