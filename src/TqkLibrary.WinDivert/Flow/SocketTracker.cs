@@ -47,18 +47,10 @@ public sealed class SocketTracker : ISocketTracker
         public IWinDivertHandle Handle { get; }
         public Task PumpTask { get; }
 
-        /// <summary>
-        /// True when the blocking handle was refused and this pid is followed by a sniffing one.
-        /// A sniffing handle cannot hold the socket operation, so its events can lose the race
-        /// against the SYN — which is the only thing the kernel-table reconcile is there to fix.
-        /// </summary>
-        public bool IsSniffing { get; }
-
-        public PerPidHandle(IWinDivertHandle h, Task t, bool sniffing)
+        public PerPidHandle(IWinDivertHandle h, Task t)
         {
             Handle = h;
             PumpTask = t;
-            IsSniffing = sniffing;
         }
     }
 
@@ -71,10 +63,6 @@ public sealed class SocketTracker : ISocketTracker
     private const int ReconcileMinIntervalMs = 50;
 
     private int _lastReconcileTicks;
-
-    // How many tracked pids ended up on a sniffing SOCKET handle. While this is zero every flow is
-    // recorded before its SYN can leave, so a forced reconcile has nothing to find and is skipped.
-    private int _sniffingHandleCount;
 
     // Cached so the per-sweep predicate does not allocate a delegate on the packet path.
     private readonly Func<uint, bool> _isTrackedPid;
@@ -158,51 +146,38 @@ public sealed class SocketTracker : ISocketTracker
         string filter = $"processId == {pid} and (tcp or udp)";
         _logger.LogDebug("AddProcess pid={Pid} filter={Filter}", pid, filter);
         IWinDivertHandle handle;
-        bool sniffing = false;
+        // Always sniffing, and it has to be. The SOCKET layer is the one place where the two
+        // WinDivert flags fight each other:
+        //
+        //   * RECV_ONLY is mandatory — WinDivertOpen refuses a SOCKET handle without it and
+        //     returns ERROR_INVALID_PARAMETER (87), which reads like a bad filter expression.
+        //   * Without SNIFF the handle is a FILTER, not an observer: the driver holds each socket
+        //     operation and only lets it proceed when the event is re-injected. RECV_ONLY makes
+        //     that re-injection impossible, so nothing ever proceeds.
+        //
+        // Opening RECV_ONLY alone therefore succeeds and then silently blocks every connect() of
+        // every tracked process — measured: a browser with no network at all, six redirected
+        // packets in five minutes, not one connection reaching the relay. So sniffing is not a
+        // fallback here, it is the only mode this layer offers us.
+        //
+        // The cost is a race the tracker cannot win on its own: the socket event may still be in
+        // flight when the SYN reaches the NETWORK layer. That is what the kernel-table reconcile
+        // in TryReconcileFromKernel is for.
         try
         {
-            // Deliberately NOT a sniffing handle. In sniff mode the socket operation continues
-            // while the event is still on its way to us, so the SYN can reach the NETWORK layer
-            // before the flow is recorded — the interceptor then sees an unknown flow, lets the
-            // handshake out, and that connection is lost to us for good.
-            //
-            // Without SNIFF the handle is BLOCKING: the driver holds the socket operation until
-            // this pump has taken the event, which is what makes "capture from the very first
-            // packet" actually true. The work done per event is a dictionary insert, so the hold
-            // is measured in microseconds.
-            //
-            // RECV_ONLY is not optional here. The SOCKET layer carries events, not packets, so
-            // nothing can be modified or re-injected, and WinDivertOpen refuses a handle without
-            // it — with ERROR_INVALID_PARAMETER (87), which reads like a bad filter and is why
-            // this used to fall back to sniffing on every single process.
             handle = _handleFactory.Open(
                 filter,
                 WinDivertLayer.Socket,
                 priority: _socketPriority,
-                flags: WinDivertOpenFlags.RecvOnly);
+                flags: WinDivertOpenFlags.Sniff | WinDivertOpenFlags.RecvOnly);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "AddProcess pid={Pid}: blocking SOCKET handle refused (win32={Win32}), falling back to a sniffing handle — new connections may escape capture", pid, (ex as System.ComponentModel.Win32Exception)?.NativeErrorCode);
-            try
-            {
-                // Sniffing still works, it just cannot close the race — better than not tracking
-                // the process at all. Flows for this pid then lean on the kernel-table reconcile.
-                handle = _handleFactory.Open(
-                    filter,
-                    WinDivertLayer.Socket,
-                    priority: _socketPriority,
-                    flags: WinDivertOpenFlags.Sniff | WinDivertOpenFlags.RecvOnly);
-                sniffing = true;
-            }
-            catch (Exception fallbackEx)
-            {
-                _logger.LogError(fallbackEx, "AddProcess pid={Pid}: no SOCKET handle at all — this process will not be tracked", pid);
-                return;
-            }
+            _logger.LogError(ex, "AddProcess pid={Pid}: no SOCKET handle (win32={Win32}) — this process will not be tracked", pid, (ex as System.ComponentModel.Win32Exception)?.NativeErrorCode);
+            return;
         }
         Task pumpTask = Task.Run(() => PumpLoop(handle, pid, _cts.Token));
-        var entry = new PerPidHandle(handle, pumpTask, sniffing);
+        var entry = new PerPidHandle(handle, pumpTask);
         if (!_pidHandles.TryAdd(pid, entry))
         {
             // race with another AddProcess for the same pid — discard ours
@@ -210,7 +185,6 @@ public sealed class SocketTracker : ISocketTracker
             handle.Dispose();
             return;
         }
-        if (sniffing) Interlocked.Increment(ref _sniffingHandleCount);
 
         // Pre-populate this pid's existing sockets so events that fired before the filter
         // attached are not lost (mirrors the root-pid behaviour at Start time).
@@ -228,7 +202,6 @@ public sealed class SocketTracker : ISocketTracker
         if (!_pidHandles.TryRemove(pid, out PerPidHandle? entry)) return false;
 
         _logger.LogDebug("RemoveProcess pid={Pid}", pid);
-        if (entry.IsSniffing) Interlocked.Decrement(ref _sniffingHandleCount);
         try { entry.Handle.Shutdown(); } catch { }
         try { entry.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
         entry.Handle.Dispose();
@@ -298,18 +271,15 @@ public sealed class SocketTracker : ISocketTracker
     // force skips the throttle. The caller passes it for a SYN, where the answer decides whether
     // a brand-new connection is captured or lost: connect() has already put the socket in the
     // kernel table by the time the SYN reaches the NETWORK layer, so this lookup is what closes
-    // the race the sniffing SOCKET handle cannot.
+    // the race the sniffing SOCKET handle cannot — and the SOCKET layer gives us no handle that
+    // could close it on its own (see AddProcess), so this stays on the SYN path for good.
     //
-    // ...and *only* the race a sniffing handle cannot close. A blocking SOCKET handle has already
-    // recorded the flow before the SYN was allowed out, so with no sniffing handle in the tracked
-    // set the forced sweep is guaranteed to find nothing — while costing a full read of four
-    // machine-wide kernel tables, on the packet pump thread, for every SYN on the machine. That is
-    // why force degrades to the ordinary throttle in that case rather than being honoured blindly.
+    // What makes that affordable is the shape of the sweep below: four kernel-table reads for the
+    // whole tracked set, not four per tracked pid.
     public bool TryReconcileFromKernel(out int tcpAdded, out int udpAdded, bool force = false)
     {
         tcpAdded = 0;
         udpAdded = 0;
-        if (force && Volatile.Read(ref _sniffingHandleCount) == 0) force = false;
         int now = Environment.TickCount;
         int prev = Volatile.Read(ref _lastReconcileTicks);
         if (!force)
@@ -354,16 +324,18 @@ public sealed class SocketTracker : ISocketTracker
 
             try
             {
-                // On a blocking handle the socket operation is already released by the TryRecv
-                // above — the SOCKET layer carries events, not packets, so there is nothing to
-                // re-inject and the handle is RECV_ONLY by necessity. Keep this body short all the
-                // same: until it returns and the loop recv's again, the process's connect()/bind()
-                // is waiting on us.
                 HandleEvent(addr);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Socket event for pid={Pid} could not be recorded", pid);
+            }
+            finally
+            {
+                // Harmless on a sniffing handle (the send simply fails) but kept deliberately: it
+                // is what would release the socket operation if this handle were ever opened in
+                // filter mode. See AddProcess for why it is not.
+                handle.TrySend(dummy, 0, ref addr);
             }
         }
         _logger.LogDebug("Socket pump for pid={Pid} exited", pid);
