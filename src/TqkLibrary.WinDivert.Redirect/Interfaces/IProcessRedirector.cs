@@ -71,6 +71,15 @@ public interface IProcessRedirector : IDisposable
     bool IsTrackedProcessId(uint pid);
 
     /// <summary>
+    /// Marks every tracked TCP flow that is NOT going through the relay — one that was open before
+    /// its process was attached and has been passing through untouched since — so that its next
+    /// packet is answered with a reset. The process sees the connection fail at once, and the
+    /// connection it opens instead is captured from its SYN like any new one. Returns how many
+    /// flows were marked. Flows that begin escaping later are not affected; call again for them.
+    /// </summary>
+    int ResetEscapedFlows();
+
+    /// <summary>
     /// Delivers a UDP datagram to the target process as if it came from the original destination.
     /// For a handler that took over UDP forwarding itself (SOCKS5 UDP ASSOCIATE, say) and receives
     /// replies the relay's own upstream socket never sees.

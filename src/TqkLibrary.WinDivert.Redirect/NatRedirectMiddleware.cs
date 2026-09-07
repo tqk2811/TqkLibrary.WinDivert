@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Net;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using TqkLibrary.WinDivert.Packet;
 
 namespace TqkLibrary.WinDivert.Redirect;
 
@@ -57,6 +58,13 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     private const int MaxRememberedEscapedFlows = 4096;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<FlowKey, byte> _warnedEscapedFlows = new();
 
+    // Escaped flows the host has asked to have reset (see IProcessRedirector.ResetEscapedFlows),
+    // and the builder for the reset itself. Null = the host never asks, and escaped flows are only
+    // ever passed or dropped.
+    private readonly EscapedFlowBlocklist? _flowsToReset;
+    private readonly TcpResetPacketBuilder _resetBuilder = new TcpResetPacketBuilder();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<FlowKey, byte> _resetFlows = new();
+
     public NatRedirectMiddleware(
         INatTable nat,
         ISocketTracker tracker,
@@ -67,7 +75,8 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         IDnsCacheLookup? dnsLookup = null,
         IReadOnlyCollection<ushort>? destinationPortFilter = null,
         bool blockEscapedFlows = false,
-        UdpRedirectPredicate? shouldRedirectUdp = null)
+        UdpRedirectPredicate? shouldRedirectUdp = null,
+        EscapedFlowBlocklist? flowsToReset = null)
     {
         _nat = nat ?? throw new ArgumentNullException(nameof(nat));
         _tracker = tracker ?? throw new ArgumentNullException(nameof(tracker));
@@ -78,6 +87,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         _rootProcessId = rootProcessId;
         _blockEscapedFlows = blockEscapedFlows;
         _shouldRedirectUdp = shouldRedirectUdp;
+        _flowsToReset = flowsToReset;
         _dstPortFilter = (destinationPortFilter != null && destinationPortFilter.Count > 0)
             ? new HashSet<ushort>(destinationPortFilter)
             : null;
@@ -176,7 +186,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         // different places and the connection dies. That is strictly worse than the leak it was
         // meant to prevent, so such flows are handled separately.
         if (isTcp && !isSyn && _nat.Find(proto, srcPort, isIpv6) == null)
-            return HandleEscapedFlow(ctx, next, srcIp, srcPort, dstIp, dstPort);
+            return HandleEscapedFlow(ctx, next, p, srcIp, srcPort, dstIp, dstPort);
 
         // Which tracked process this packet really belongs to. With several pids tracked at once
         // (root + children, or several unrelated targets) the root pid says nothing, and the NAT
@@ -286,17 +296,33 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     // The opening SYN (no ACK): the only packet a flow can be captured from.
     private static bool IsHandshakeStart(ParsedPacket p) => p.Tcp.Syn && !p.Tcp.Ack;
 
-    // A flow that started outside our control. Two honest choices, neither of them "redirect it":
+    // A flow that started outside our control. Three honest choices, none of them "redirect it":
     //   * pass it through (default) — the connection keeps working, but its packets reach the
     //     destination directly, so that one connection reveals the real IP. Sockets a process
     //     already had open when it was attached land here, which is why this is the default:
     //     killing every existing connection of a running browser is not a reasonable greeting.
     //   * block it — nothing leaks; the application sees the connection die and opens a new one,
     //     which is then captured from its SYN. Use when a leak is worse than a stall.
+    //   * reset it, when the host asked for this particular flow (ResetEscapedFlows) — the packet
+    //     is dropped and the process is handed the RST its peer would have sent, so the socket
+    //     fails at once instead of waiting out a retransmission timer, and the application's
+    //     reconnect is captured from its SYN. Blocking alone leaves the process retransmitting into
+    //     silence for a minute or more.
     // Launching the process suspended avoids the situation entirely.
     private Task HandleEscapedFlow(
-        PacketContext ctx, PacketDelegate next, IPAddress srcIp, ushort srcPort, IPAddress dstIp, ushort dstPort)
+        PacketContext ctx, PacketDelegate next, ParsedPacket p, IPAddress srcIp, ushort srcPort, IPAddress dstIp, ushort dstPort)
     {
+        if (_flowsToReset != null)
+        {
+            var key = new FlowKey(6, srcIp, srcPort, dstIp, dstPort);
+            if (_flowsToReset.Contains(key))
+            {
+                ResetTowardsProcess(ctx, p, key);
+                ctx.Drop();
+                return Task.CompletedTask;
+            }
+        }
+
         if (_blockEscapedFlows)
         {
             _logger.LogDebug("dropping escaped flow {Source}:{SourcePort} -> {Destination}:{DestinationPort} (it started before capture)",
@@ -315,6 +341,40 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
                 srcIp, srcPort, dstIp, dstPort);
         }
         return next(ctx);
+    }
+
+    // The reset goes in the direction the peer's packets take: inbound, on the interface the
+    // process's own packet was leaving from, so the stack matches it to the socket. The packet it
+    // answers is dropped by the caller; a peer that never sees it has nothing to reply to.
+    private void ResetTowardsProcess(PacketContext ctx, ParsedPacket p, FlowKey key)
+    {
+        byte[] reset;
+        try
+        {
+            reset = _resetBuilder.BuildResetTowardsSender(p);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "could not build a reset for {Flow}; dropping the packet only", key);
+            return;
+        }
+
+        WinDivertAddress addr = default;
+        addr.Layer = WinDivertLayer.Network;
+        addr.Outbound = false;
+        addr.Loopback = false;
+        addr.IPv6 = p.IsIpv6;
+        addr.Network.IfIdx = ctx.Address.Network.IfIdx;
+        addr.Network.SubIfIdx = ctx.Address.Network.SubIfIdx;
+
+        bool injected = ctx.Injector.Inject(reset, reset.Length, addr);
+
+        // Once per flow: the process may send a few more segments before it takes the reset in.
+        if (_resetFlows.TryAdd(key, 0))
+        {
+            if (_resetFlows.Count > MaxRememberedEscapedFlows) _resetFlows.Clear();
+            _logger.LogDebug("resetting pre-existing flow {Flow} at the host's request, injected={Injected}", key, injected);
+        }
     }
 
     private static string TcpFlags(ParsedPacket p)

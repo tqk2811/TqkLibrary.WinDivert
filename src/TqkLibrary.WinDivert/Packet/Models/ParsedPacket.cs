@@ -31,6 +31,19 @@ public sealed class ParsedPacket
     public IPEndPoint SourceEndPoint => new IPEndPoint(Source, SourcePort);
     public IPEndPoint DestinationEndPoint => new IPEndPoint(Destination, DestinationPort);
 
+    /// <summary>
+    /// Bytes after the transport header — the segment's data. Zero for a bare ACK, and for a
+    /// protocol this parser does not read a header for.
+    /// </summary>
+    public int PayloadLength
+    {
+        get
+        {
+            int transportHeaderLength = IsTcp ? Tcp.DataOffset : IsUdp ? 8 : 0;
+            return Math.Max(0, Length - TransportHeaderOffset - transportHeaderLength);
+        }
+    }
+
     internal ParsedPacket(byte[] buffer, int length, bool isIpv6, IpProtocol protocol, int ipOffset, int ipHeaderLength)
     {
         Buffer = buffer;

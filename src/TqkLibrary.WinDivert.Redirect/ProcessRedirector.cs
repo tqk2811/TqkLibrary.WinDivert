@@ -37,6 +37,10 @@ public sealed class ProcessRedirector : IProcessRedirector
 
     private readonly NatTable _nat = new NatTable();
 
+    // Flows the host asked to reset — see ResetEscapedFlows. Shared by both NAT stages (one per
+    // address family) and emptied flow by flow as the tracker reports closes.
+    private readonly EscapedFlowBlocklist _escapedFlows = new EscapedFlowBlocklist();
+
     private ISocketTracker? _tracker;
     private ITcpRelayServer? _tcpRelay;
     private IUdpRelayServer? _udpRelay;
@@ -111,6 +115,26 @@ public sealed class ProcessRedirector : IProcessRedirector
 
     public bool IsTrackedProcessId(uint pid) => _tracker?.IsTrackedProcess(pid) == true;
 
+    public int ResetEscapedFlows()
+    {
+        if (_tracker is null) throw new InvalidOperationException("Redirector not started");
+
+        // A tracked TCP flow with no NAT entry is one the relay never saw: its handshake happened
+        // before the process was attached. Everything the relay carries has an entry under its
+        // source port, so this is exactly the set that has been passing through.
+        int marked = 0;
+        foreach (FlowKey flow in _tracker.TcpSnapshot)
+        {
+            if (flow.Protocol != 6) continue;
+            bool isIpv6 = flow.LocalAddress.AddressFamily == AddressFamily.InterNetworkV6
+                && !flow.LocalAddress.IsIPv4MappedToIPv6;
+            if (_nat.Find(6, flow.LocalPort, isIpv6) != null) continue;
+            if (_escapedFlows.Add(flow)) marked++;
+        }
+        _logger.LogInformation("{Count} pre-existing flow(s) marked for reset; each is answered with an RST on its next packet", marked);
+        return marked;
+    }
+
     public void Start()
     {
         if (_tracker != null) throw new InvalidOperationException("Already started");
@@ -123,6 +147,8 @@ public sealed class ProcessRedirector : IProcessRedirector
         _tracker = tracker;
         tracker.TcpConnectEstablished += k => TcpConnectEstablished?.Invoke(k);
         tracker.TcpConnectClosed += k => TcpConnectClosed?.Invoke(k);
+        // A flow marked for reset is done with once the process has closed it.
+        tracker.TcpConnectClosed += k => _escapedFlows.Remove(k);
         tracker.Start();
 
         Ipv6Mode ipv6Mode = ResolveIpv6Mode();
@@ -284,7 +310,8 @@ public sealed class ProcessRedirector : IProcessRedirector
             _dnsLookupStarted ? _dnsCacheLookup : null,
             _options.RedirectDestinationPorts,
             _options.BlockEscapedFlows,
-            _options.ShouldRedirectUdp);
+            _options.ShouldRedirectUdp,
+            _escapedFlows);
 
     // The caller's own middlewares, then the UDP block last — so everything already handled (DNS,
     // NAT, the caller's stages) has been claimed before anything is swallowed.
@@ -295,26 +322,6 @@ public sealed class ProcessRedirector : IProcessRedirector
             builder.Use(new BlockTargetUdpMiddleware(tracker, _loggerFactory.CreateLogger<BlockTargetUdpMiddleware>()));
     }
 
-    private static string BuildProtoFilter(bool tcp, bool udp)
-    {
-        if (tcp && udp) return "tcp or udp";
-        if (tcp) return "tcp";
-        if (udp) return "udp";
-        return "false";
-    }
-
-    public void Dispose()
-    {
-        _logger.LogInformation("stopping redirect for pid={Pid}", _options.ProcessId);
-        _ipv6Pump?.Dispose();
-        _ipv4Pump?.Dispose();
-        _tcpRelay?.Dispose();
-        _udpRelay?.Dispose();
-        _tracker?.Dispose();
-        _dnsResolver?.Dispose();
-        _dnsCacheLookup.Dispose();
-    }
-}
     // Packets the driver has captured wait in a queue until the pump takes them. The defaults —
     // 4096 packets, 2 seconds — are sized for a pump that never pauses; ours does, when a burst of
     // SYNs each costs a sweep of the kernel tables, and every packet still queued when the time
@@ -344,3 +351,23 @@ public sealed class ProcessRedirector : IProcessRedirector
         return handle;
     }
 
+    private static string BuildProtoFilter(bool tcp, bool udp)
+    {
+        if (tcp && udp) return "tcp or udp";
+        if (tcp) return "tcp";
+        if (udp) return "udp";
+        return "false";
+    }
+
+    public void Dispose()
+    {
+        _logger.LogInformation("stopping redirect for pid={Pid}", _options.ProcessId);
+        _ipv6Pump?.Dispose();
+        _ipv4Pump?.Dispose();
+        _tcpRelay?.Dispose();
+        _udpRelay?.Dispose();
+        _tracker?.Dispose();
+        _dnsResolver?.Dispose();
+        _dnsCacheLookup.Dispose();
+    }
+}
