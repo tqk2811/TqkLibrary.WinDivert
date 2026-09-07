@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
@@ -24,6 +24,14 @@ namespace TqkLibrary.WinDivert.Flow;
 //   * Grace-period removal of TCP flows after SocketClose — kernel keeps retransmitting
 //     trailing ACKs for several seconds after the process closes the socket, and those
 //     packets would otherwise fall through and leak.
+//
+// Two ways of deciding whose events matter, chosen by the caller:
+//   * one SOCKET handle per pid, filtered in the driver ("processId == N"). Nothing is heard about
+//     a process until something else — a process watcher — has named it, so a process is only
+//     followed from the moment that watcher noticed it.
+//   * one SOCKET handle for the whole machine, with a callback deciding pid by pid. The event
+//     itself carries the pid, so a process is judged the instant it opens a socket rather than
+//     when it started; the answer is cached so the callback is asked once per process.
 public sealed class SocketTracker : ISocketTracker
 {
     private readonly ConcurrentDictionary<FlowKey, TcpFlowState> _tcpFlows = new();
@@ -31,6 +39,11 @@ public sealed class SocketTracker : ISocketTracker
 
     private readonly uint _processId;
     private readonly short _socketPriority;
+    // Null for per-pid handles. Non-null puts this tracker in machine-wide mode: it answers
+    // "should this process be redirected?" for a pid nobody has mentioned before. Null BACK from
+    // it means "cannot tell yet" — the process table has not caught up — and is deliberately not
+    // cached, so the next event for that pid asks again instead of writing it off forever.
+    private readonly Func<uint, bool?>? _shouldTrackProcess;
     private readonly IWinDivertHandleFactory _handleFactory;
     private readonly ILogger<SocketTracker> _logger;
     private readonly CancellationTokenSource _cts = new();
@@ -41,6 +54,13 @@ public sealed class SocketTracker : ISocketTracker
     // to the shared _tcpFlows / _udpBinds dictionaries. AddProcess opens a new handle on demand
     // so child processes spawned by the root target can be followed without reopening anything.
     private readonly ConcurrentDictionary<uint, PerPidHandle> _pidHandles = new();
+
+    // Machine-wide mode only: what the callback answered about each pid. This is also the tracked
+    // set — there is no per-pid handle to stand in for it.
+    private readonly ConcurrentDictionary<uint, bool> _pidDecisions = new();
+
+    // Machine-wide mode only: the single SOCKET handle every process's events arrive on.
+    private PerPidHandle? _allHandle;
 
     private sealed class PerPidHandle
     {
@@ -74,21 +94,33 @@ public sealed class SocketTracker : ISocketTracker
 
     /// <param name="processId">
     /// Root process to follow. Zero means "start with nothing tracked" — pids are then added via
-    /// <see cref="AddProcess"/> as a process watcher discovers them.
+    /// <see cref="AddProcess"/> as a process watcher discovers them. Ignored in machine-wide mode,
+    /// where the callback decides.
+    /// </param>
+    /// <param name="shouldTrackProcess">
+    /// Machine-wide mode: asked once per pid, on the pump thread, the first time that process is
+    /// seen opening a socket. True redirects it, false leaves it alone, and null means "not yet
+    /// known" — nothing is remembered and the question is asked again on its next event. Null for
+    /// the whole parameter keeps the per-pid handles instead.
     /// </param>
     public SocketTracker(
         uint processId,
         IWinDivertHandleFactory handleFactory,
         ILogger<SocketTracker> logger,
-        short socketPriority = 0)
+        short socketPriority = 0,
+        Func<uint, bool?>? shouldTrackProcess = null)
     {
         _processId = processId;
         _socketPriority = socketPriority;
+        _shouldTrackProcess = shouldTrackProcess;
         _handleFactory = handleFactory ?? throw new ArgumentNullException(nameof(handleFactory));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _lastReconcileTicks = Environment.TickCount - ReconcileMinIntervalMs;
-        _isTrackedPid = _pidHandles.ContainsKey;
+        _isTrackedPid = shouldTrackProcess is null ? _pidHandles.ContainsKey : IsAcceptedPid;
     }
+
+    /// <summary>True when this tracker listens to the whole machine and judges pid by pid.</summary>
+    private bool IsMachineWide => _shouldTrackProcess != null;
 
     public bool IsTrackedTcp(FlowKey key) => _tcpFlows.ContainsKey(key);
 
@@ -124,15 +156,71 @@ public sealed class SocketTracker : ISocketTracker
 
     public IReadOnlyCollection<FlowKey> TcpSnapshot => (IReadOnlyCollection<FlowKey>)_tcpFlows.Keys;
 
-    public IReadOnlyCollection<uint> TrackedProcessIds => (IReadOnlyCollection<uint>)_pidHandles.Keys;
+    public IReadOnlyCollection<uint> TrackedProcessIds
+        => IsMachineWide
+            ? _pidDecisions.Where(kv => kv.Value).Select(kv => kv.Key).ToArray()
+            : (IReadOnlyCollection<uint>)_pidHandles.Keys;
 
     public void Start()
     {
         if (_started) throw new InvalidOperationException("Already started");
         _started = true;
-        if (_processId != 0) AddProcess(_processId);
+        if (IsMachineWide) OpenMachineWideHandle();
+        else if (_processId != 0) AddProcess(_processId);
         _cleanupTask = Task.Run(() => CleanupLoop(_cts.Token));
     }
+
+    // One handle for every process on the machine. The filter cannot name the pids we want —
+    // that is the whole point, we do not know them yet — so it takes every socket event and the
+    // decision moves to HandleEvent. Sniffing for the same reason as the per-pid handles: the
+    // SOCKET layer offers nothing else (see AddProcess).
+    private void OpenMachineWideHandle()
+    {
+        const string filter = "tcp or udp";
+        _logger.LogDebug("opening a machine-wide SOCKET handle, filter={Filter}", filter);
+
+        IWinDivertHandle handle;
+        try
+        {
+            handle = _handleFactory.Open(
+                filter,
+                WinDivertLayer.Socket,
+                priority: _socketPriority,
+                flags: WinDivertOpenFlags.Sniff | WinDivertOpenFlags.RecvOnly);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "no machine-wide SOCKET handle (win32={Win32}) — nothing will be tracked",
+                (ex as System.ComponentModel.Win32Exception)?.NativeErrorCode);
+            return;
+        }
+
+        _allHandle = new PerPidHandle(handle, Task.Run(() => PumpLoop(handle, 0, _cts.Token)));
+    }
+
+    // The verdict on one pid, asked once and then remembered. "Not yet known" is not remembered:
+    // it usually means the process table has not caught up with a process that was created
+    // moments ago, and writing it off would lose that process for as long as it runs.
+    private bool AcceptPid(uint pid)
+    {
+        if (_pidDecisions.TryGetValue(pid, out bool known)) return known;
+
+        bool? verdict;
+        try { verdict = _shouldTrackProcess!(pid); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "deciding whether pid={Pid} should be tracked failed", pid);
+            return false;
+        }
+
+        if (verdict is null) return false;
+
+        _pidDecisions[pid] = verdict.Value;
+        if (verdict.Value) _logger.LogDebug("pid={Pid} is now tracked, decided from its own socket event", pid);
+        return verdict.Value;
+    }
+
+    private bool IsAcceptedPid(uint pid) => _pidDecisions.TryGetValue(pid, out bool ok) && ok;
 
     // Adds a new pid to the tracked set. Opens a dedicated WinDivert SOCKET handle scoped to that
     // pid and spawns a pump task; subsequent socket events for the pid flow into the shared
@@ -141,6 +229,18 @@ public sealed class SocketTracker : ISocketTracker
     public void AddProcess(uint pid)
     {
         if (_cts.IsCancellationRequested) return;
+
+        // Machine-wide mode has no handle to open — the events are already arriving. Being told
+        // about a pid here is a caller (a suspended launch, a process the user picked) settling
+        // the verdict in advance, so the pump never has to ask.
+        if (IsMachineWide)
+        {
+            if (_pidDecisions.TryGetValue(pid, out bool already) && already) return;
+            _pidDecisions[pid] = true;
+            PrePopulateForPid(pid);
+            return;
+        }
+
         if (_pidHandles.ContainsKey(pid)) return;
 
         string filter = $"processId == {pid} and (tcp or udp)";
@@ -199,12 +299,22 @@ public sealed class SocketTracker : ISocketTracker
     // so trailing packets should reach the kernel unmodified rather than keep hitting the relay.
     public bool RemoveProcess(uint pid)
     {
-        if (!_pidHandles.TryRemove(pid, out PerPidHandle? entry)) return false;
-
-        _logger.LogDebug("RemoveProcess pid={Pid}", pid);
-        try { entry.Handle.Shutdown(); } catch { }
-        try { entry.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
-        entry.Handle.Dispose();
+        if (IsMachineWide)
+        {
+            // The pid is forgotten rather than remembered as "no": a pid the caller drops is
+            // usually a process that has exited, and Windows hands its number to something else
+            // soon enough. A remembered "no" would then be answering about the wrong program.
+            if (!_pidDecisions.TryRemove(pid, out bool wasTracked)) return false;
+            if (!wasTracked) return false;
+        }
+        else if (!_pidHandles.TryRemove(pid, out PerPidHandle? entry)) return false;
+        else
+        {
+            _logger.LogDebug("RemoveProcess pid={Pid}", pid);
+            try { entry.Handle.Shutdown(); } catch { }
+            try { entry.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            entry.Handle.Dispose();
+        }
 
         int tcpRemoved = 0, udpRemoved = 0;
         foreach (var kv in _tcpFlows)
@@ -229,7 +339,8 @@ public sealed class SocketTracker : ISocketTracker
         return true;
     }
 
-    public bool IsTrackedProcess(uint pid) => _pidHandles.ContainsKey(pid);
+    public bool IsTrackedProcess(uint pid)
+        => IsMachineWide ? IsAcceptedPid(pid) : _pidHandles.ContainsKey(pid);
 
     private void PrePopulateForPid(uint pid)
     {
@@ -338,7 +449,7 @@ public sealed class SocketTracker : ISocketTracker
                 handle.TrySend(dummy, 0, ref addr);
             }
         }
-        _logger.LogDebug("Socket pump for pid={Pid} exited", pid);
+        _logger.LogDebug("Socket pump for pid={Pid} exited (0 = machine-wide)", pid);
     }
 
     private async Task CleanupLoop(CancellationToken ct)
@@ -376,6 +487,11 @@ public sealed class SocketTracker : ISocketTracker
         ushort rp = data.RemotePort;
         byte proto = data.Protocol;
         uint pid = data.ProcessId;
+
+        // Machine-wide mode hears every process on the machine, so this is where everything that
+        // is not ours is dropped — before a flow is recorded, and before anything is logged about
+        // it at trace level.
+        if (IsMachineWide && !AcceptPid(pid)) return;
 
         _logger.LogTrace("evt={Event} proto={Protocol} pid={Pid} {Local}:{LocalPort} -> {Remote}:{RemotePort}", addr.Event, proto, pid, local, lp, remote, rp);
 
@@ -427,6 +543,16 @@ public sealed class SocketTracker : ISocketTracker
     public void Dispose()
     {
         try { _cts.Cancel(); } catch { }
+
+        PerPidHandle? all = _allHandle;
+        _allHandle = null;
+        if (all != null)
+        {
+            try { all.Handle.Shutdown(); } catch { }
+            try { all.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            all.Handle.Dispose();
+        }
+
         foreach (var kv in _pidHandles)
         {
             try { kv.Value.Handle.Shutdown(); } catch { }
@@ -437,6 +563,7 @@ public sealed class SocketTracker : ISocketTracker
             kv.Value.Handle.Dispose();
         }
         _pidHandles.Clear();
+        _pidDecisions.Clear();
         try { _cleanupTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
         _cts.Dispose();
     }

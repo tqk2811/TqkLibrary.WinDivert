@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Threading.Tasks;
@@ -143,7 +143,8 @@ public sealed class ProcessRedirector : IProcessRedirector
             "starting redirect for pid={Pid}, protocols={Protocols}, ipv6={Ipv6Mode}, netPriority={NetPriority}",
             _options.ProcessId, _options.Protocols, _options.Ipv6Mode, _options.NetworkPriority);
 
-        ISocketTracker tracker = _trackerFactory.Create(_options.ProcessId, _options.SocketPriority);
+        ISocketTracker tracker = _trackerFactory.Create(
+            _options.ProcessId, _options.SocketPriority, _options.ShouldTrackProcess);
         _tracker = tracker;
         tracker.TcpConnectEstablished += k => TcpConnectEstablished?.Invoke(k);
         tracker.TcpConnectClosed += k => TcpConnectClosed?.Invoke(k);

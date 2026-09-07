@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace TqkLibrary.WinDivert.Redirect;
@@ -59,6 +59,23 @@ public sealed class RedirectOptions
     /// the user is running.
     /// </summary>
     public short SocketPriority { get; set; } = 0;
+
+    /// <summary>
+    /// Judge every process on the machine as it opens a socket, instead of following only the pids
+    /// the host has named.
+    /// </summary>
+    /// <remarks>
+    /// Set this and the tracker opens ONE sniffing SOCKET handle for the whole machine rather than
+    /// one per pid, and asks this for each pid it has not seen before: true redirects that process,
+    /// false leaves it alone, null means "cannot tell yet" and is asked again on the next event.
+    /// Asked on the pump thread, so it must be quick — and it is asked once per process, not once
+    /// per connection.
+    ///
+    /// What it buys is WHEN a process is judged. The alternative learns of a process from a process
+    /// watcher, which is a different event stream with its own delay; here the pid arrives on the
+    /// socket event itself, so a program that connects the moment it starts is still caught.
+    /// </remarks>
+    public Func<uint, bool?>? ShouldTrackProcess { get; set; }
 
     /// <summary>
     /// What happens to the target's IPv6 traffic. Redirect (default) opens a parallel IPv6 NETWORK

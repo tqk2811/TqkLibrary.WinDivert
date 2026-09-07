@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using Microsoft.Extensions.Logging;
 
 namespace TqkLibrary.WinDivert.Flow;
@@ -15,6 +15,9 @@ public sealed class SocketTrackerFactory : ISocketTrackerFactory
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
     }
 
-    public ISocketTracker Create(uint processId, short socketPriority = 0)
-        => new SocketTracker(processId, _handleFactory, _loggerFactory.CreateLogger<SocketTracker>(), socketPriority);
+    public ISocketTracker Create(
+        uint processId, short socketPriority = 0, Func<uint, bool?>? shouldTrackProcess = null)
+        => new SocketTracker(
+            processId, _handleFactory, _loggerFactory.CreateLogger<SocketTracker>(),
+            socketPriority, shouldTrackProcess);
 }

@@ -1,3 +1,5 @@
+﻿using System;
+
 namespace TqkLibrary.WinDivert.Flow.Interfaces;
 
 /// <summary>
@@ -15,5 +17,11 @@ public interface ISocketTrackerFactory
     /// Priority of the SOCKET-layer handles, deciding this tracker's order relative to other
     /// WinDivert clients on the machine.
     /// </param>
-    ISocketTracker Create(uint processId, short socketPriority = 0);
+    /// <param name="shouldTrackProcess">
+    /// Opt into machine-wide mode: one SOCKET handle for every process, with this asked once per
+    /// pid to decide whether that process is redirected. Null keeps the per-pid handles, where a
+    /// process is only followed once <see cref="ISocketTracker.AddProcess"/> has named it.
+    /// </param>
+    ISocketTracker Create(
+        uint processId, short socketPriority = 0, Func<uint, bool?>? shouldTrackProcess = null);
 }
