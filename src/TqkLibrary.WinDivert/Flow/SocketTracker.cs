@@ -216,7 +216,15 @@ public sealed class SocketTracker : ISocketTracker
         if (verdict is null) return false;
 
         _pidDecisions[pid] = verdict.Value;
-        if (verdict.Value) _logger.LogDebug("pid={Pid} is now tracked, decided from its own socket event", pid);
+        if (verdict.Value)
+        {
+            _logger.LogDebug("pid={Pid} is now tracked, decided from its own socket event", pid);
+            // The event that got us here is one socket; the process may have had others open long
+            // before this handle existed, and those produce no event ever again. The kernel's own
+            // tables are where they are, so they are read once, here, at the moment the process
+            // becomes ours — exactly what AddProcess does for a pid named from outside.
+            PrePopulateForPid(pid);
+        }
         return verdict.Value;
     }
 
