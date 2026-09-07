@@ -34,12 +34,34 @@ public sealed class RedirectedTcpConnection : IDisposable
 
     public ConnectionStatistics Statistics { get; } = new ConnectionStatistics();
 
-    public RedirectedTcpConnection(uint pid, IPEndPoint origSrc, IPEndPoint origDst, TcpClient client)
+    /// <summary>
+    /// When the NAT stage first saw this flow's SYN — the moment the process asked for the
+    /// connection. Equal to <see cref="AcceptedUtc"/> when the relay was handed no NAT entry.
+    /// </summary>
+    public DateTime CapturedUtc { get; }
+
+    /// <summary>When the relay accepted the loopback connection the SYN was bent onto.</summary>
+    public DateTime AcceptedUtc { get; }
+
+    /// <summary>
+    /// How long the process waited for its handshake to complete through the relay. On a healthy
+    /// machine this is microseconds; seconds mean the rewritten SYN or its reply was lost and the
+    /// process retransmitted — the packet pump was stalled, or the driver queue overflowed.
+    /// </summary>
+    public TimeSpan CaptureToAccept => AcceptedUtc - CapturedUtc;
+
+    /// <param name="capturedUtc">
+    /// The NAT entry's creation time, when the caller has it. Null means "unknown", which is
+    /// recorded as the accept time so the difference reads as zero rather than as nonsense.
+    /// </param>
+    public RedirectedTcpConnection(uint pid, IPEndPoint origSrc, IPEndPoint origDst, TcpClient client, DateTime? capturedUtc = null)
     {
         ProcessId = pid;
         OriginalSource = origSrc;
         OriginalDestination = origDst;
         ClientTcp = client ?? throw new ArgumentNullException(nameof(client));
+        AcceptedUtc = DateTime.UtcNow;
+        CapturedUtc = capturedUtc ?? AcceptedUtc;
         _clientStream = new PeekableStream(new CountingStream(client.GetStream(), Statistics));
     }
 

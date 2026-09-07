@@ -206,8 +206,7 @@ public sealed class ProcessRedirector : IProcessRedirector
         // `not impostor` avoids re-capturing packets we reinjected ourselves, which would loop.
         string filter = $"ip and ({BuildProtoFilter(WantsTcp, CapturesUdp)}) and not impostor";
         _logger.LogDebug("opening IPv4 NETWORK handle, filter={Filter}", filter);
-        IWinDivertHandle handle = _handleFactory.Open(
-            filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
+        IWinDivertHandle handle = OpenNetworkHandle(filter);
 
         var builder = new PacketPipelineBuilder();
 
@@ -243,8 +242,7 @@ public sealed class ProcessRedirector : IProcessRedirector
     {
         string filter = $"ipv6 and ({BuildProtoFilter(WantsTcp, CapturesUdp)}) and not impostor";
         _logger.LogDebug("opening IPv6 NETWORK handle for redirect, filter={Filter}", filter);
-        IWinDivertHandle handle = _handleFactory.Open(
-            filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
+        IWinDivertHandle handle = OpenNetworkHandle(filter);
 
         var builder = new PacketPipelineBuilder();
 
@@ -266,8 +264,7 @@ public sealed class ProcessRedirector : IProcessRedirector
     {
         const string filter = "ipv6 and (tcp or udp) and not impostor";
         _logger.LogDebug("opening IPv6 NETWORK handle to block, filter={Filter}", filter);
-        IWinDivertHandle handle = _handleFactory.Open(
-            filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
+        IWinDivertHandle handle = OpenNetworkHandle(filter);
 
         var builder = new PacketPipelineBuilder();
         builder.Use(new Ipv6BlockMiddleware(tracker, _loggerFactory.CreateLogger<Ipv6BlockMiddleware>()));
@@ -318,3 +315,32 @@ public sealed class ProcessRedirector : IProcessRedirector
         _dnsCacheLookup.Dispose();
     }
 }
+    // Packets the driver has captured wait in a queue until the pump takes them. The defaults —
+    // 4096 packets, 2 seconds — are sized for a pump that never pauses; ours does, when a burst of
+    // SYNs each costs a sweep of the kernel tables, and every packet still queued when the time
+    // runs out is DROPPED. A dropped SYN, or the relay's SYN-ACK to it, is a handshake the process
+    // only completes after its retransmission timer fires: one second, then three, then seven.
+    // With the queue this deep a pause of the same length is a pause, not a loss — the browser
+    // waits a moment instead of a second.
+    private const ulong QueueLength = 16384;        // packets; the driver's maximum
+    private const ulong QueueTimeMs = 8000;         // the driver allows up to 16000
+    private const ulong QueueBytes = 16 * 1024 * 1024;
+
+    private IWinDivertHandle OpenNetworkHandle(string filter)
+    {
+        IWinDivertHandle handle = _handleFactory.Open(
+            filter, WinDivertLayer.Network, _options.NetworkPriority, WinDivertOpenFlags.None);
+        try
+        {
+            handle.SetParam(WinDivertParam.QueueLength, QueueLength);
+            handle.SetParam(WinDivertParam.QueueTime, QueueTimeMs);
+            handle.SetParam(WinDivertParam.QueueSize, QueueBytes);
+        }
+        catch (Exception ex)
+        {
+            // The defaults still work; they just lose packets sooner under a stall.
+            _logger.LogWarning(ex, "could not deepen the driver queue for filter={Filter}; keeping the defaults", filter);
+        }
+        return handle;
+    }
+

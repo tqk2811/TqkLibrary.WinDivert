@@ -121,13 +121,17 @@ public sealed class TcpRelayServer : ITcpRelayServer
             client.Close();
             return;
         }
-        _logger.LogDebug("srcPort={SrcPort} ipv6={IsIpv6} was going to {Destination}:{DestinationPort}", remote.Port, isIpv6, entry.OriginalDestinationAddress, entry.OriginalDestinationPort);
-
         using var conn = new RedirectedTcpConnection(
             entry.ProcessId,
             new IPEndPoint(entry.OriginalSourceAddress, entry.OriginalSourcePort),
             entry.OriginalDestination,
-            client);
+            client,
+            entry.CreatedUtc);
+        // The delay between the SYN and this accept is the one number that tells a stalled pump
+        // from a slow network: the handshake runs over loopback, so anything above a few
+        // milliseconds is a retransmitted SYN.
+        _logger.LogDebug("srcPort={SrcPort} ipv6={IsIpv6} was going to {Destination}:{DestinationPort}, accepted {Ms}ms after its SYN",
+            remote.Port, isIpv6, entry.OriginalDestinationAddress, entry.OriginalDestinationPort, (long)conn.CaptureToAccept.TotalMilliseconds);
 
         try { ConnectionOpened?.Invoke(conn); } catch { }
         try
