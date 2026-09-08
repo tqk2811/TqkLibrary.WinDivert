@@ -41,7 +41,7 @@ public static class RedirectServiceCollectionExtensions
             sp.GetRequiredService<IDnsMessageParser>(),
             sp.GetRequiredService<IDnsResolverFactory>(),
             sp.GetRequiredService<IReverseDnsTable>,
-            sp.GetRequiredService<IDnsCacheLookup>,
+            sp.GetRequiredService<Func<IDnsCacheLookup>>(),
             sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()));
 
         // Resolves without a reverse-DNS table: the one that matters belongs to a session, and a

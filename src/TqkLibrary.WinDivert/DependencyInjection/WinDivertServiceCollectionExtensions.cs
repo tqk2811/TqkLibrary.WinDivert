@@ -31,9 +31,15 @@ public static class WinDivertServiceCollectionExtensions
         services.TryAddSingleton<IPacketParser, PacketParser>();
         services.TryAddSingleton<IPacketPumpFactory, PacketPumpFactory>();
         services.TryAddSingleton<ISocketTrackerFactory, SocketTrackerFactory>();
-        // Transient: it owns a polling task, and a caller that asks for one is expected to
-        // dispose it with the session it belongs to.
-        services.TryAddTransient<IDnsCacheLookup, DnsCacheLookup>();
+        // A factory, not the service itself. The lookup owns a polling task and is disposed with
+        // the session that asked for it — and a transient IDisposable resolved from the ROOT
+        // provider is added to that provider's own disposables list, which holds a strong
+        // reference until the application exits. Every start/stop cycle left another lookup there,
+        // still holding its map, which only ever grows.
+        //
+        // Registering a Func of your own is how to substitute an implementation.
+        Func<IDnsCacheLookup> dnsCacheLookupFactory = () => new DnsCacheLookup();
+        services.TryAddSingleton(dnsCacheLookupFactory);
         return services;
     }
 }
