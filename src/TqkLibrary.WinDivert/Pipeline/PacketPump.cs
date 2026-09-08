@@ -44,6 +44,7 @@ public sealed class PacketPump : IPacketPump
 
     private readonly CancellationTokenSource _cts = new();
     private Task? _pumpTask;
+    private volatile bool _started;
     private volatile bool _disposed;
 
     public string Name { get; }
@@ -68,11 +69,32 @@ public sealed class PacketPump : IPacketPump
 
     public void Start()
     {
-        if (_pumpTask != null) throw new InvalidOperationException("Already started");
+        if (_started) throw new InvalidOperationException("Already started");
+        // Set before the task exists, not after. Dispose reads it to decide who closes the handle,
+        // and in the window between Task.Run creating the pump and the assignment landing, a pump
+        // would be reading a handle Dispose had already decided nobody owned.
+        _started = true;
         _pumpTask = Task.Run(() => PumpLoop(_cts.Token));
     }
 
+    /// <summary>
+    /// Runs the recv loop and closes the handle on the way out.
+    /// </summary>
+    /// <remarks>
+    /// The close lives here because a <see cref="System.Runtime.InteropServices.SafeHandle"/>
+    /// protects only the call in flight when another thread disposes it: the close waits for that
+    /// call to return, but the next call throws ObjectDisposedException out of DangerousAddRef. A
+    /// disposer that times out and closes anyway would leave this loop reading a dead handle.
+    /// <see cref="Dispose"/> shuts the handle down — that is what makes the recv return — and waits;
+    /// the close belongs to the thread doing the reading.
+    /// </remarks>
     private void PumpLoop(CancellationToken ct)
+    {
+        try { Pump(ct); }
+        finally { _handle.Dispose(); }
+    }
+
+    private void Pump(CancellationToken ct)
     {
         byte[] buffer = new byte[RecvBufferSize];
         int stopError = 0;
@@ -161,13 +183,19 @@ public sealed class PacketPump : IPacketPump
         _disposed = true;
         try { _cts.Cancel(); } catch { }
         try { _handle.Shutdown(); } catch { }
-        try { _pumpTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
 
-        // The wait may time out — a driver under load can hold a recv longer than a second — and
-        // disposing anyway is still safe: every call into the driver holds a reference on the
-        // handle, so the close waits for the pump thread to come out rather than pulling the
-        // handle out from under it.
-        _handle.Dispose();
+        if (_started)
+        {
+            // Best effort, and that is all it can be: a driver under load can hold a recv longer
+            // than a second. When the wait does time out the handle closes a moment later, when the
+            // pump leaves — not here. See PumpLoop for why closing it here was wrong.
+            try { _pumpTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
+        }
+        else
+        {
+            // Never started, so there is no pump to hand it to.
+            _handle.Dispose();
+        }
         _cts.Dispose();
     }
 }
