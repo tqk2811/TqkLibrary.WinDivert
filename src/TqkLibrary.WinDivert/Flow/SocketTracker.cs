@@ -519,7 +519,15 @@ public sealed class SocketTracker : ISocketTracker
         // it at trace level.
         if (IsMachineWide && !AcceptPid(pid)) return;
 
-        _logger.LogTrace("evt={Event} proto={Protocol} pid={Pid} {Local}:{LocalPort} -> {Remote}:{RemotePort}", addr.Event, proto, pid, local, lp, remote, rp);
+        // Guarded, and so is every trace line below that reads a flow count. The arguments to a
+        // LogTrace call are evaluated whether or not Trace is on, and ConcurrentDictionary.Count
+        // takes EVERY one of the dictionary's locks to answer — on a path the NETWORK pump reads
+        // per packet, in a mode that hears every socket event on the machine.
+        bool trace = _logger.IsEnabled(LogLevel.Trace);
+        if (trace)
+        {
+            _logger.LogTrace("evt={Event} proto={Protocol} pid={Pid} {Local}:{LocalPort} -> {Remote}:{RemotePort}", addr.Event, proto, pid, local, lp, remote, rp);
+        }
 
         switch (addr.Event)
         {
@@ -531,7 +539,7 @@ public sealed class SocketTracker : ISocketTracker
                     var state = new TcpFlowState(pid);
                     bool added = _tcpFlows.TryAdd(key, state);
                     if (!added) _tcpFlows[key] = state;
-                    _logger.LogTrace("  tcp flow added={Added} count={Count} key={Key}", added, _tcpFlows.Count, key);
+                    if (trace) _logger.LogTrace("  tcp flow added={Added} count={Count} key={Key}", added, _tcpFlows.Count, key);
                     if (added) TcpConnectEstablished?.Invoke(key);
                 }
                 break;
@@ -546,7 +554,7 @@ public sealed class SocketTracker : ISocketTracker
                     bool wasLive = _tcpFlows.TryGetValue(key, out TcpFlowState? current) && current.ExpireTick == 0;
                     if (current != null) current.ExpireTick = expireAt;
                     else _tcpFlows[key] = new TcpFlowState(pid, expireAt);
-                    _logger.LogTrace("  tcp flow marked closed, wasLive={WasLive} graceMs={GraceMs} count={Count} key={Key}", wasLive, TcpCloseGraceMs, _tcpFlows.Count, key);
+                    if (trace) _logger.LogTrace("  tcp flow marked closed, wasLive={WasLive} graceMs={GraceMs} count={Count} key={Key}", wasLive, TcpCloseGraceMs, _tcpFlows.Count, key);
                     if (wasLive) TcpConnectClosed?.Invoke(key);
                 }
                 else if (proto == 17)
