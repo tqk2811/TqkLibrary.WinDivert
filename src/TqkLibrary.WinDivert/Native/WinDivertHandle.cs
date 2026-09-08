@@ -11,8 +11,6 @@ public sealed class WinDivertHandle : IWinDivertHandle
     public WinDivertLayer Layer { get; }
     public string Filter { get; }
 
-    internal IntPtr DangerousHandle => _handle.DangerousGetHandle();
-
     private WinDivertHandle(WinDivertSafeHandle handle, WinDivertLayer layer, string filter)
     {
         _handle = handle;
@@ -23,13 +21,17 @@ public sealed class WinDivertHandle : IWinDivertHandle
     public static WinDivertHandle Open(string filter, WinDivertLayer layer, short priority, WinDivertOpenFlags flags)
     {
         if (filter is null) throw new ArgumentNullException(nameof(filter));
-        IntPtr raw = WinDivertNative.Open(filter, layer, priority, flags);
-        if (raw == IntPtr.Zero || raw == new IntPtr(-1))
+
+        // The marshaller builds the SafeHandle inside the call, so there is no instant where the
+        // raw handle exists with nobody owning it.
+        WinDivertSafeHandle handle = WinDivertNative.Open(filter, layer, priority, flags);
+        if (handle.IsInvalid)
         {
             int err = Marshal.GetLastWin32Error();
+            handle.Dispose();
             throw new Win32Exception(err, $"WinDivertOpen failed (layer={layer}, filter=\"{filter}\")");
         }
-        return new WinDivertHandle(new WinDivertSafeHandle(raw), layer, filter);
+        return new WinDivertHandle(handle, layer, filter);
     }
 
     public unsafe bool TryRecv(byte[] buffer, out int length, out WinDivertAddress addr, out int win32Error)
@@ -38,7 +40,7 @@ public sealed class WinDivertHandle : IWinDivertHandle
         fixed (byte* p = buffer)
         {
             WinDivertAddress a = default;
-            bool ok = WinDivertNative.Recv(_handle.DangerousGetHandle(), (IntPtr)p, (uint)buffer.Length, out uint recv, ref a);
+            bool ok = WinDivertNative.Recv(_handle, (IntPtr)p, (uint)buffer.Length, out uint recv, ref a);
             if (!ok)
             {
                 // Read it here, before anything else on this thread can overwrite it.
@@ -60,7 +62,7 @@ public sealed class WinDivertHandle : IWinDivertHandle
         if ((uint)length > buffer.Length) throw new ArgumentOutOfRangeException(nameof(length));
         fixed (byte* p = buffer)
         {
-            return WinDivertNative.Send(_handle.DangerousGetHandle(), (IntPtr)p, (uint)length, out _, ref addr);
+            return WinDivertNative.Send(_handle, (IntPtr)p, (uint)length, out _, ref addr);
         }
     }
 
@@ -74,20 +76,20 @@ public sealed class WinDivertHandle : IWinDivertHandle
 
     public void SetParam(WinDivertParam param, ulong value)
     {
-        if (!WinDivertNative.SetParam(_handle.DangerousGetHandle(), param, value))
+        if (!WinDivertNative.SetParam(_handle, param, value))
             throw new Win32Exception(Marshal.GetLastWin32Error(), $"WinDivertSetParam {param} failed");
     }
 
     public ulong GetParam(WinDivertParam param)
     {
-        if (!WinDivertNative.GetParam(_handle.DangerousGetHandle(), param, out ulong v))
+        if (!WinDivertNative.GetParam(_handle, param, out ulong v))
             throw new Win32Exception(Marshal.GetLastWin32Error(), $"WinDivertGetParam {param} failed");
         return v;
     }
 
     public void Shutdown(WinDivertShutdown how = WinDivertShutdown.Both)
     {
-        WinDivertNative.Shutdown(_handle.DangerousGetHandle(), how);
+        WinDivertNative.Shutdown(_handle, how);
     }
 
     public void Dispose()

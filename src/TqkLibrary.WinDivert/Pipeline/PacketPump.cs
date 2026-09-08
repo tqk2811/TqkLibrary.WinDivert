@@ -162,6 +162,11 @@ public sealed class PacketPump : IPacketPump
         try { _cts.Cancel(); } catch { }
         try { _handle.Shutdown(); } catch { }
         try { _pumpTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
+
+        // The wait may time out — a driver under load can hold a recv longer than a second — and
+        // disposing anyway is still safe: every call into the driver holds a reference on the
+        // handle, so the close waits for the pump thread to come out rather than pulling the
+        // handle out from under it.
         _handle.Dispose();
         _cts.Dispose();
     }
