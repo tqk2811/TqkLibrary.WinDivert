@@ -148,6 +148,23 @@ public sealed class ProcessRedirector : IProcessRedirector
             "starting redirect for pid={Pid}, protocols={Protocols}, ipv6={Ipv6Mode}, netPriority={NetPriority}",
             _options.ProcessId, _options.Protocols, _options.Ipv6Mode, _options.NetworkPriority);
 
+        try
+        {
+            StartCore();
+        }
+        catch
+        {
+            // Half of this is already running by the time the network handle is opened — the
+            // tracker, two relay listeners, their accept loops. Opening that handle is also the
+            // step that fails when the tool is not elevated, and a caller told "Start threw" does
+            // not go on to call Dispose. Everything stood up so far comes down here instead.
+            try { Dispose(); } catch (Exception cleanup) { _logger.LogDebug(cleanup, "cleaning up after a failed start"); }
+            throw;
+        }
+    }
+
+    private void StartCore()
+    {
         ISocketTracker tracker = _trackerFactory.Create(
             _options.ProcessId, _options.SocketPriority, _options.ShouldTrackProcess);
         _tracker = tracker;
