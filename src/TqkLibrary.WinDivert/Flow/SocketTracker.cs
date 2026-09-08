@@ -47,6 +47,10 @@ public sealed class SocketTracker : ISocketTracker
     private readonly IWinDivertHandleFactory _handleFactory;
     private readonly ILogger<SocketTracker> _logger;
     private readonly CancellationTokenSource _cts = new();
+
+    // 1 once Dispose has started. AddProcess runs on the process-watcher thread and Dispose on the
+    // caller's, so both have to be able to notice the other.
+    private int _disposed;
     private Task? _cleanupTask;
     private bool _started;
 
@@ -241,7 +245,7 @@ public sealed class SocketTracker : ISocketTracker
     // process is detected.
     public void AddProcess(uint pid)
     {
-        if (_cts.IsCancellationRequested) return;
+        if (Volatile.Read(ref _disposed) != 0 || _cts.IsCancellationRequested) return;
 
         // Machine-wide mode has no handle to open — the events are already arriving. Being told
         // about a pid here is a caller (a suspended launch, a process the user picked) settling
@@ -289,13 +293,29 @@ public sealed class SocketTracker : ISocketTracker
             _logger.LogError(ex, "AddProcess pid={Pid}: no SOCKET handle (win32={Win32}) — this process will not be tracked", pid, (ex as System.ComponentModel.Win32Exception)?.NativeErrorCode);
             return;
         }
-        Task pumpTask = Task.Run(() => PumpLoop(handle, pid, _cts.Token));
+        // Read here rather than inside the task: Dispose disposes the source, and a task body that
+        // reaches for the token afterwards throws ObjectDisposedException with nobody watching.
+        CancellationToken token = _cts.Token;
+        Task pumpTask = Task.Run(() => PumpLoop(handle, pid, token));
         var entry = new PerPidHandle(handle, pumpTask);
         if (!_pidHandles.TryAdd(pid, entry))
         {
             // race with another AddProcess for the same pid — discard ours
             try { handle.Shutdown(); } catch { }
             handle.Dispose();
+            return;
+        }
+
+        // Dispose may have run since the check at the top of this method — the watcher thread calls
+        // AddProcess while the UI thread stops the engine — and Dispose closes what is in
+        // _pidHandles at the moment it looks. An entry added after that is a driver handle and a
+        // pump task nothing will ever close. Re-checked now that the entry is in the table, so one
+        // of the two is guaranteed to see it.
+        if (Volatile.Read(ref _disposed) != 0 && _pidHandles.TryRemove(pid, out PerPidHandle? orphan))
+        {
+            try { orphan.Handle.Shutdown(); } catch { }
+            try { orphan.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            orphan.Handle.Dispose();
             return;
         }
 
@@ -329,6 +349,10 @@ public sealed class SocketTracker : ISocketTracker
             entry.Handle.Dispose();
         }
 
+        // Each notification is guarded on its own. A subscriber that throws used to abandon the
+        // rest of the removal, so the SOCKET handle was already closed while flows and binds
+        // belonging to the pid stayed in the tables — answering for a process nothing is watching
+        // any more, and for a port Windows will hand to somebody else.
         int tcpRemoved = 0, udpRemoved = 0;
         foreach (var kv in _tcpFlows)
         {
@@ -336,7 +360,8 @@ public sealed class SocketTracker : ISocketTracker
             if (_tcpFlows.TryRemove(kv.Key, out _))
             {
                 tcpRemoved++;
-                TcpConnectClosed?.Invoke(kv.Key);
+                try { TcpConnectClosed?.Invoke(kv.Key); }
+                catch (Exception ex) { _logger.LogWarning(ex, "a TcpConnectClosed subscriber threw for pid={Pid}", pid); }
             }
         }
         foreach (var kv in _udpBinds)
@@ -345,7 +370,8 @@ public sealed class SocketTracker : ISocketTracker
             if (_udpBinds.TryRemove(kv.Key, out _))
             {
                 udpRemoved++;
-                UdpBindRemoved?.Invoke(kv.Key.Address, kv.Key.Port);
+                try { UdpBindRemoved?.Invoke(kv.Key.Address, kv.Key.Port); }
+                catch (Exception ex) { _logger.LogWarning(ex, "a UdpBindRemoved subscriber threw for pid={Pid}", pid); }
             }
         }
         _logger.LogDebug("RemoveProcess pid={Pid} done, tcpRemoved={TcpRemoved} udpRemoved={UdpRemoved}", pid, tcpRemoved, udpRemoved);
@@ -576,6 +602,9 @@ public sealed class SocketTracker : ISocketTracker
 
     public void Dispose()
     {
+        // Set before anything is torn down: AddProcess re-reads this after publishing its entry,
+        // so a handle opened concurrently is closed by whichever of the two sees it.
+        Volatile.Write(ref _disposed, 1);
         try { _cts.Cancel(); } catch { }
 
         PerPidHandle? all = _allHandle;
