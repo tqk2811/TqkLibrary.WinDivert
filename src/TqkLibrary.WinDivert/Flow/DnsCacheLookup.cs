@@ -28,6 +28,7 @@ public sealed class DnsCacheLookup : IDnsCacheLookup
     private readonly TimeSpan _interval;
     private readonly CancellationTokenSource _cts = new();
     private Task? _loopTask;
+    private int _started;
 
     public DnsCacheLookup(TimeSpan? refreshInterval = null)
     {
@@ -36,7 +37,11 @@ public sealed class DnsCacheLookup : IDnsCacheLookup
 
     public void Start()
     {
-        if (_loopTask != null) return;
+        // One loop however many callers ask. Check-then-assign let two threads each start one, and
+        // the second overwrote the first's task: Dispose then waited on the loop it could see while
+        // the other went on shelling out to ipconfig every fifteen seconds for the rest of the
+        // process's life.
+        if (Interlocked.Exchange(ref _started, 1) != 0) return;
         _loopTask = Task.Run(() => RefreshLoopAsync(_cts.Token));
     }
 
@@ -67,15 +72,28 @@ public sealed class DnsCacheLookup : IDnsCacheLookup
         var psi = new ProcessStartInfo("ipconfig", "/displaydns")
         {
             RedirectStandardOutput = true,
-            RedirectStandardError = true,
+            // NOT redirected. A redirected pipe nobody reads fills at about 4KB and then blocks
+            // the writer — ipconfig would stop mid-output, ReadToEnd below would never return, and
+            // this loop would be gone for the rest of the session with nothing logged. Left alone,
+            // whatever ipconfig has to say goes to the console it was started without.
+            RedirectStandardError = false,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
         using var p = SysProcess.Start(psi);
         if (p == null) return;
+
         string output = p.StandardOutput.ReadToEnd();
-        p.WaitForExit(10_000);
-        Parse(output);
+        if (p.WaitForExit(10_000))
+        {
+            Parse(output);
+            return;
+        }
+
+        // Ten seconds for a cache dump means it is not coming. Killed rather than left: this runs
+        // every fifteen seconds, and one stuck ipconfig per refresh adds up for as long as the
+        // tool is open.
+        try { p.Kill(); } catch { }
     }
 
     private void Parse(string output)
