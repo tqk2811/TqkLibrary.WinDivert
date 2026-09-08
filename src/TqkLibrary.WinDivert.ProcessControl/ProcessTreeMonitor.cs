@@ -87,14 +87,21 @@ public sealed class ProcessTreeMonitor : IProcessTreeMonitor
                 }
             }
 
-            // Fire ChildSpawned for any descendant we haven't seen before. Don't bother removing
-            // dead pids — SocketTracker handles those via SocketClose events + cleanup.
+            // Fire ChildSpawned for any descendant that was not in the tree LAST time. The set used
+            // to accumulate for the life of the monitor and never lose a pid, so once a child had
+            // exited and Windows had handed its number to a new child of the same tree, that new
+            // process was already "known" — no event, and nothing ever redirected it. Comparing
+            // against the previous sweep instead means a pid that comes back is announced again,
+            // which is what the tracker needs to hear.
             foreach (uint pid in seen)
             {
                 if (pid == _rootPid) continue;
-                if (_knownDescendants.Add(pid))
+                if (!_knownDescendants.Contains(pid))
                     ChildSpawned?.Invoke(pid, parentOf.TryGetValue(pid, out uint parent) ? parent : 0);
             }
+
+            _knownDescendants.Clear();
+            foreach (uint pid in seen) _knownDescendants.Add(pid);
         }
         finally
         {
