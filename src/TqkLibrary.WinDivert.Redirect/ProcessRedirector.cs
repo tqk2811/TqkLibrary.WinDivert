@@ -67,6 +67,13 @@ public sealed class ProcessRedirector : IProcessRedirector
     public event Action<RedirectedTcpConnection>? TcpConnectionOpened;
     public event Action<RedirectedTcpConnection>? TcpConnectionClosed;
 
+    /// <summary>
+    /// Raised when one of the capture handles stops. Traffic that handle covered is no longer
+    /// being redirected — for an unexpected stop that means the target's packets are now going
+    /// out as they are, which the user needs telling about.
+    /// </summary>
+    public event Action<PumpStop>? PumpStopped;
+
     public ProcessRedirector(
         RedirectOptions options,
         IWinDivertHandleFactory handleFactory,
@@ -175,6 +182,16 @@ public sealed class ProcessRedirector : IProcessRedirector
         else if (ipv6Mode == Ipv6Mode.Block) StartIpv6BlockPump(tracker);
     }
 
+    private void OnPumpStopped(PumpStop stop)
+    {
+        if (!stop.IsOrderly)
+            _logger.LogError(
+                "[{Pump}] capture stopped with win32={Win32}; traffic on this handle is no longer redirected",
+                stop.PumpName, stop.Win32Error);
+
+        PumpStopped?.Invoke(stop);
+    }
+
     // The mode we can actually deliver, which is not always the one that was asked for.
     private Ipv6Mode ResolveIpv6Mode()
     {
@@ -260,6 +277,7 @@ public sealed class ProcessRedirector : IProcessRedirector
         AddTrailingMiddlewares(builder, tracker);
 
         _ipv4Pump = _pumpFactory.Create("ipv4", handle, builder.Build());
+        _ipv4Pump.Stopped += OnPumpStopped;
         _ipv4Pump.Start();
     }
 
@@ -284,6 +302,7 @@ public sealed class ProcessRedirector : IProcessRedirector
         AddTrailingMiddlewares(builder, tracker);
 
         _ipv6Pump = _pumpFactory.Create("ipv6", handle, builder.Build());
+        _ipv6Pump.Stopped += OnPumpStopped;
         _ipv6Pump.Start();
     }
 
@@ -297,6 +316,7 @@ public sealed class ProcessRedirector : IProcessRedirector
         builder.Use(new Ipv6BlockMiddleware(tracker, _loggerFactory.CreateLogger<Ipv6BlockMiddleware>()));
 
         _ipv6Pump = _pumpFactory.Create("ipv6-block", handle, builder.Build());
+        _ipv6Pump.Stopped += OnPumpStopped;
         _ipv6Pump.Start();
     }
 

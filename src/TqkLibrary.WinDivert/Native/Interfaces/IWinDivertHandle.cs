@@ -20,10 +20,17 @@ public interface IWinDivertHandle : IDisposable
     string Filter { get; }
 
     /// <summary>
-    /// Blocks until a packet arrives. False means the handle is finished — shut down, or the
-    /// driver returned an error — and the caller should stop pumping.
+    /// Blocks until a packet arrives. False means the driver refused this call, and
+    /// <paramref name="win32Error"/> says why.
     /// </summary>
-    bool TryRecv(byte[] buffer, out int length, out WinDivertAddress addr);
+    /// <remarks>
+    /// The error code is part of the contract because the reasons are not interchangeable. A
+    /// shutdown says stop pumping; a packet too large for the buffer says skip this one and carry
+    /// on; anything else is a fault worth reporting. A caller that treats them all as "stop" turns
+    /// one oversized packet into a silent end to redirection, with every packet after it going out
+    /// unproxied and nothing to say so.
+    /// </remarks>
+    bool TryRecv(byte[] buffer, out int length, out WinDivertAddress addr, out int win32Error);
 
     /// <summary>Re-injects a packet. False when the kernel refused it (see Marshal.GetLastWin32Error).</summary>
     bool TrySend(byte[] buffer, int length, ref WinDivertAddress addr);

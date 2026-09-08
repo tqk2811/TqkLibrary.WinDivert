@@ -82,6 +82,11 @@ public sealed class SocketTracker : ISocketTracker
     // Minimum gap between full kernel-table reconciliations on the hot path.
     private const int ReconcileMinIntervalMs = 50;
 
+    private const int ERROR_NO_DATA = 232;
+    private const int ERROR_OPERATION_ABORTED = 995;
+    // How many failed recvs in a row mean the handle is gone rather than unlucky.
+    private const int MaxRecvFailuresInARow = 32;
+
     private int _lastReconcileTicks;
 
     // Cached so the per-sweep predicate does not allocate a delegate on the packet path.
@@ -436,10 +441,23 @@ public sealed class SocketTracker : ISocketTracker
     private void PumpLoop(IWinDivertHandle handle, uint pid, CancellationToken ct)
     {
         byte[] dummy = new byte[0];
+        int failuresInARow = 0;
         while (!ct.IsCancellationRequested)
         {
-            if (!handle.TryRecv(dummy, out _, out WinDivertAddress addr))
-                break;
+            if (!handle.TryRecv(dummy, out _, out WinDivertAddress addr, out int win32))
+            {
+                // Same reasoning as the packet pump: only a shutdown means stop. Giving up on any
+                // error would leave this process untracked with nothing to say so.
+                if (win32 == ERROR_NO_DATA || win32 == ERROR_OPERATION_ABORTED) break;
+                _logger.LogWarning("Socket event recv for pid={Pid} failed, win32={Win32}", pid, win32);
+                if (++failuresInARow >= MaxRecvFailuresInARow)
+                {
+                    _logger.LogError("Socket pump for pid={Pid} giving up after {Count} consecutive failures", pid, failuresInARow);
+                    break;
+                }
+                continue;
+            }
+            failuresInARow = 0;
 
             try
             {

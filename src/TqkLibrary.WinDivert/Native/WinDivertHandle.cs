@@ -32,7 +32,7 @@ public sealed class WinDivertHandle : IWinDivertHandle
         return new WinDivertHandle(new WinDivertSafeHandle(raw), layer, filter);
     }
 
-    public unsafe bool TryRecv(byte[] buffer, out int length, out WinDivertAddress addr)
+    public unsafe bool TryRecv(byte[] buffer, out int length, out WinDivertAddress addr, out int win32Error)
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         fixed (byte* p = buffer)
@@ -41,10 +41,13 @@ public sealed class WinDivertHandle : IWinDivertHandle
             bool ok = WinDivertNative.Recv(_handle.DangerousGetHandle(), (IntPtr)p, (uint)buffer.Length, out uint recv, ref a);
             if (!ok)
             {
+                // Read it here, before anything else on this thread can overwrite it.
+                win32Error = Marshal.GetLastWin32Error();
                 length = 0;
                 addr = default;
                 return false;
             }
+            win32Error = 0;
             length = (int)recv;
             addr = a;
             return true;

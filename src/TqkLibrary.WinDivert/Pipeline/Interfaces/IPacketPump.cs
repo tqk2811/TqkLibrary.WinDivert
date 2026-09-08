@@ -1,4 +1,5 @@
 using System;
+using TqkLibrary.WinDivert.Pipeline.Models;
 
 namespace TqkLibrary.WinDivert.Pipeline.Interfaces;
 
@@ -10,6 +11,13 @@ public interface IPacketPump : IPacketInjector, IDisposable
 {
     /// <summary>Short name used in log lines to tell several pumps apart. Not an identity.</summary>
     string Name { get; }
+
+    /// <summary>
+    /// Raised once when the recv loop leaves, whether it was shut down or it failed. From that
+    /// moment this handle captures nothing, so a host that wants the user to know it stopped
+    /// redirecting has to hear about it here.
+    /// </summary>
+    event Action<PumpStop>? Stopped;
 
     void Start();
 }
