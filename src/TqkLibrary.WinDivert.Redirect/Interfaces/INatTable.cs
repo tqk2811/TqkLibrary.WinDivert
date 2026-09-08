@@ -30,4 +30,17 @@ public interface INatTable
     NatEntry? Find(byte protocol, ushort srcPort, bool isIpv6);
 
     bool Remove(byte protocol, ushort srcPort, bool isIpv6);
+
+    /// <summary>
+    /// Says the flow using this source port has closed. The entry stays findable for a grace
+    /// window and is then dropped.
+    /// </summary>
+    /// <remarks>
+    /// Not the same as <see cref="Remove"/>. The socket closing does not end the packets: the
+    /// kernel goes on retransmitting the trailing FIN-ACK or RST-ACK, and those still have to be
+    /// translated. Removing outright would strand them; never removing leaves the port answering
+    /// for a flow that no longer exists, which is what breaks the next connection to be handed
+    /// that port with its first packet unseen.
+    /// </remarks>
+    void MarkClosed(byte protocol, ushort srcPort, bool isIpv6);
 }

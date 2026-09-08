@@ -133,9 +133,7 @@ public sealed class ProcessRedirector : IProcessRedirector
         foreach (FlowKey flow in _tracker.TcpSnapshot)
         {
             if (flow.Protocol != 6) continue;
-            bool isIpv6 = flow.LocalAddress.AddressFamily == AddressFamily.InterNetworkV6
-                && !flow.LocalAddress.IsIPv4MappedToIPv6;
-            if (_nat.Find(6, flow.LocalPort, isIpv6) != null) continue;
+            if (_nat.Find(6, flow.LocalPort, IsIpv6Flow(flow)) != null) continue;
             if (_escapedFlows.Add(flow)) marked++;
         }
         _logger.LogInformation("{Count} pre-existing flow(s) marked for reset; each is answered with an RST on its next packet", marked);
@@ -157,6 +155,10 @@ public sealed class ProcessRedirector : IProcessRedirector
         tracker.TcpConnectClosed += k => TcpConnectClosed?.Invoke(k);
         // A flow marked for reset is done with once the process has closed it.
         tracker.TcpConnectClosed += k => _escapedFlows.Remove(k);
+        // And its NAT entry stops being the truth about that port. The tracker is the only thing
+        // that knows a flow ended, so without this the table only ever grows and stale entries
+        // answer for ports the OS has since handed to somebody else.
+        tracker.TcpConnectClosed += k => _nat.MarkClosed(k.Protocol, k.LocalPort, IsIpv6Flow(k));
         tracker.Start();
 
         Ipv6Mode ipv6Mode = ResolveIpv6Mode();
@@ -181,6 +183,14 @@ public sealed class ProcessRedirector : IProcessRedirector
         if (ipv6Mode == Ipv6Mode.Redirect) StartIpv6RedirectPump(tracker, ports);
         else if (ipv6Mode == Ipv6Mode.Block) StartIpv6BlockPump(tracker);
     }
+
+    /// <summary>
+    /// Which of the two port spaces a flow belongs to. A v4-mapped address is an IPv4 flow riding
+    /// a dual-stack socket, and its port lives in the IPv4 space — the NAT key has to agree.
+    /// </summary>
+    private static bool IsIpv6Flow(FlowKey flow)
+        => flow.LocalAddress.AddressFamily == AddressFamily.InterNetworkV6
+            && !flow.LocalAddress.IsIPv4MappedToIPv6;
 
     private void OnPumpStopped(PumpStop stop)
     {
