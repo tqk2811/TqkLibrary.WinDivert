@@ -61,7 +61,34 @@ public sealed class SocketTracker : ISocketTracker
 
     // Machine-wide mode only: what the callback answered about each pid. This is also the tracked
     // set — there is no per-pid handle to stand in for it.
-    private readonly ConcurrentDictionary<uint, bool> _pidDecisions = new();
+    private readonly ConcurrentDictionary<uint, PidVerdict> _pidDecisions = new();
+
+    /// <summary>How long a "do not track this pid" answer is trusted before it is asked again.</summary>
+    /// <remarks>
+    /// A verdict is about a program, but the only key available here is a pid — and Windows hands
+    /// pids out again within seconds. Remembered forever, the "no" given for a browser went on
+    /// answering after that number had been reissued to a game the user does want redirected: every
+    /// one of its socket events was refused from the cache, with nothing logged, for as long as it
+    /// ran. Re-asking costs one lookup in the caller's own table.
+    ///
+    /// A "yes" needs no expiry — RemoveProcess drops it when the process is detached.
+    /// </remarks>
+    private const int PidDenialTtlMs = 30_000;
+
+    private readonly struct PidVerdict
+    {
+        public PidVerdict(bool accepted, int decidedAtTicks)
+        {
+            Accepted = accepted;
+            DecidedAtTicks = decidedAtTicks;
+        }
+
+        public bool Accepted { get; }
+        public int DecidedAtTicks { get; }
+
+        // (int) subtraction handles TickCount wrap correctly via two's complement.
+        public bool IsStale(int now) => !Accepted && now - DecidedAtTicks >= PidDenialTtlMs;
+    }
 
     // Machine-wide mode only: the single SOCKET handle every process's events arrive on.
     private PerPidHandle? _allHandle;
@@ -167,7 +194,7 @@ public sealed class SocketTracker : ISocketTracker
 
     public IReadOnlyCollection<uint> TrackedProcessIds
         => IsMachineWide
-            ? _pidDecisions.Where(kv => kv.Value).Select(kv => kv.Key).ToArray()
+            ? _pidDecisions.Where(kv => kv.Value.Accepted).Select(kv => kv.Key).ToArray()
             : (IReadOnlyCollection<uint>)_pidHandles.Keys;
 
     public void Start()
@@ -212,7 +239,9 @@ public sealed class SocketTracker : ISocketTracker
     // moments ago, and writing it off would lose that process for as long as it runs.
     private bool AcceptPid(uint pid)
     {
-        if (_pidDecisions.TryGetValue(pid, out bool known)) return known;
+        int now = Environment.TickCount;
+        if (_pidDecisions.TryGetValue(pid, out PidVerdict known) && !known.IsStale(now))
+            return known.Accepted;
 
         bool? verdict;
         try { verdict = _shouldTrackProcess!(pid); }
@@ -224,7 +253,7 @@ public sealed class SocketTracker : ISocketTracker
 
         if (verdict is null) return false;
 
-        _pidDecisions[pid] = verdict.Value;
+        _pidDecisions[pid] = new PidVerdict(verdict.Value, now);
         if (verdict.Value)
         {
             _logger.LogDebug("pid={Pid} is now tracked, decided from its own socket event", pid);
@@ -237,7 +266,7 @@ public sealed class SocketTracker : ISocketTracker
         return verdict.Value;
     }
 
-    private bool IsAcceptedPid(uint pid) => _pidDecisions.TryGetValue(pid, out bool ok) && ok;
+    private bool IsAcceptedPid(uint pid) => _pidDecisions.TryGetValue(pid, out PidVerdict verdict) && verdict.Accepted;
 
     // Adds a new pid to the tracked set. Opens a dedicated WinDivert SOCKET handle scoped to that
     // pid and spawns a pump task; subsequent socket events for the pid flow into the shared
@@ -252,8 +281,8 @@ public sealed class SocketTracker : ISocketTracker
         // the verdict in advance, so the pump never has to ask.
         if (IsMachineWide)
         {
-            if (_pidDecisions.TryGetValue(pid, out bool already) && already) return;
-            _pidDecisions[pid] = true;
+            if (_pidDecisions.TryGetValue(pid, out PidVerdict already) && already.Accepted) return;
+            _pidDecisions[pid] = new PidVerdict(true, Environment.TickCount);
             PrePopulateForPid(pid);
             return;
         }
@@ -337,8 +366,8 @@ public sealed class SocketTracker : ISocketTracker
             // The pid is forgotten rather than remembered as "no": a pid the caller drops is
             // usually a process that has exited, and Windows hands its number to something else
             // soon enough. A remembered "no" would then be answering about the wrong program.
-            if (!_pidDecisions.TryRemove(pid, out bool wasTracked)) return false;
-            if (!wasTracked) return false;
+            if (!_pidDecisions.TryRemove(pid, out PidVerdict wasTracked)) return false;
+            if (!wasTracked.Accepted) return false;
         }
         else if (!_pidHandles.TryRemove(pid, out PerPidHandle? entry)) return false;
         else
@@ -525,6 +554,14 @@ public sealed class SocketTracker : ISocketTracker
             }
             if (reaped > 0)
                 _logger.LogDebug("Cleanup reaped {Reaped} closed TCP flow(s), {Remaining} remaining", reaped, _tcpFlows.Count);
+
+            // Expired refusals go too. Machine-wide mode hears from every process on the machine,
+            // so without this the verdict table grows for the life of the run — one entry per
+            // program that has ever opened a socket, most of them long gone.
+            foreach (var kv in _pidDecisions)
+            {
+                if (kv.Value.IsStale(now)) _pidDecisions.TryRemove(kv.Key, out _);
+            }
         }
     }
 
