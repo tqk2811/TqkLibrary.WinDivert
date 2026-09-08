@@ -82,9 +82,13 @@ public sealed class ReverseDnsTable : IReverseDnsTable
         }
         if (_entries.Count <= _capacity) return;
 
+        // Down to a batch BELOW the capacity, not to it. Trimming to exactly the capacity left the
+        // table full, so the very next answer went over again: a copy of every entry plus an
+        // O(n log n) sort, per DNS reply, on the pump thread, for as long as the tool ran. Taking
+        // an eighth out at once spreads that over the next few thousand answers.
         var byExpiry = new List<KeyValuePair<IPAddress, Entry>>(_entries);
         byExpiry.Sort((a, b) => a.Value.ExpiresUtc.CompareTo(b.Value.ExpiresUtc));
-        int toDrop = _entries.Count - _capacity;
+        int toDrop = _entries.Count - (_capacity - Math.Max(1, _capacity / 8));
         for (int i = 0; i < toDrop && i < byExpiry.Count; i++)
             _entries.TryRemove(byExpiry[i].Key, out _);
     }
