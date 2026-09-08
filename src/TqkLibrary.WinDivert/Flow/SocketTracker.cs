@@ -329,9 +329,11 @@ public sealed class SocketTracker : ISocketTracker
         var entry = new PerPidHandle(handle, pumpTask);
         if (!_pidHandles.TryAdd(pid, entry))
         {
-            // race with another AddProcess for the same pid — discard ours
+            // Race with another AddProcess for the same pid — discard ours. Shut down and leave:
+            // the pump for this handle was started three lines up and is what closes it. Disposing
+            // it here instead was a live bug — nothing waits for that task, so the pump's very
+            // first recv hit a closed handle and threw where no one could see it.
             try { handle.Shutdown(); } catch { }
-            handle.Dispose();
             return;
         }
 
@@ -344,7 +346,6 @@ public sealed class SocketTracker : ISocketTracker
         {
             try { orphan.Handle.Shutdown(); } catch { }
             try { orphan.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
-            orphan.Handle.Dispose();
             return;
         }
 
@@ -375,7 +376,6 @@ public sealed class SocketTracker : ISocketTracker
             _logger.LogDebug("RemoveProcess pid={Pid}", pid);
             try { entry.Handle.Shutdown(); } catch { }
             try { entry.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
-            entry.Handle.Dispose();
         }
 
         // Each notification is guarded on its own. A subscriber that throws used to abandon the
@@ -493,7 +493,30 @@ public sealed class SocketTracker : ISocketTracker
         return tcpAdded > 0 || udpAdded > 0;
     }
 
+    /// <summary>
+    /// Reads socket events off one handle until it is shut down, and closes the handle on the way
+    /// out.
+    /// </summary>
+    /// <remarks>
+    /// Closing it here is the point of this wrapper. A <see cref="System.Runtime.InteropServices.SafeHandle"/>
+    /// protects the call that happens to be in flight when another thread disposes it — the close
+    /// waits for that call to return — but it does not protect the call after: once disposed,
+    /// DangerousAddRef throws ObjectDisposedException. A disposer that gives up waiting and closes
+    /// anyway therefore leaves this loop reading from a dead handle, and the throw lands on a
+    /// thread-pool thread nobody is watching.
+    ///
+    /// So the rule everywhere in this class is: whoever wants the handle gone calls
+    /// <see cref="IWinDivertHandle.Shutdown"/> — that is what makes the recv below return — and may
+    /// wait for the pump task. The close belongs to the thread doing the reading. When a wait times
+    /// out the handle simply closes a moment later instead of being pulled out from under the pump.
+    /// </remarks>
     private void PumpLoop(IWinDivertHandle handle, uint pid, CancellationToken ct)
+    {
+        try { PumpEvents(handle, pid, ct); }
+        finally { handle.Dispose(); }
+    }
+
+    private void PumpEvents(IWinDivertHandle handle, uint pid, CancellationToken ct)
     {
         byte[] dummy = new byte[0];
         int failuresInARow = 0;
@@ -650,9 +673,10 @@ public sealed class SocketTracker : ISocketTracker
         {
             try { all.Handle.Shutdown(); } catch { }
             try { all.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
-            all.Handle.Dispose();
         }
 
+        // Shut every handle down first and wait afterwards, so the waits overlap instead of adding
+        // up. Neither loop closes a handle: the pump that reads it does, as it leaves. See PumpLoop.
         foreach (var kv in _pidHandles)
         {
             try { kv.Value.Handle.Shutdown(); } catch { }
@@ -660,7 +684,6 @@ public sealed class SocketTracker : ISocketTracker
         foreach (var kv in _pidHandles)
         {
             try { kv.Value.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
-            kv.Value.Handle.Dispose();
         }
         _pidHandles.Clear();
         _pidDecisions.Clear();
