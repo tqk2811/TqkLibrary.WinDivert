@@ -28,4 +28,16 @@ public interface IHostNameParser
     /// still incomplete" — <see cref="CanParse"/> is what tells the two apart.
     /// </summary>
     bool TryReadHostName(byte[] buffer, int length, out string hostName);
+
+    /// <summary>
+    /// Whether waiting for more bytes could still produce a name. False means the message this
+    /// parser reads is complete and simply does not carry one.
+    /// </summary>
+    /// <remarks>
+    /// Without this the inspector has no way to tell "the client has not finished speaking" from
+    /// "the client finished and said no name", so it waits for the peek timeout before routing —
+    /// seconds of delay on the first connection of any client whose first message is complete and
+    /// nameless (a ClientHello with no SNI, an HTTP/1.0 request with no Host).
+    /// </remarks>
+    bool WantsMoreData(byte[] buffer, int length);
 }

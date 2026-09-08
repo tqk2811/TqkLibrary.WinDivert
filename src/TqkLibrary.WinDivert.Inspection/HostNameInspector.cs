@@ -59,15 +59,24 @@ public sealed class HostNameInspector : IHostNameInspector
 
                 byte[] chunk = stream.PeekBuffer;
                 bool anyRecognised = false;
+                bool anyWantsMore = false;
                 foreach (IHostNameParser parser in _parsers)
                 {
                     if (parser.TryReadHostName(chunk, available, out string name) && !string.IsNullOrEmpty(name))
                         return name;
-                    anyRecognised |= parser.CanParse(chunk, available);
+
+                    if (!parser.CanParse(chunk, available)) continue;
+                    anyRecognised = true;
+                    anyWantsMore |= parser.WantsMoreData(chunk, available);
                 }
 
                 // No parser recognises the protocol at all: more bytes cannot change that.
                 if (!anyRecognised) return null;
+
+                // Recognised, complete, and carrying no name — a ClientHello with no SNI, an
+                // HTTP/1.0 request with no Host. Waiting on for bytes the client has no reason to
+                // send costs the whole peek timeout before the connection is routed at all.
+                if (!anyWantsMore) return null;
             }
         }
         catch (OperationCanceledException)

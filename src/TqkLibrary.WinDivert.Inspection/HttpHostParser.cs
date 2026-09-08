@@ -29,6 +29,17 @@ public sealed class HttpHostParser : IHostNameParser
         return false;
     }
 
+    // The header block ends at a blank line. Until one arrives a Host header may still be coming;
+    // once it has, the request has said everything it is going to.
+    public bool WantsMoreData(byte[] buffer, int length)
+    {
+        if (buffer == null || length <= 0) return true;
+        if (length >= RecommendedPeekSize) return false;
+
+        string text = Encoding.ASCII.GetString(buffer, 0, length);
+        return text.IndexOf("\r\n\r\n", StringComparison.Ordinal) < 0;
+    }
+
     // Returns the Host header value without the port. False when the header is absent or the
     // buffer stops before the header block ends.
     public bool TryReadHostName(byte[] buffer, int length, out string host)

@@ -16,9 +16,26 @@ public sealed class TlsClientHelloParser : IHostNameParser
     private const ushort ExtensionServerName = 0x0000;
     private const byte NameTypeHostName = 0x00;
 
-    // Enough for a ClientHello with a normal extension set; a larger one is not worth buffering
-    // just to read a host name.
-    public int RecommendedPeekSize => 2048;
+    // A ClientHello used to fit in 2048 with room to spare, and that was the size here. Post-quantum
+    // key agreement changed it: Chrome and Edge offering X25519MLKEM768 send 2.0-2.3KB, with the
+    // ~1.2KB key_share ahead of server_name — so the SNI lands past 2048 and the parse simply
+    // failed. Nothing reported it; routing by domain quietly fell back to reverse DNS or to the raw
+    // address, which is a different route than the user asked for.
+    //
+    // 8192 covers that with margin for the extension sets that come next, and costs nothing when
+    // the hello is smaller: this is a ceiling on one peek, not an amount waited for.
+    public int RecommendedPeekSize => 8192;
+
+    // A handshake record declares its own length in its first five bytes. Until that many have
+    // arrived the SNI may still be on its way; once they have, this hello is all there is.
+    public bool WantsMoreData(byte[] buffer, int length)
+    {
+        if (!CanParse(buffer, length)) return length < 3;
+        if (length < 5) return true;
+
+        int recordLength = (buffer[3] << 8) | buffer[4];
+        return length < recordLength + 5;
+    }
 
     // True when the buffer starts like a TLS handshake record — cheap pre-check before peeking
     // further or attempting a full parse.
