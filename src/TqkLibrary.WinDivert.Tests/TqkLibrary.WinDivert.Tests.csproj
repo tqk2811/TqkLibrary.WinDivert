@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!-- ProjectBuildProperties.targets is not imported: it multi-targets net6.0 and net8.0, and
+	     these tests exercise managed lifetime rules that do not differ between the two. One
+	     framework keeps a run short enough to be worth doing on every change. -->
+	<PropertyGroup>
+		<TargetFramework>net8.0-windows</TargetFramework>
+		<LangVersion>12.0</LangVersion>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<IsPackable>false</IsPackable>
+		<IsTestProject>true</IsTestProject>
+		<Platforms>AnyCPU;x64;x86</Platforms>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.NET.Test.Sdk" />
+		<PackageReference Include="xunit" />
+		<PackageReference Include="xunit.runner.visualstudio" />
+	</ItemGroup>
+
+</Project>
