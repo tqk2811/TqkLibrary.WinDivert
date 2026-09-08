@@ -102,13 +102,35 @@ public sealed class TcpRelayServer : ITcpRelayServer
         }
     }
 
+    // Everything an accepted connection does, with the socket's fate settled in one place.
+    //
+    // The setup below can throw before the inner try is reached: reading RemoteEndPoint, and taking
+    // the stream inside RedirectedTcpConnection, both fail on a client that has already reset. That
+    // is not rare — QUIC falling back to TCP, two racing connections, a cancelled request all do
+    // it — and this runs under Task.Run, so the exception went nowhere and the socket stayed open
+    // until a finalizer happened to collect it.
     private async Task HandleAsync(TcpClient client, bool isIpv6, CancellationToken ct)
+    {
+        try
+        {
+            await HandleCoreAsync(client, isIpv6, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "an accepted connection ended before it was set up");
+        }
+        finally
+        {
+            try { client.Close(); } catch { }
+        }
+    }
+
+    private async Task HandleCoreAsync(TcpClient client, bool isIpv6, CancellationToken ct)
     {
         IPEndPoint? remote = client.Client.RemoteEndPoint as IPEndPoint;
         if (remote == null)
         {
             _logger.LogDebug("accepted socket has no remote endpoint, closing");
-            client.Close();
             return;
         }
 
@@ -118,7 +140,6 @@ public sealed class TcpRelayServer : ITcpRelayServer
         if (entry == null)
         {
             _logger.LogDebug("no NAT entry for srcPort={SrcPort} ipv6={IsIpv6}, closing", remote.Port, isIpv6);
-            client.Close();
             return;
         }
         using var conn = new RedirectedTcpConnection(
