@@ -9,7 +9,10 @@ namespace TqkLibrary.WinDivert.Redirect;
 // process", writes as "to the process" — the wrapper always sits on the CLIENT side of a
 // redirected connection, so the direction naming holds regardless of what the caller pipes it to.
 //
-// Ownership: the inner stream is NOT disposed by this wrapper (the owning TcpClient closes it).
+// Ownership: disposing this DOES dispose the inner stream, even though the TcpClient it came from
+// closes it as well. See PeekableStream for why a decorator must not swallow Dispose: it is the
+// only thing that wakes a copy loop parked in a read, and a wrapper that ignored the call left
+// cancelled transfers running against a socket nobody had closed.
 public sealed class CountingStream : Stream
 {
     private readonly Stream _inner;
@@ -65,4 +68,10 @@ public sealed class CountingStream : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
 
     public override void SetLength(long value) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _inner.Dispose();
+        base.Dispose(disposing);
+    }
 }

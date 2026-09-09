@@ -9,7 +9,12 @@ namespace TqkLibrary.WinDivert.Inspection;
 // stream on as if nothing had been read. Reading the TLS ClientHello (for SNI) or the HTTP
 // request line (for Host) is exactly this: the bytes must still reach the upstream verbatim.
 //
-// Ownership: the inner stream is NOT disposed by this wrapper.
+// Ownership: disposing this DOES dispose the inner stream. A decorator that swallowed Dispose
+// looked harmless — the socket has an owner either way — but it silently broke the one mechanism
+// that ends a transfer parked in a read: cancelling a copy loop closes its streams, and a read
+// already blocked in the kernel only ever returns because the socket underneath it was closed.
+// Through a wrapper that dropped the call on the floor, "close both streams" reached nothing, and
+// the connection carried on until one of its ends timed out.
 public sealed class PeekableStream : Stream
 {
     private readonly Stream _inner;
@@ -114,4 +119,10 @@ public sealed class PeekableStream : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
 
     public override void SetLength(long value) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _inner.Dispose();
+        base.Dispose(disposing);
+    }
 }

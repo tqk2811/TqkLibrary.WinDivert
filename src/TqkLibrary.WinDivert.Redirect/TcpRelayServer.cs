@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -29,12 +30,20 @@ public sealed class TcpRelayServer : ITcpRelayServer
     private readonly TcpListener? _listenerV6;
     private readonly CancellationTokenSource _cts = new();
     private readonly List<Task> _acceptLoops = new();
+    // Every connection this relay has accepted and not yet finished. Kept so Dispose can close
+    // them itself instead of hoping each handler notices the token: a handler parked in a read
+    // hands the socket back only when the read returns, and the whole reason to close here is that
+    // the reset has to go out while the NAT stage is still up to carry it back to the process.
+    private readonly ConcurrentDictionary<TcpClient, byte> _accepted = new();
 
     /// <summary>Loopback port the IPv4 relay listens on.</summary>
     public int Port { get; private set; }
 
     /// <summary>Loopback port the IPv6 relay listens on; 0 when IPv6 redirect is off.</summary>
     public int PortV6 { get; private set; }
+
+    /// <summary>How many accepted connections this relay is still holding open.</summary>
+    public int AcceptedCount => _accepted.Count;
 
     // Raised when a redirected connection is accepted / finished. The connection object carries
     // PID, original destination and live byte counters, so a UI can bind straight to it.
@@ -111,6 +120,7 @@ public sealed class TcpRelayServer : ITcpRelayServer
     // until a finalizer happened to collect it.
     private async Task HandleAsync(TcpClient client, bool isIpv6, CancellationToken ct)
     {
+        _accepted[client] = 0;
         try
         {
             await HandleCoreAsync(client, isIpv6, ct).ConfigureAwait(false);
@@ -121,6 +131,7 @@ public sealed class TcpRelayServer : ITcpRelayServer
         }
         finally
         {
+            _accepted.TryRemove(client, out _);
             try { client.Close(); } catch { }
         }
     }
@@ -174,11 +185,26 @@ public sealed class TcpRelayServer : ITcpRelayServer
         }
     }
 
+    /// <remarks>
+    /// The connections already accepted are closed here rather than left to their handlers. The
+    /// token alone is not enough: a handler blocked in a read returns only once the socket under
+    /// it is closed, and the reset that closing sends has to leave WHILE the NAT stage is still
+    /// running — see ProcessRedirector.Dispose. Closing here is also what covers a connection that
+    /// has not been routed yet (still being peeked at for its host name) and so is not tracked
+    /// anywhere else.
+    /// </remarks>
     public void Dispose()
     {
         try { _cts.Cancel(); } catch { }
         try { _listener.Stop(); } catch { }
         try { _listenerV6?.Stop(); } catch { }
+
+        foreach (TcpClient client in _accepted.Keys)
+        {
+            _accepted.TryRemove(client, out _);
+            try { client.Close(); } catch { }
+        }
+
         try { Task.WaitAll(_acceptLoops.ToArray(), TimeSpan.FromSeconds(1)); } catch { }
         _cts.Dispose();
     }

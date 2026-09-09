@@ -407,13 +407,28 @@ public sealed class ProcessRedirector : IProcessRedirector
         return "false";
     }
 
+    /// <remarks>
+    /// The relays go down BEFORE the pumps, and the order is the whole point. Closing a relay
+    /// resets the loopback sockets the redirected connections are riding on, and that reset only
+    /// reaches the process if the NAT stage is still there to bend it back onto the address the
+    /// process believes it is talking to. Unloading the driver first — which is what this used to
+    /// do — throws that reset away: every redirected socket is left ESTABLISHED with nothing on
+    /// the other end, so the process (a browser holding a keep-alive pool, say) goes on believing
+    /// its connections are usable long after redirection was switched off.
+    /// <para>
+    /// What it costs is one instant in which a SYN is still bent onto a relay port that has just
+    /// closed, and the process sees a refused connection instead of a pass-through. That is the
+    /// right way round: refusing a connection while the engine is coming down is honest, and the
+    /// process retries; leaving a live-looking dead socket behind is not.
+    /// </para>
+    /// </remarks>
     public void Dispose()
     {
         _logger.LogInformation("stopping redirect for pid={Pid}", _options.ProcessId);
-        _ipv6Pump?.Dispose();
-        _ipv4Pump?.Dispose();
         _tcpRelay?.Dispose();
         _udpRelay?.Dispose();
+        _ipv6Pump?.Dispose();
+        _ipv4Pump?.Dispose();
         _tracker?.Dispose();
         _dnsResolver?.Dispose();
         _dnsCacheLookup.Dispose();
