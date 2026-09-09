@@ -203,6 +203,8 @@ public sealed class SocketTracker : ISocketTracker
         _started = true;
         if (IsMachineWide) OpenMachineWideHandle();
         else if (_processId != 0) AddProcess(_processId);
+        // The pool, not a thread of its own: unlike the pumps this one is asleep in an await
+        // between sweeps and holds no thread while it waits. See BlockingLoop for the distinction.
         _cleanupTask = Task.Run(() => CleanupLoop(_cts.Token));
     }
 
@@ -231,7 +233,7 @@ public sealed class SocketTracker : ISocketTracker
             return;
         }
 
-        _allHandle = new PerPidHandle(handle, Task.Run(() => PumpLoop(handle, 0, _cts.Token)));
+        _allHandle = new PerPidHandle(handle, BlockingLoop.Start(() => PumpLoop(handle, 0, _cts.Token)));
     }
 
     // The verdict on one pid, asked once and then remembered. "Not yet known" is not remembered:
@@ -325,7 +327,7 @@ public sealed class SocketTracker : ISocketTracker
         // Read here rather than inside the task: Dispose disposes the source, and a task body that
         // reaches for the token afterwards throws ObjectDisposedException with nobody watching.
         CancellationToken token = _cts.Token;
-        Task pumpTask = Task.Run(() => PumpLoop(handle, pid, token));
+        Task pumpTask = BlockingLoop.Start(() => PumpLoop(handle, pid, token));
         var entry = new PerPidHandle(handle, pumpTask);
         if (!_pidHandles.TryAdd(pid, entry))
         {

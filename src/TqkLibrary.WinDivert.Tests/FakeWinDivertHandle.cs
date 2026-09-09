@@ -74,6 +74,12 @@ internal sealed class FakeWinDivertHandle : IWinDivertHandle
     public int RecvCalls => Volatile.Read(ref _recvCalls);
 
     /// <summary>
+    /// Whether the first recv ran on a thread-pool thread. A pump parks in recv for its whole life,
+    /// so a pool thread taken here is a pool thread never given back — see BlockingLoop.
+    /// </summary>
+    public bool? FirstRecvOnThreadPoolThread { get; private set; }
+
+    /// <summary>
     /// Sends attempted, counted before the closed check rather than after.
     /// </summary>
     /// <remarks>
@@ -96,7 +102,8 @@ internal sealed class FakeWinDivertHandle : IWinDivertHandle
 
     public bool TryRecv(byte[] buffer, out int length, out WinDivertAddress addr, out int win32Error)
     {
-        Interlocked.Increment(ref _recvCalls);
+        if (Interlocked.Increment(ref _recvCalls) == 1)
+            FirstRecvOnThreadPoolThread = Thread.CurrentThread.IsThreadPoolThread;
         ThrowIfClosed();
 
         length = 0;

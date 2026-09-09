@@ -71,10 +71,10 @@ public sealed class PacketPump : IPacketPump
     {
         if (_started) throw new InvalidOperationException("Already started");
         // Set before the task exists, not after. Dispose reads it to decide who closes the handle,
-        // and in the window between Task.Run creating the pump and the assignment landing, a pump
+        // and in the window between the pump being started and the assignment landing, a pump
         // would be reading a handle Dispose had already decided nobody owned.
         _started = true;
-        _pumpTask = Task.Run(() => PumpLoop(_cts.Token));
+        _pumpTask = BlockingLoop.Start(() => PumpLoop(_cts.Token));
     }
 
     /// <summary>

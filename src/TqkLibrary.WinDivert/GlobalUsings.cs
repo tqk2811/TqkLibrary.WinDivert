@@ -10,5 +10,6 @@ global using TqkLibrary.WinDivert.Packet.Models;
 global using TqkLibrary.WinDivert.Flow.Interfaces;
 global using TqkLibrary.WinDivert.Flow.Models;
 global using TqkLibrary.WinDivert.Pipeline.Enums;
+global using TqkLibrary.WinDivert.Pipeline.Helpers;
 global using TqkLibrary.WinDivert.Pipeline.Interfaces;
 global using TqkLibrary.WinDivert.Pipeline.Models;
