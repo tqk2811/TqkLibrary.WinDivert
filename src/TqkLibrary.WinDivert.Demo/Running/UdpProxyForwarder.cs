@@ -18,15 +18,17 @@ namespace TqkLibrary.WinDivert.Demo.Running;
 // each source port its own tunnel makes the tunnel itself the correlation key.
 internal sealed class UdpProxyForwarder : IDisposable
 {
-    private readonly IProxySource _proxySource;
+    // Only the UDP half of a way out: since TqkLibrary.Proxy 1.0.60 that is a capability of its own
+    // (IUdpCapable), no longer a flag every IProxySource has to answer.
+    private readonly IUdpCapable _udpSource;
     private readonly IProcessRedirector _redirector;
     private readonly CancellationTokenSource _cts;
     private readonly ConcurrentDictionary<ushort, PortTunnel> _tunnels = new();
     private volatile bool _disposed;
 
-    public UdpProxyForwarder(IProxySource proxySource, IProcessRedirector redirector, CancellationToken ct)
+    public UdpProxyForwarder(IUdpCapable udpSource, IProcessRedirector redirector, CancellationToken ct)
     {
-        _proxySource = proxySource ?? throw new ArgumentNullException(nameof(proxySource));
+        _udpSource = udpSource ?? throw new ArgumentNullException(nameof(udpSource));
         _redirector = redirector ?? throw new ArgumentNullException(nameof(redirector));
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
     }
@@ -39,7 +41,7 @@ internal sealed class UdpProxyForwarder : IDisposable
     // that needs it, so nothing is wasted.
     public async Task InitAsync()
     {
-        IUdpAssociateSource probe = await _proxySource.GetUdpAssociateSourceAsync(Guid.NewGuid(), _cts.Token).ConfigureAwait(false);
+        IUdpAssociateSource probe = await _udpSource.GetUdpAssociateSourceAsync(Guid.NewGuid(), _cts.Token).ConfigureAwait(false);
         await probe.AssociateAsync(_cts.Token).ConfigureAwait(false);
         RelayEndPoint = probe.RelayEndPoint;
         probe.Dispose();
@@ -103,7 +105,7 @@ internal sealed class UdpProxyForwarder : IDisposable
         {
             try
             {
-                IUdpAssociateSource tunnel = await _owner._proxySource
+                IUdpAssociateSource tunnel = await _owner._udpSource
                     .GetUdpAssociateSourceAsync(Guid.NewGuid(), ct).ConfigureAwait(false);
                 await tunnel.AssociateAsync(ct).ConfigureAwait(false);
                 _tunnel = tunnel;

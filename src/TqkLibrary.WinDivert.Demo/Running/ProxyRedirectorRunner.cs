@@ -83,11 +83,13 @@ internal sealed class ProxyRedirectorRunner
         }
 
         string udpMode;
-        if (proxySource.IsSupportUdp)
+        // A way out that cannot carry UDP does not implement IUdpCapable at all; one that can may
+        // still say no for this configuration, so both halves are asked.
+        if (proxySource is IUdpCapable udpSource && udpSource.IsSupportUdp)
         {
             try
             {
-                udpForwarder = new UdpProxyForwarder(proxySource, redirector, exitCts.Token);
+                udpForwarder = new UdpProxyForwarder(udpSource, redirector, exitCts.Token);
                 await udpForwarder.InitAsync().ConfigureAwait(false);
                 udpMode = $"via proxy (relay listener={redirector.UdpRelayPort}, upstream relay={udpForwarder.RelayEndPoint})";
             }
