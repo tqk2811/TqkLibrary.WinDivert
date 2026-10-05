@@ -1,4 +1,5 @@
 // Own sub-namespaces.
+global using TqkLibrary.WinDivert.SecureDns.Enums;
 global using TqkLibrary.WinDivert.SecureDns.Interfaces;
 global using TqkLibrary.WinDivert.SecureDns.Models;
 

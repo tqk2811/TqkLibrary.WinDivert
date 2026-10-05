@@ -195,10 +195,20 @@ public sealed class ProcessRedirector : IProcessRedirector
             _logger.LogDebug("DNS cache lookup enabled");
         }
 
+        if (_options.EnableSecureDns)
+        {
+            // One resolver shared by both pumps, so IPv4 and IPv6 queries ride the same HTTPS
+            // connection pool.
+            _dnsResolver = _dnsResolverFactory.Create(_options.DohEndpoint);
+            _logger.LogInformation("secure DNS enabled for {Scope}, resolving over {Endpoint}",
+                _options.SecureDnsScope, _dnsResolver.Endpoint);
+        }
+
         StartIpv4Pump(tracker, ports);
 
         if (ipv6Mode == Ipv6Mode.Redirect) StartIpv6RedirectPump(tracker, ports);
         else if (ipv6Mode == Ipv6Mode.Block) StartIpv6BlockPump(tracker);
+        else if (WantsMachineWideSecureDns && Socket.OSSupportsIPv6) StartIpv6SecureDnsPump(tracker);
     }
 
     /// <summary>
@@ -290,15 +300,8 @@ public sealed class ProcessRedirector : IProcessRedirector
             _logger.LogDebug("DNS answer sniffing enabled");
         }
 
-        // DNS-over-HTTPS runs before NAT so it claims the target's DNS/53 first.
-        if (_options.EnableSecureDns)
-        {
-            _dnsResolver = _dnsResolverFactory.Create(_options.DohEndpoint);
-            builder.Use(new DnsOverHttpsMiddleware(
-                _dnsResolver, tracker, _dnsMessageParser,
-                _loggerFactory.CreateLogger<DnsOverHttpsMiddleware>(), ReverseDns));
-            _logger.LogInformation("secure DNS enabled, resolving over {Endpoint}", _dnsResolver.Endpoint);
-        }
+        // DNS-over-HTTPS runs before NAT so it claims DNS/53 first.
+        if (_dnsResolver != null) builder.Use(CreateSecureDnsMiddleware(tracker));
 
         builder.Use(CreateNatMiddleware(tracker, RelayPorts.Ipv4Only(ports.Tcp, ports.Udp)));
         AddTrailingMiddlewares(builder, tracker);
@@ -322,9 +325,9 @@ public sealed class ProcessRedirector : IProcessRedirector
         // the same table is what lets a v6-only connection be routed by domain.
         if (_options.EnableDnsSniff) builder.Use(CreateDnsSniffMiddleware());
 
-        // DnsOverHttpsMiddleware is deliberately absent: it builds IPv4 reply packets and ignores
-        // IPv6 anyway. The target's own IPv6 DNS/53 is NAT-redirected like any other UDP and gets
-        // routed by policy; the OS resolver's own DNS is untouched either way.
+        // DNS-over-HTTPS before NAT, only machine-wide: then DNS/53 over IPv6 is answered over HTTPS
+        // like IPv4. Tracked-only keeps the old behaviour — v6 DNS is NAT-routed like other UDP.
+        if (WantsMachineWideSecureDns) builder.Use(CreateSecureDnsMiddleware(tracker));
         builder.Use(CreateNatMiddleware(tracker, RelayPorts.Ipv6Only(ports.TcpV6, ports.UdpV6)));
         AddTrailingMiddlewares(builder, tracker);
 
@@ -340,12 +343,41 @@ public sealed class ProcessRedirector : IProcessRedirector
         IWinDivertHandle handle = OpenNetworkHandle(filter);
 
         var builder = new PacketPipelineBuilder();
+        // Answered before the block, only machine-wide: that DoH stage must see the DNS/53 first.
+        // Tracked-only keeps the old behaviour — the target's IPv6 DNS is blocked with the rest.
+        if (WantsMachineWideSecureDns) builder.Use(CreateSecureDnsMiddleware(tracker));
         builder.Use(new Ipv6BlockMiddleware(tracker, _loggerFactory.CreateLogger<Ipv6BlockMiddleware>()));
 
         _ipv6Pump = _pumpFactory.Create("ipv6-block", handle, builder.Build());
         _ipv6Pump.Stopped += OnPumpStopped;
         _ipv6Pump.Start();
     }
+
+    // Ipv6Mode.Ignore opens no IPv6 handle for the target, but machine-wide DNS still has to move
+    // the whole machine's IPv6 DNS/53 onto DoH — otherwise the OS resolver just asks over IPv6.
+    // Only outbound DNS/53 is captured; everything else on IPv6 stays untouched.
+    private void StartIpv6SecureDnsPump(ISocketTracker tracker)
+    {
+        const string filter = "ipv6 and outbound and udp.DstPort == 53 and not impostor";
+        _logger.LogDebug("opening IPv6 NETWORK handle for secure DNS, filter={Filter}", filter);
+        IWinDivertHandle handle = OpenNetworkHandle(filter);
+
+        var builder = new PacketPipelineBuilder();
+        builder.Use(CreateSecureDnsMiddleware(tracker));
+
+        _ipv6Pump = _pumpFactory.Create("ipv6-dns", handle, builder.Build());
+        _ipv6Pump.Stopped += OnPumpStopped;
+        _ipv6Pump.Start();
+    }
+
+    private bool WantsMachineWideSecureDns
+        => _options.EnableSecureDns && _options.SecureDnsScope == DnsInterceptScope.WholeMachine;
+
+    private DnsOverHttpsMiddleware CreateSecureDnsMiddleware(ISocketTracker tracker)
+        => new DnsOverHttpsMiddleware(
+            _dnsResolver!, tracker, _dnsMessageParser,
+            _loggerFactory.CreateLogger<DnsOverHttpsMiddleware>(), ReverseDns,
+            scope: _options.SecureDnsScope);
 
     private DnsAnswerSniffMiddleware CreateDnsSniffMiddleware()
         => new DnsAnswerSniffMiddleware(

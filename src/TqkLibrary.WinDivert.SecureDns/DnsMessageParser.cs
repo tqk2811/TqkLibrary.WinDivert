@@ -101,6 +101,16 @@ public sealed class DnsMessageParser : IDnsMessageParser
         return records.Count == 0 ? empty : records;
     }
 
+    public bool TryReadQuestionName(byte[] wire, int offset, int length, out string name)
+    {
+        name = string.Empty;
+        if (wire == null || length < HeaderLength || offset < 0 || offset + length > wire.Length) return false;
+        if (ReadUInt16(wire, offset + 4) == 0) return false;
+
+        int pos = offset + HeaderLength;
+        return TryReadName(wire, offset, offset + length, ref pos, out name);
+    }
+
     // Reads a (possibly compressed) domain name, advancing `pos` past the name in the record
     // stream. Compression pointers are followed without moving `pos` beyond the pointer itself,
     // which is what the format requires.
