@@ -13,4 +13,16 @@ public interface IDnsMessageParser
     /// Never throws on bad input: a packet off the wire is not trustworthy by construction.
     /// </summary>
     IReadOnlyList<DnsAddressRecord> ParseAddressAnswers(byte[] wire, int offset, int length);
+
+    /// <summary>
+    /// Reads the name asked by the first question of a query or response. False when the message
+    /// carries no question or is malformed; never throws.
+    /// </summary>
+    bool TryReadQuestionName(byte[] wire, int offset, int length, out string name);
+
+    /// <summary>
+    /// Like <see cref="TryReadQuestionName"/>, plus the first question's QTYPE. False when the
+    /// question is cut short before its QTYPE/QCLASS; never throws.
+    /// </summary>
+    bool TryReadQuestion(byte[] wire, int offset, int length, out string name, out ushort type);
 }

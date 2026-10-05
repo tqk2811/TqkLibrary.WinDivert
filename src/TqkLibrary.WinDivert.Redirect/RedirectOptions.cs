@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using TqkLibrary.WinDivert.SecureDns;
 
 namespace TqkLibrary.WinDivert.Redirect;
 
@@ -142,18 +143,46 @@ public sealed class RedirectOptions
     public bool EnableDnsSniff { get; set; } = true;
 
     /// <summary>
-    /// When true, the target's outbound IPv4 UDP/53 is intercepted and resolved over HTTPS instead
-    /// of being forwarded, and the answer is injected back to the process. This is what lets DNS
-    /// keep working when the proxy cannot tunnel UDP. DNS/53 then never reaches the UDP relay or
-    /// the <see cref="UdpDatagramHandler"/>.
+    /// When true, outbound DNS (IPv4 UDP/53, plus IPv6 when <see cref="SecureDnsScope"/> is
+    /// <see cref="DnsInterceptScope.WholeMachine"/>) is intercepted and resolved over HTTPS instead
+    /// of being forwarded, and the answer is injected back to the asker. Whose queries is decided
+    /// by <see cref="SecureDnsScope"/>. This is what lets DNS keep working when the proxy cannot
+    /// tunnel UDP. DNS/53 then never reaches the UDP relay or the <see cref="UdpDatagramHandler"/>.
     /// </summary>
     public bool EnableSecureDns { get; set; } = false;
 
     /// <summary>
+    /// Whose DNS/53 <see cref="EnableSecureDns"/> takes over. The default,
+    /// <see cref="DnsInterceptScope.TrackedProcesses"/>, catches only queries sent from the target's
+    /// own IPv4 sockets — most Windows applications resolve through the Dnscache service instead, so
+    /// little is caught; its IPv6 DNS keeps the Ipv6Mode behaviour (NAT-routed or blocked).
+    /// <see cref="DnsInterceptScope.WholeMachine"/> takes every process's DNS over IPv4 and IPv6,
+    /// and also opens an IPv6 handle for it when <see cref="Ipv6Mode"/> is
+    /// <see cref="Enums.Ipv6Mode.Ignore"/>.
+    /// </summary>
+    public DnsInterceptScope SecureDnsScope { get; set; } = DnsInterceptScope.TrackedProcesses;
+
+    /// <summary>
     /// DoH endpoint used when <see cref="EnableSecureDns"/> is on. Null uses the library default,
     /// an IP literal — which avoids a bootstrap DNS lookup for the resolver's own hostname.
+    /// A host-name endpoint works too: queries for that one name are always let through to the OS
+    /// resolver's own server, so resolving the endpoint never waits on itself.
     /// </summary>
     public Uri? DohEndpoint { get; set; }
+
+    /// <summary>
+    /// Per-query secure DNS. When set it takes precedence over <see cref="EnableSecureDns"/>,
+    /// <see cref="SecureDnsScope"/> and <see cref="DohEndpoint"/>: every process's outbound DNS/53
+    /// over IPv4 and IPv6 is offered to this callback (on the pump thread), which lets it pass or
+    /// names the resolver to answer it over — so no default resolver is created. The pumps are
+    /// wired as for <see cref="DnsInterceptScope.WholeMachine"/>. The resolvers it returns stay
+    /// owned by the caller, and so does loop safety: a resolver's own bootstrap lookups must be
+    /// let through (a query for the picked resolver's own host-name endpoint is passed through as
+    /// a safety net). Disposing a resolver while queries on it are in flight makes those queries
+    /// fail (SERVFAIL, or the plain-DNS fallback); after swapping resolvers, keep the old one
+    /// alive for at least its timeout if that matters.
+    /// </summary>
+    public DnsQueryDecider? SecureDnsDecider { get; set; }
 
     /// <summary>
     /// When true, the target's outbound UDP that no earlier middleware claimed is dropped rather

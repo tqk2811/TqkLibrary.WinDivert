@@ -19,5 +19,6 @@ global using TqkLibrary.WinDivert.Pipeline.Interfaces;
 global using TqkLibrary.WinDivert.Pipeline.Models;
 global using TqkLibrary.WinDivert.Inspection;
 global using TqkLibrary.WinDivert.Inspection.Interfaces;
+global using TqkLibrary.WinDivert.SecureDns.Enums;
 global using TqkLibrary.WinDivert.SecureDns.Interfaces;
 global using TqkLibrary.WinDivert.SecureDns.Models;
