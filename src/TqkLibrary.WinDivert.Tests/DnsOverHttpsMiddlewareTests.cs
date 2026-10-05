@@ -13,6 +13,7 @@ using TqkLibrary.WinDivert.Pipeline.Models;
 using TqkLibrary.WinDivert.SecureDns;
 using TqkLibrary.WinDivert.SecureDns.Enums;
 using TqkLibrary.WinDivert.SecureDns.Interfaces;
+using TqkLibrary.WinDivert.SecureDns.Models;
 using Xunit;
 
 namespace TqkLibrary.WinDivert.Tests;
@@ -277,7 +278,175 @@ public class DnsOverHttpsMiddlewareTests
         return (int)sum;
     }
 
+    // ---- decider mode ----------------------------------------------------------------------
+
+    [Fact]
+    public async Task DeciderPassHandsTheQueryOnAndInjectsNothing()
+    {
+        var injector = new RecordingInjector();
+        var resolver = new StubResolver(Answer);
+        int asked = 0;
+        var middleware = Create((in DnsQueryInfo _) => { asked++; return DnsQueryDecision.Pass; });
+
+        PacketContext ctx = Query(ClientV4, ServerV4, "example.com", injector);
+        bool passed = await InvokeAsync(middleware, ctx);
+
+        Assert.True(passed);
+        Assert.Equal(1, asked);
+        Assert.NotEqual(PacketDisposition.Drop, ctx.Disposition);
+        Assert.Equal(0, injector.Count);
+        Assert.Equal(0, resolver.Calls);
+    }
+
+    [Fact]
+    public async Task DeciderResolveUsesThePickedResolverAndInjectsItsAnswer()
+    {
+        var injector = new RecordingInjector();
+        var other = new StubResolver(Answer);
+        var picked = new StubResolver(Answer);
+        var middleware = Create((in DnsQueryInfo _) => DnsQueryDecision.Resolve(picked, false));
+
+        PacketContext ctx = Query(ClientV6, ServerV6, "example.com", injector);
+        bool passed = await InvokeAsync(middleware, ctx);
+
+        Assert.False(passed);
+        Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
+        (byte[] packet, WinDivertAddress addr) = await injector.NextAsync();
+        Assert.False(addr.Outbound);
+        Assert.True(addr.IPv6);
+        Assert.Equal(0xAB, packet[40 + 8]);  // the stub's answer id, after the IPv6 + UDP headers
+        Assert.Equal(1, picked.Calls);
+        Assert.Equal(0, other.Calls);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DeciderGetsThePidOnlyWhenTheSocketIsTracked(bool tracked)
+    {
+        var tracker = new StubTracker { UdpOwner = tracked ? (ClientV4, ClientPort, 4242u) : null };
+        DnsQueryInfo? seen = null;
+        var middleware = Create((in DnsQueryInfo q) => { seen = q; return DnsQueryDecision.Pass; }, tracker);
+
+        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", new RecordingInjector()));
+
+        Assert.NotNull(seen);
+        Assert.Equal(tracked ? 4242u : (uint?)null, seen.Value.ProcessId);
+        Assert.False(seen.Value.IsIpv6);
+    }
+
+    [Fact]
+    public async Task DeciderGetsTheLowerCasedNameAndTheQueryType()
+    {
+        DnsQueryInfo? seen = null;
+        var middleware = Create((in DnsQueryInfo q) => { seen = q; return DnsQueryDecision.Pass; });
+
+        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "WWW.Example.COM", new RecordingInjector(), qtype: 28));
+
+        Assert.NotNull(seen);
+        Assert.Equal("www.example.com", seen.Value.QueryName);
+        Assert.Equal((ushort)28, seen.Value.QueryType);
+    }
+
+    [Fact]
+    public async Task ADeciderThatThrowsLetsTheQueryThrough()
+    {
+        var injector = new RecordingInjector();
+        var middleware = Create((in DnsQueryInfo _) => throw new InvalidOperationException("decider broke"));
+
+        PacketContext ctx = Query(ClientV4, ServerV4, "example.com", injector);
+        bool passed = await InvokeAsync(middleware, ctx);
+
+        Assert.True(passed);
+        Assert.NotEqual(PacketDisposition.Drop, ctx.Disposition);
+        Assert.Equal(0, injector.Count);
+    }
+
+    // A resolver with a host-name endpoint must not be asked for that very name.
+    [Fact]
+    public async Task DeciderPicksAResolverForItsOwnEndpointNameAndTheQueryPassesThrough()
+    {
+        var injector = new RecordingInjector();
+        var resolver = new StubResolver(Answer, new Uri("https://dns.google/dns-query"));
+        var middleware = Create((in DnsQueryInfo _) => DnsQueryDecision.Resolve(resolver, false));
+
+        PacketContext ctx = Query(ClientV4, ServerV4, "DNS.google", injector);
+        bool passed = await InvokeAsync(middleware, ctx);
+
+        Assert.True(passed);
+        Assert.NotEqual(PacketDisposition.Drop, ctx.Disposition);
+        Assert.Equal(0, injector.Count);
+        Assert.Equal(0, resolver.Calls);
+    }
+
+    // With fallback the failed lookup sends the untouched query on outbound, not a SERVFAIL back.
+    [Fact]
+    public async Task FallbackReinjectsTheOriginalQueryOutboundWhenTheResolverFails()
+    {
+        var injector = new RecordingInjector();
+        var resolver = new StubResolver(Answer) { Throw = true };
+        var middleware = Create((in DnsQueryInfo _) => DnsQueryDecision.Resolve(resolver, true));
+
+        PacketContext ctx = Query(ClientV4, ServerV4, "example.com", injector);
+        byte[] original = ctx.Buffer[..ctx.Length];
+        bool passed = await InvokeAsync(middleware, ctx);
+
+        Assert.False(passed);
+        Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
+        (byte[] packet, WinDivertAddress addr) = await injector.NextAsync();
+        Assert.True(addr.Outbound);
+        Assert.False(addr.Loopback);
+        Assert.Equal(original, packet);
+    }
+
+    [Fact]
+    public async Task WithoutFallbackAFailedResolveGetsASERVFAIL()
+    {
+        var injector = new RecordingInjector();
+        var resolver = new StubResolver(Answer) { Throw = true };
+        var middleware = Create((in DnsQueryInfo _) => DnsQueryDecision.Resolve(resolver, false));
+
+        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", injector));
+
+        (byte[] packet, WinDivertAddress addr) = await injector.NextAsync();
+        Assert.False(addr.Outbound);
+        Assert.Equal(2, packet[28 + 3] & 0x0F);  // SERVFAIL
+    }
+
+    // Over the pending cap, a fallback query simply goes on as plain DNS instead of a SERVFAIL.
+    [Fact]
+    public async Task FallbackPassesAQueryBeyondThePendingCap()
+    {
+        var gate = new TaskCompletionSource<byte[]?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resolver = new StubResolver(Answer) { Gate = gate.Task };
+        var injector = new RecordingInjector();
+        var middleware = new DnsOverHttpsMiddleware(
+            (in DnsQueryInfo _) => DnsQueryDecision.Resolve(resolver, true),
+            new StubTracker(), new DnsMessageParser(), NullLogger<DnsOverHttpsMiddleware>.Instance,
+            maxConcurrentQueries: 1, maxPendingQueries: 1);
+
+        PacketContext first = Query(ClientV4, ServerV4, "example.com", injector);
+        PacketContext second = Query(ClientV4, ServerV4, "example.com", injector);
+        Assert.False(await InvokeAsync(middleware, first));
+        await resolver.WaitForCallAsync();
+        bool secondPassed = await InvokeAsync(middleware, second);
+
+        Assert.True(secondPassed);
+        Assert.NotEqual(PacketDisposition.Drop, second.Disposition);
+        Assert.Equal(0, injector.Count);
+
+        gate.SetResult(Answer);
+        (byte[] packet, _) = await injector.NextAsync();
+        Assert.Equal(0, packet[28 + 3] & 0x0F);  // the first query's real answer
+        Assert.Equal(1, resolver.Calls);
+    }
+
     // ---- helpers ---------------------------------------------------------------------------
+
+    private static DnsOverHttpsMiddleware Create(DnsQueryDecider decider, ISocketTracker? tracker = null)
+        => new DnsOverHttpsMiddleware(
+            decider, tracker ?? new StubTracker(), new DnsMessageParser(),
+            NullLogger<DnsOverHttpsMiddleware>.Instance);
 
     private static DnsOverHttpsMiddleware Create(
         DnsInterceptScope scope, IDnsResolver resolver, ISocketTracker? tracker = null)
@@ -296,9 +465,9 @@ public class DnsOverHttpsMiddlewareTests
     // An outbound client:ClientPort -> server:53 query for `name`, as the pump would hand it over.
     private static PacketContext Query(
         IPAddress client, IPAddress server, string name, IPacketInjector injector,
-        CancellationToken token = default)
+        CancellationToken token = default, ushort qtype = 1)
     {
-        byte[] dns = DnsQuery(name);
+        byte[] dns = DnsQuery(name, qtype);
         // The reply builder makes a well-formed datagram with source port 53; a query is the same
         // shape with the client's ephemeral port as its source.
         byte[] packet = new DnsReplyPacketBuilder().Build(client, server, 53, dns);
@@ -316,7 +485,7 @@ public class DnsOverHttpsMiddlewareTests
         return ctx;
     }
 
-    private static byte[] DnsQuery(string name)
+    private static byte[] DnsQuery(string name, ushort qtype = 1)
     {
         var bytes = new List<byte> { 0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0 };
         foreach (string label in name.Split('.'))
@@ -324,7 +493,7 @@ public class DnsOverHttpsMiddlewareTests
             bytes.Add((byte)label.Length);
             bytes.AddRange(System.Text.Encoding.ASCII.GetBytes(label));
         }
-        bytes.AddRange(new byte[] { 0, 0, 1, 0, 1 });  // root, type A, class IN
+        bytes.AddRange(new byte[] { 0, (byte)(qtype >> 8), (byte)qtype, 0, 1 });  // root, qtype, class IN
         return bytes.ToArray();
     }
 
@@ -394,6 +563,7 @@ public class DnsOverHttpsMiddlewareTests
     private sealed class StubTracker : ISocketTracker
     {
         public (IPAddress Address, ushort Port)? TrackedUdp { get; init; }
+        public (IPAddress Address, ushort Port, uint Pid)? UdpOwner { get; init; }
 
         public event Action<FlowKey>? TcpConnectEstablished { add { } remove { } }
         public event Action<FlowKey>? TcpConnectClosed { add { } remove { } }
@@ -413,7 +583,13 @@ public class DnsOverHttpsMiddlewareTests
             => TrackedUdp is { } t && t.Address.Equals(localAddr) && t.Port == localPort;
 
         public bool TryGetTcpProcessId(FlowKey key, out uint processId) { processId = 0; return false; }
-        public bool TryGetUdpProcessId(IPAddress localAddr, ushort localPort, out uint processId) { processId = 0; return false; }
+        public bool TryGetUdpProcessId(IPAddress localAddr, ushort localPort, out uint processId)
+        {
+            processId = 0;
+            if (UdpOwner is not { } o || !o.Address.Equals(localAddr) || o.Port != localPort) return false;
+            processId = o.Pid;
+            return true;
+        }
 
         public bool TryReconcileFromKernel(out int tcpAdded, out int udpAdded, bool force = false)
         {

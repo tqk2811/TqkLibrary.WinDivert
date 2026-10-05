@@ -19,4 +19,10 @@ public interface IDnsMessageParser
     /// carries no question or is malformed; never throws.
     /// </summary>
     bool TryReadQuestionName(byte[] wire, int offset, int length, out string name);
+
+    /// <summary>
+    /// Like <see cref="TryReadQuestionName"/>, plus the first question's QTYPE. False when the
+    /// question is cut short before its QTYPE/QCLASS; never throws.
+    /// </summary>
+    bool TryReadQuestion(byte[] wire, int offset, int length, out string name, out ushort type);
 }

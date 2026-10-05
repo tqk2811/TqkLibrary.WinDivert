@@ -1,4 +1,5 @@
 using System;
+using System.Net.Http;
 
 namespace TqkLibrary.WinDivert.SecureDns.Interfaces;
 
@@ -11,4 +12,11 @@ public interface IDnsResolverFactory
 {
     /// <param name="endpoint">Null uses the default DoH endpoint.</param>
     IDnsResolver Create(Uri? endpoint = null, TimeSpan? timeout = null);
+
+    /// <summary>
+    /// A resolver whose HTTPS goes through <paramref name="handler"/> (e.g. a <c>SocketsHttpHandler</c>
+    /// dialing through an outbound). The caller owns the result, and through it the handler when
+    /// <paramref name="disposeHandler"/> is true.
+    /// </summary>
+    IDnsResolver Create(HttpMessageHandler handler, bool disposeHandler, Uri? endpoint = null, TimeSpan? timeout = null);
 }

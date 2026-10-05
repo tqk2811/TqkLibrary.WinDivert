@@ -195,7 +195,12 @@ public sealed class ProcessRedirector : IProcessRedirector
             _logger.LogDebug("DNS cache lookup enabled");
         }
 
-        if (_options.EnableSecureDns)
+        if (_options.SecureDnsDecider != null)
+        {
+            // The caller picks a resolver per query and owns them all; none is created here.
+            _logger.LogInformation("secure DNS enabled machine-wide, resolver chosen per query");
+        }
+        else if (_options.EnableSecureDns)
         {
             // One resolver shared by both pumps, so IPv4 and IPv6 queries ride the same HTTPS
             // connection pool.
@@ -280,7 +285,7 @@ public sealed class ProcessRedirector : IProcessRedirector
     // block, answer sniffing), even if NAT itself only redirects TCP — otherwise those middlewares
     // would never see the packets they exist for.
     private bool CapturesUdp => WantsUdp
-        || _options.EnableSecureDns || _options.BlockUnhandledTargetUdp || _options.EnableDnsSniff;
+        || WantsSecureDns || _options.BlockUnhandledTargetUdp || _options.EnableDnsSniff;
 
     private void StartIpv4Pump(ISocketTracker tracker, RelayPorts ports)
     {
@@ -301,7 +306,7 @@ public sealed class ProcessRedirector : IProcessRedirector
         }
 
         // DNS-over-HTTPS runs before NAT so it claims DNS/53 first.
-        if (_dnsResolver != null) builder.Use(CreateSecureDnsMiddleware(tracker));
+        if (WantsSecureDns) builder.Use(CreateSecureDnsMiddleware(tracker));
 
         builder.Use(CreateNatMiddleware(tracker, RelayPorts.Ipv4Only(ports.Tcp, ports.Udp)));
         AddTrailingMiddlewares(builder, tracker);
@@ -370,14 +375,22 @@ public sealed class ProcessRedirector : IProcessRedirector
         _ipv6Pump.Start();
     }
 
+    // A decider takes precedence over the fixed-resolver switches and is always machine-wide.
+    private bool WantsSecureDns => _options.SecureDnsDecider != null || _options.EnableSecureDns;
+
     private bool WantsMachineWideSecureDns
-        => _options.EnableSecureDns && _options.SecureDnsScope == DnsInterceptScope.WholeMachine;
+        => _options.SecureDnsDecider != null
+            || (_options.EnableSecureDns && _options.SecureDnsScope == DnsInterceptScope.WholeMachine);
 
     private DnsOverHttpsMiddleware CreateSecureDnsMiddleware(ISocketTracker tracker)
-        => new DnsOverHttpsMiddleware(
-            _dnsResolver!, tracker, _dnsMessageParser,
-            _loggerFactory.CreateLogger<DnsOverHttpsMiddleware>(), ReverseDns,
-            scope: _options.SecureDnsScope);
+        => _options.SecureDnsDecider is { } decider
+            ? new DnsOverHttpsMiddleware(
+                decider, tracker, _dnsMessageParser,
+                _loggerFactory.CreateLogger<DnsOverHttpsMiddleware>(), ReverseDns)
+            : new DnsOverHttpsMiddleware(
+                _dnsResolver!, tracker, _dnsMessageParser,
+                _loggerFactory.CreateLogger<DnsOverHttpsMiddleware>(), ReverseDns,
+                scope: _options.SecureDnsScope);
 
     private DnsAnswerSniffMiddleware CreateDnsSniffMiddleware()
         => new DnsAnswerSniffMiddleware(

@@ -12,10 +12,12 @@ namespace TqkLibrary.WinDivert.SecureDns;
 
 /// <summary>
 /// Intercepts outbound UDP/53 (classic DNS) over IPv4 or IPv6, resolves it over HTTPS, and injects
-/// the answer back to the asker as an inbound UDP packet. <see cref="DnsInterceptScope"/> decides
-/// whose queries: the target processes' only (the default), or the whole machine's — so DNS keeps
-/// working even when the proxy carrying the rest of the traffic cannot tunnel UDP (HTTP CONNECT,
-/// SOCKS4), and stays private from whoever watches the real network.
+/// the answer back to the asker as an inbound UDP packet. Two ways to choose which queries: a fixed
+/// resolver plus a <see cref="DnsInterceptScope"/> (the target processes' only, or the whole
+/// machine's), or a <see cref="DnsQueryDecider"/> asked per query machine-wide, which picks
+/// pass-through or the resolver to use. Either way DNS keeps working even when the proxy carrying
+/// the rest of the traffic cannot tunnel UDP (HTTP CONNECT, SOCKS4), and stays private from
+/// whoever watches the real network.
 /// </summary>
 /// <remarks>
 /// The original query is dropped immediately; the HTTPS round-trip and the injection happen on a
@@ -23,21 +25,30 @@ namespace TqkLibrary.WinDivert.SecureDns;
 /// task needs is copied out of the shared pump buffer BEFORE InvokeAsync returns — the buffer
 /// holds the next packet by the time the task runs.
 ///
-/// Loop safety: when the DoH endpoint is a host name rather than an IP literal, the resolver's own
-/// lookup of that name goes through the OS resolver and, machine-wide, would land right back here
-/// — waiting on itself. Queries for exactly that name are therefore always let through untouched.
+/// Loop safety (fixed-resolver mode): when the DoH endpoint is a host name rather than an IP
+/// literal, the resolver's own lookup of that name goes through the OS resolver and, machine-wide,
+/// would land right back here — waiting on itself. Queries for exactly that name are therefore
+/// always let through untouched. In decider mode that choice belongs to the decider.
+///
+/// Plain-DNS fallback (decider mode): a failed lookup re-sends the original query packet, with the
+/// address it was captured with, through the same injector the pump uses to pass packets on — the
+/// very send <c>next(ctx)</c> would have caused — so the handle's <c>not impostor</c> filter keeps
+/// it from being captured again.
 /// </remarks>
 public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
 {
     private const ushort DnsPort = 53;
 
-    private readonly IDnsResolver _resolver;
+    // Exactly one of these two is set: a fixed resolver, or a per-query decider.
+    private readonly IDnsResolver? _resolver;
+    private readonly DnsQueryDecider? _decider;
     private readonly ISocketTracker _tracker;
     private readonly IDnsMessageParser _parser;
     private readonly ILogger<DnsOverHttpsMiddleware> _logger;
     private readonly SemaphoreSlim _concurrency;
     private readonly int _maxPendingQueries;
     private int _pendingQueries;
+    private int _deciderThrewLogged;
     private readonly DnsInterceptScope _scope;
     private readonly DnsReplyPacketBuilder _replyBuilder = new DnsReplyPacketBuilder();
 
@@ -57,20 +68,47 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         int maxConcurrentQueries = 32,
         DnsInterceptScope scope = DnsInterceptScope.TrackedProcesses,
         int maxPendingQueries = 256)
+        : this(tracker, parser, logger, reverseDns, maxConcurrentQueries, maxPendingQueries)
     {
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _scope = scope;
+        _endpointHost = GetEndpointHost(resolver.Endpoint);
+    }
+
+    /// <summary>
+    /// Decider mode: every process's outbound DNS/53 is offered to <paramref name="decider"/>, on
+    /// the pump thread, which says whether and through which resolver it is answered. The resolvers
+    /// it hands out stay owned by the caller.
+    /// </summary>
+    public DnsOverHttpsMiddleware(
+        DnsQueryDecider decider,
+        ISocketTracker tracker,
+        IDnsMessageParser parser,
+        ILogger<DnsOverHttpsMiddleware> logger,
+        IReverseDnsTable? reverseDns = null,
+        int maxConcurrentQueries = 32,
+        int maxPendingQueries = 256)
+        : this(tracker, parser, logger, reverseDns, maxConcurrentQueries, maxPendingQueries)
+    {
+        _decider = decider ?? throw new ArgumentNullException(nameof(decider));
+        _scope = DnsInterceptScope.WholeMachine;
+    }
+
+    private DnsOverHttpsMiddleware(
+        ISocketTracker tracker,
+        IDnsMessageParser parser,
+        ILogger<DnsOverHttpsMiddleware> logger,
+        IReverseDnsTable? reverseDns,
+        int maxConcurrentQueries,
+        int maxPendingQueries)
+    {
         _tracker = tracker ?? throw new ArgumentNullException(nameof(tracker));
         _parser = parser ?? throw new ArgumentNullException(nameof(parser));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _reverseDns = reverseDns;
         if (maxConcurrentQueries < 1) maxConcurrentQueries = 1;
         _concurrency = new SemaphoreSlim(maxConcurrentQueries, maxConcurrentQueries);
-        _scope = scope;
         _maxPendingQueries = maxPendingQueries < 1 ? 1 : maxPendingQueries;
-        Uri? endpoint = resolver.Endpoint;
-        _endpointHost = endpoint != null && endpoint.HostNameType == UriHostNameType.Dns
-            ? endpoint.IdnHost.TrimEnd('.')
-            : null;
     }
 
     public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
@@ -83,65 +121,123 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         if (_scope == DnsInterceptScope.TrackedProcesses && !_tracker.IsTrackedUdp(p.Source, p.SourcePort))
             return next(ctx);
 
-        // Copy the DNS query payload + the 5-tuple/interface out of the shared buffer NOW.
         int payloadOffset = p.Udp.PayloadOffset;
         int available = ctx.Length - payloadOffset;
         int udpPayloadLen = p.Udp.PayloadLength;
         int payloadLen = (udpPayloadLen >= 0 && udpPayloadLen < available) ? udpPayloadLen : available;
-        if (payloadLen <= 0)
+
+        IDnsResolver resolver;
+        bool fallback;
+        if (_decider != null)
         {
-            ctx.Drop();
-            return Task.CompletedTask;
+            if (payloadLen <= 0) return next(ctx);
+            if (!TryDecide(ctx, p, payloadOffset, payloadLen, out DnsQueryDecision decision)) return next(ctx);
+            resolver = decision.Resolver!;
+            fallback = decision.FallbackToPlainDnsOnFailure;
         }
-
-        if (IsEndpointLookup(ctx.Buffer, payloadOffset, payloadLen)) return next(ctx);
-
-        byte[] query = new byte[payloadLen];
-        Buffer.BlockCopy(ctx.Buffer, payloadOffset, query, 0, payloadLen);
-
-        IPAddress clientIp = p.Source;
-        ushort clientPort = p.SourcePort;
-        IPAddress serverIp = p.Destination;
-        bool ipv6 = p.IsIpv6;
-        uint ifIdx = ctx.Address.Network.IfIdx;
-        uint subIfIdx = ctx.Address.Network.SubIfIdx;
-        IPacketInjector injector = ctx.Injector;
-        CancellationToken token = ctx.CancellationToken;
-
-        // Swallow the original query; the resolved answer is injected later (a SERVFAIL on failure).
-        ctx.Drop();
+        else
+        {
+            if (payloadLen <= 0)
+            {
+                ctx.Drop();
+                return Task.CompletedTask;
+            }
+            if (IsEndpointLookup(ctx.Buffer, payloadOffset, payloadLen)) return next(ctx);
+            resolver = _resolver!;
+            fallback = false;
+        }
 
         // Queued + running queries are bounded: a flood must not pile up tasks behind the semaphore.
         // The excess gets an immediate SERVFAIL (cheap, built and injected right here) so its client
-        // moves on instead of waiting out its own timeout.
+        // moves on instead of waiting out its own timeout — or, with fallback, just goes out as
+        // plain DNS.
         if (Interlocked.Increment(ref _pendingQueries) > _maxPendingQueries)
         {
             Interlocked.Decrement(ref _pendingQueries);
+            if (fallback)
+            {
+                _logger.LogTrace("DoH backlog full ({Max}), query from {Client}:{ClientPort} goes out as plain DNS",
+                    _maxPendingQueries, p.Source, p.SourcePort);
+                return next(ctx);
+            }
             _logger.LogTrace("DoH backlog full ({Max}), SERVFAIL for query from {Client}:{ClientPort}",
-                _maxPendingQueries, clientIp, clientPort);
-            byte[]? servFail = DnsServFail.Build(query);
+                _maxPendingQueries, p.Source, p.SourcePort);
+            byte[]? servFail = DnsServFail.Build(CopyPayload(ctx, payloadOffset, payloadLen));
+            ReplyTarget excess = CaptureReplyTarget(ctx, p);
+            ctx.Drop();
             if (servFail != null)
             {
-                try { InjectReply(servFail, clientIp, clientPort, serverIp, ipv6, ifIdx, subIfIdx, injector); }
+                try { InjectReply(servFail, excess); }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "DoH SERVFAIL injection failed for {Client}:{ClientPort}", clientIp, clientPort);
+                    _logger.LogWarning(ex, "DoH SERVFAIL injection failed for {Client}:{ClientPort}", excess.ClientIp, excess.ClientPort);
                 }
             }
             return Task.CompletedTask;
         }
 
+        // Copy the DNS query payload + the 5-tuple/interface out of the shared buffer NOW.
+        byte[] query = CopyPayload(ctx, payloadOffset, payloadLen);
+        ReplyTarget target = CaptureReplyTarget(ctx, p);
+        // The whole original packet + its address, re-sent as plain DNS should the lookup fail.
+        OriginalQuery? original = null;
+        if (fallback)
+        {
+            byte[] packet = new byte[ctx.Length];
+            Buffer.BlockCopy(ctx.Buffer, 0, packet, 0, ctx.Length);
+            original = new OriginalQuery(packet, ctx.Address);
+        }
+        CancellationToken token = ctx.CancellationToken;
+
+        // Swallow the original query; the resolved answer is injected later (on failure a SERVFAIL,
+        // or the original query itself with fallback).
+        ctx.Drop();
+
         _ = Task.Run(async () =>
         {
-            try { await ResolveAndInjectAsync(query, clientIp, clientPort, serverIp, ipv6, ifIdx, subIfIdx, injector, token).ConfigureAwait(false); }
+            try { await ResolveAndInjectAsync(resolver, query, target, original, token).ConfigureAwait(false); }
             finally { Interlocked.Decrement(ref _pendingQueries); }
         });
         return Task.CompletedTask;
     }
 
+    // Asks the decider about one query. False means let it through: decided so, unparseable, or
+    // the decider threw — a broken decider must not take the machine's DNS down with it.
+    private bool TryDecide(PacketContext ctx, ParsedPacket p, int payloadOffset, int payloadLen, out DnsQueryDecision decision)
+    {
+        decision = DnsQueryDecision.Pass;
+        if (!_parser.TryReadQuestion(ctx.Buffer, payloadOffset, payloadLen, out string name, out ushort type))
+            return false;
+
+        uint? pid = _tracker.TryGetUdpProcessId(p.Source, p.SourcePort, out uint found) ? found : null;
+        var info = new DnsQueryInfo(pid, name.TrimEnd('.').ToLowerInvariant(), type, p.IsIpv6);
+        try
+        {
+            decision = _decider!(in info);
+        }
+        catch (Exception ex)
+        {
+            // Only the first throw is a warning; a decider that keeps throwing must not flood the log.
+            LogLevel level = Interlocked.Exchange(ref _deciderThrewLogged, 1) == 0 ? LogLevel.Warning : LogLevel.Debug;
+            _logger.Log(level, ex, "DNS query decider threw for {Query}; letting it through", info);
+            decision = DnsQueryDecision.Pass;
+        }
+        if (decision.IsPass) return false;
+
+        // Safety net: a resolver must never be asked for its own endpoint's name, or its lookup of
+        // that name would wait on itself. Let that query through to the OS resolver's real server.
+        string? endpointHost = GetEndpointHost(decision.Resolver!.Endpoint);
+        if (endpointHost != null && string.Equals(info.QueryName, endpointHost, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogDebug("DNS query for {Query} is the picked resolver's own endpoint name; letting it through", info);
+            decision = DnsQueryDecision.Pass;
+            return false;
+        }
+        return true;
+    }
+
     private async Task ResolveAndInjectAsync(
-        byte[] query, IPAddress clientIp, ushort clientPort, IPAddress serverIp, bool ipv6,
-        uint ifIdx, uint subIfIdx, IPacketInjector injector, CancellationToken token)
+        IDnsResolver resolver, byte[] query, ReplyTarget target, OriginalQuery? original, CancellationToken token)
     {
         try { await _concurrency.WaitAsync(token).ConfigureAwait(false); }
         catch (OperationCanceledException) { return; }
@@ -151,20 +247,34 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             byte[]? response = null;
             try
             {
-                response = await _resolver.ResolveAsync(query, token).ConfigureAwait(false);
+                response = await resolver.ResolveAsync(query, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
+            catch (ObjectDisposedException ex)
+            {
+                // The caller disposed the resolver while this query was in flight: an ordinary
+                // failure (fallback or SERVFAIL below), not worth a warning.
+                _logger.LogDebug(ex, "DoH resolver was disposed during the lookup for {Client}:{ClientPort}", target.ClientIp, target.ClientPort);
+            }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "DoH resolve failed for {Client}:{ClientPort}", clientIp, clientPort);
+                _logger.LogWarning(ex, "DoH resolve failed for {Client}:{ClientPort}", target.ClientIp, target.ClientPort);
             }
 
             if (response == null || response.Length == 0)
             {
+                if (original != null)
+                {
+                    // Fallback: the query goes on to its real server as if it had never been taken.
+                    bool sent = target.Injector.Inject(original.Packet, original.Packet.Length, original.Address);
+                    _logger.LogDebug("{Client}:{ClientPort} sent out as plain DNS (DoH gave no answer), inject={Injected}",
+                        target.ClientIp, target.ClientPort, sent);
+                    return;
+                }
                 // Fail fast: an immediate SERVFAIL lets the client move on instead of timing out.
                 response = DnsServFail.Build(query);
                 if (response == null) return;
-                _logger.LogDebug("{Client}:{ClientPort} answered with SERVFAIL (DoH gave no answer)", clientIp, clientPort);
+                _logger.LogDebug("{Client}:{ClientPort} answered with SERVFAIL (DoH gave no answer)", target.ClientIp, target.ClientPort);
             }
             else if (_reverseDns != null)
             {
@@ -172,11 +282,11 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
                 if (records.Count > 0) _reverseDns.AddRange(records);
             }
 
-            InjectReply(response, clientIp, clientPort, serverIp, ipv6, ifIdx, subIfIdx, injector);
+            InjectReply(response, target);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "DoH answer injection failed for {Client}:{ClientPort}", clientIp, clientPort);
+            _logger.LogWarning(ex, "DoH answer injection failed for {Client}:{ClientPort}", target.ClientIp, target.ClientPort);
         }
         finally
         {
@@ -184,16 +294,25 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         }
     }
 
-    private void InjectReply(
-        byte[] response, IPAddress clientIp, ushort clientPort, IPAddress serverIp, bool ipv6,
-        uint ifIdx, uint subIfIdx, IPacketInjector injector)
+    private void InjectReply(byte[] response, ReplyTarget target)
     {
-        byte[] packet = _replyBuilder.Build(serverIp, clientIp, clientPort, response);
-        WinDivertAddress addr = BuildInboundAddress(ipv6, ifIdx, subIfIdx);
-        bool ok = injector.Inject(packet, packet.Length, addr);
+        byte[] packet = _replyBuilder.Build(target.ServerIp, target.ClientIp, target.ClientPort, response);
+        WinDivertAddress addr = BuildInboundAddress(target.Ipv6, target.IfIdx, target.SubIfIdx);
+        bool ok = target.Injector.Inject(packet, packet.Length, addr);
         _logger.LogTrace("{Client}:{ClientPort} answered from {Server}:{DnsPort}, resp={Bytes}B inject={Injected}",
-            clientIp, clientPort, serverIp, DnsPort, response.Length, ok);
+            target.ClientIp, target.ClientPort, target.ServerIp, DnsPort, response.Length, ok);
     }
+
+    private static byte[] CopyPayload(PacketContext ctx, int payloadOffset, int payloadLen)
+    {
+        byte[] query = new byte[payloadLen];
+        Buffer.BlockCopy(ctx.Buffer, payloadOffset, query, 0, payloadLen);
+        return query;
+    }
+
+    private static ReplyTarget CaptureReplyTarget(PacketContext ctx, ParsedPacket p)
+        => new ReplyTarget(p.Source, p.SourcePort, p.Destination, p.IsIpv6,
+            ctx.Address.Network.IfIdx, ctx.Address.Network.SubIfIdx, ctx.Injector);
 
     // True for a query asking the DoH endpoint's own name, which must reach the OS resolver's real
     // server: answering it over DoH would need that very answer first.
@@ -201,6 +320,12 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         => _endpointHost != null
             && _parser.TryReadQuestionName(buffer, offset, length, out string name)
             && string.Equals(name.TrimEnd('.'), _endpointHost, StringComparison.OrdinalIgnoreCase);
+
+    // The endpoint's host name, or null for an IP-literal (or missing) endpoint.
+    private static string? GetEndpointHost(Uri? endpoint)
+        => endpoint != null && endpoint.HostNameType == UriHostNameType.Dns
+            ? endpoint.IdnHost.TrimEnd('.')
+            : null;
 
     // Inbound on the real interface the query left from — mirrors how the NAT stage reply leg
     // delivers (Outbound=false, Loopback=false, original IfIdx).
@@ -215,4 +340,12 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         addr.Network.SubIfIdx = subIfIdx;
         return addr;
     }
+
+    // Who the answer goes back to, copied out of the pump's packet.
+    private sealed record ReplyTarget(
+        IPAddress ClientIp, ushort ClientPort, IPAddress ServerIp, bool Ipv6,
+        uint IfIdx, uint SubIfIdx, IPacketInjector Injector);
+
+    // The untouched query packet and the address it was captured with.
+    private sealed record OriginalQuery(byte[] Packet, WinDivertAddress Address);
 }

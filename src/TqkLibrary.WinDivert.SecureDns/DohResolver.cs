@@ -31,10 +31,24 @@ public sealed class DohResolver : IDnsResolver
     public Uri Endpoint { get; }
 
     public DohResolver(ILogger<DohResolver> logger, Uri? endpoint = null, TimeSpan? timeout = null)
+        : this(logger, new HttpClientHandler(), disposeHandler: true, endpoint, timeout)
+    {
+    }
+
+    /// <summary>
+    /// Sends the HTTPS requests through <paramref name="handler"/> — e.g. a
+    /// <c>SocketsHttpHandler</c> whose <c>ConnectCallback</c> dials through a proxy or tunnel.
+    /// </summary>
+    /// <param name="disposeHandler">True hands the handler over: disposing this resolver disposes it.</param>
+    public DohResolver(
+        ILogger<DohResolver> logger, HttpMessageHandler handler, bool disposeHandler,
+        Uri? endpoint = null, TimeSpan? timeout = null)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        if (handler is null) throw new ArgumentNullException(nameof(handler));
         Endpoint = endpoint ?? DefaultEndpoint;
-        _http = new HttpClient { Timeout = timeout ?? TimeSpan.FromSeconds(5) };
+        // HttpClient disposes the handler with itself only when told it owns it.
+        _http = new HttpClient(handler, disposeHandler) { Timeout = timeout ?? TimeSpan.FromSeconds(5) };
     }
 
     public async Task<byte[]?> ResolveAsync(byte[] dnsWireQuery, CancellationToken ct)

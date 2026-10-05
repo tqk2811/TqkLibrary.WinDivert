@@ -1,4 +1,5 @@
 using System;
+using System.Net.Http;
 using Microsoft.Extensions.Logging;
 
 namespace TqkLibrary.WinDivert.SecureDns;
@@ -15,4 +16,7 @@ public sealed class DohResolverFactory : IDnsResolverFactory
 
     public IDnsResolver Create(Uri? endpoint = null, TimeSpan? timeout = null)
         => new DohResolver(_loggerFactory.CreateLogger<DohResolver>(), endpoint, timeout);
+
+    public IDnsResolver Create(HttpMessageHandler handler, bool disposeHandler, Uri? endpoint = null, TimeSpan? timeout = null)
+        => new DohResolver(_loggerFactory.CreateLogger<DohResolver>(), handler, disposeHandler, endpoint, timeout);
 }
