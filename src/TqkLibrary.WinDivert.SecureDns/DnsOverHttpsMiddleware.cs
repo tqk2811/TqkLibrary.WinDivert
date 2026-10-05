@@ -1,9 +1,11 @@
 using System;
+using System.Diagnostics;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.WinDivert.Flow;
+using TqkLibrary.WinDivert.SecureDns.Helpers;
 using TqkLibrary.WinDivert.Native;
 using TqkLibrary.WinDivert.Packet;
 using TqkLibrary.WinDivert.Pipeline;
@@ -49,6 +51,8 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
     private readonly int _maxPendingQueries;
     private int _pendingQueries;
     private int _deciderThrewLogged;
+    // Plain-DNS fallbacks can come once per query while an endpoint is down: one warning per interval.
+    private readonly LogThrottle _fallbackThrottle = new LogThrottle(TimeSpan.FromSeconds(30));
     private readonly DnsInterceptScope _scope;
     private readonly DnsReplyPacketBuilder _replyBuilder = new DnsReplyPacketBuilder();
 
@@ -128,10 +132,11 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
 
         IDnsResolver resolver;
         bool fallback;
+        string? queryName = null;
         if (_decider != null)
         {
             if (payloadLen <= 0) return next(ctx);
-            if (!TryDecide(ctx, p, payloadOffset, payloadLen, out DnsQueryDecision decision)) return next(ctx);
+            if (!TryDecide(ctx, p, payloadOffset, payloadLen, out DnsQueryDecision decision, out queryName)) return next(ctx);
             resolver = decision.Resolver!;
             fallback = decision.FallbackToPlainDnsOnFailure;
         }
@@ -156,12 +161,14 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             Interlocked.Decrement(ref _pendingQueries);
             if (fallback)
             {
-                _logger.LogTrace("DoH backlog full ({Max}), query from {Client}:{ClientPort} goes out as plain DNS",
-                    _maxPendingQueries, p.Source, p.SourcePort);
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("DoH backlog full ({Max}), query {Query} from {Client}:{ClientPort} goes out as plain DNS",
+                        _maxPendingQueries, queryName, p.Source, p.SourcePort);
                 return next(ctx);
             }
-            _logger.LogTrace("DoH backlog full ({Max}), SERVFAIL for query from {Client}:{ClientPort}",
-                _maxPendingQueries, p.Source, p.SourcePort);
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("DoH backlog full ({Max}), SERVFAIL for query {Query} from {Client}:{ClientPort}",
+                    _maxPendingQueries, queryName, p.Source, p.SourcePort);
             byte[]? servFail = DnsServFail.Build(CopyPayload(ctx, payloadOffset, payloadLen));
             ReplyTarget excess = CaptureReplyTarget(ctx, p);
             ctx.Drop();
@@ -188,6 +195,7 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             original = new OriginalQuery(packet, ctx.Address);
         }
         CancellationToken token = ctx.CancellationToken;
+        long startedAt = Stopwatch.GetTimestamp();
 
         // Swallow the original query; the resolved answer is injected later (on failure a SERVFAIL,
         // or the original query itself with fallback).
@@ -195,7 +203,7 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
 
         _ = Task.Run(async () =>
         {
-            try { await ResolveAndInjectAsync(resolver, query, target, original, token).ConfigureAwait(false); }
+            try { await ResolveAndInjectAsync(resolver, query, target, original, queryName, startedAt, token).ConfigureAwait(false); }
             finally { Interlocked.Decrement(ref _pendingQueries); }
         });
         return Task.CompletedTask;
@@ -203,9 +211,10 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
 
     // Asks the decider about one query. False means let it through: decided so, unparseable, or
     // the decider threw — a broken decider must not take the machine's DNS down with it.
-    private bool TryDecide(PacketContext ctx, ParsedPacket p, int payloadOffset, int payloadLen, out DnsQueryDecision decision)
+    private bool TryDecide(PacketContext ctx, ParsedPacket p, int payloadOffset, int payloadLen, out DnsQueryDecision decision, out string? queryName)
     {
         decision = DnsQueryDecision.Pass;
+        queryName = null;
         if (!_parser.TryReadQuestion(ctx.Buffer, payloadOffset, payloadLen, out string name, out ushort type))
             return false;
 
@@ -223,6 +232,7 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             decision = DnsQueryDecision.Pass;
         }
         if (decision.IsPass) return false;
+        queryName = info.QueryName;
 
         // Safety net: a resolver must never be asked for its own endpoint's name, or its lookup of
         // that name would wait on itself. Let that query through to the OS resolver's real server.
@@ -237,7 +247,8 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
     }
 
     private async Task ResolveAndInjectAsync(
-        IDnsResolver resolver, byte[] query, ReplyTarget target, OriginalQuery? original, CancellationToken token)
+        IDnsResolver resolver, byte[] query, ReplyTarget target, OriginalQuery? original,
+        string? queryName, long startedAt, CancellationToken token)
     {
         try { await _concurrency.WaitAsync(token).ConfigureAwait(false); }
         catch (OperationCanceledException) { return; }
@@ -245,6 +256,7 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         try
         {
             byte[]? response = null;
+            string failure = "no answer";
             try
             {
                 response = await resolver.ResolveAsync(query, token).ConfigureAwait(false);
@@ -254,27 +266,40 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             {
                 // The caller disposed the resolver while this query was in flight: an ordinary
                 // failure (fallback or SERVFAIL below), not worth a warning.
+                failure = "resolver disposed";
                 _logger.LogDebug(ex, "DoH resolver was disposed during the lookup for {Client}:{ClientPort}", target.ClientIp, target.ClientPort);
             }
             catch (Exception ex)
             {
+                failure = ex.GetType().Name + ": " + ex.Message;
                 _logger.LogWarning(ex, "DoH resolve failed for {Client}:{ClientPort}", target.ClientIp, target.ClientPort);
             }
 
+            bool servFailed = false;
             if (response == null || response.Length == 0)
             {
                 if (original != null)
                 {
                     // Fallback: the query goes on to its real server as if it had never been taken.
                     bool sent = target.Injector.Inject(original.Packet, original.Packet.Length, original.Address);
-                    _logger.LogDebug("{Client}:{ClientPort} sent out as plain DNS (DoH gave no answer), inject={Injected}",
-                        target.ClientIp, target.ClientPort, sent);
+                    if (_fallbackThrottle.TryEnter(out int heldBack))
+                    {
+                        _logger.LogWarning(
+                            "DoH gave no answer ({Reason}) via {Endpoint}; queries sent as plain DNS ({HeldBack} more not logged)",
+                            failure, resolver.Endpoint, heldBack);
+                    }
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("{Client}:{ClientPort} {Query} fell back to plain DNS after {Ms} ms ({Reason}), inject={Injected}",
+                            target.ClientIp, target.ClientPort, queryName, ElapsedMs(startedAt), failure, sent);
                     return;
                 }
                 // Fail fast: an immediate SERVFAIL lets the client move on instead of timing out.
+                servFailed = true;
                 response = DnsServFail.Build(query);
                 if (response == null) return;
-                _logger.LogDebug("{Client}:{ClientPort} answered with SERVFAIL (DoH gave no answer)", target.ClientIp, target.ClientPort);
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("{Client}:{ClientPort} {Query} SERVFAIL after {Ms} ms ({Reason})",
+                        target.ClientIp, target.ClientPort, queryName, ElapsedMs(startedAt), failure);
             }
             else if (_reverseDns != null)
             {
@@ -283,6 +308,9 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             }
 
             InjectReply(response, target);
+            if (!servFailed && _logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("{Client}:{ClientPort} {Query} answered in {Ms} ms ({Bytes} B)",
+                    target.ClientIp, target.ClientPort, queryName, ElapsedMs(startedAt), response.Length);
         }
         catch (Exception ex)
         {
@@ -293,6 +321,9 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             _concurrency.Release();
         }
     }
+
+    private static double ElapsedMs(long startedAt)
+        => (Stopwatch.GetTimestamp() - startedAt) * 1000.0 / Stopwatch.Frequency;
 
     private void InjectReply(byte[] response, ReplyTarget target)
     {
