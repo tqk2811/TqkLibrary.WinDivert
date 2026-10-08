@@ -101,6 +101,8 @@ public sealed class TcpRelayServer : ITcpRelayServer
             try
             {
                 client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                // Nagle would hold a game's small writes for up to a delayed-ACK; relay as soon as written.
+                client.NoDelay = true;
                 IPEndPoint? rep = client.Client.RemoteEndPoint as IPEndPoint;
                 _logger.LogTrace("accepted[{Family}] from {Remote}", tag, rep);
             }

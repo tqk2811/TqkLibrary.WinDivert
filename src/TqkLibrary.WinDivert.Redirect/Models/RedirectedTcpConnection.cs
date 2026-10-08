@@ -71,7 +71,8 @@ public sealed class RedirectedTcpConnection : IDisposable
     public async Task RelayDirectAsync(CancellationToken ct = default)
     {
         if (_directUpstream != null) throw new InvalidOperationException("Direct upstream already opened");
-        var upstream = new TcpClient();
+        // Nagle would hold a game's small writes for up to a delayed-ACK; relay as soon as written.
+        var upstream = new TcpClient { NoDelay = true };
         _directUpstream = upstream;
         await upstream.ConnectAsync(OriginalDestination.Address, OriginalDestination.Port).ConfigureAwait(false);
         await RelayToAsync(upstream.GetStream(), ct).ConfigureAwait(false);
