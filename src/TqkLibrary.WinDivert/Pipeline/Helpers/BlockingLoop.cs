@@ -58,7 +58,14 @@ public static class BlockingLoop
                 // spends its life blocked in the driver, not spinning. The thread is ours alone
                 // (LongRunning), so the priority does not leak into anything else.
                 Thread.CurrentThread.Priority = ThreadPriority.Highest;
+                // Measured with every core busy at Normal: one packet per 10s still waited 20-30ms
+                // (a scheduler quantum) before the pump ran. TimeCritical (15) ranks above every
+                // non-realtime thread of any process, whatever MMCSS manages to do on top.
+                if (latencyCritical && !SetThreadPriority(GetCurrentThread(), ThreadPriorityTimeCritical))
+                    logger?.LogWarning("could not raise the pump thread to TimeCritical, win32={Win32}", Marshal.GetLastWin32Error());
                 IntPtr mmcss = latencyCritical ? EnterMmcss(logger) : IntPtr.Zero;
+                if (latencyCritical)
+                    logger?.LogDebug("pump thread priority={Priority} mmcss={Mmcss}", GetThreadPriority(GetCurrentThread()), mmcss != IntPtr.Zero);
                 try
                 {
                     loop();
@@ -104,6 +111,17 @@ public static class BlockingLoop
     }
 
     private const int AvrtPriorityHigh = 1;
+    private const int ThreadPriorityTimeCritical = 15;
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentThread();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetThreadPriority(IntPtr thread, int priority);
+
+    [DllImport("kernel32.dll")]
+    private static extern int GetThreadPriority(IntPtr thread);
 
     [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
