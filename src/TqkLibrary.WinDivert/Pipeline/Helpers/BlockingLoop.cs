@@ -43,6 +43,15 @@ public static class BlockingLoop
         // LongRunning is the documented way to ask the scheduler for a thread instead of a pool
         // worker, and it keeps the Task the existing teardown paths wait on.
         return Task.Factory.StartNew(
-            loop, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            () =>
+            {
+                // Every packet of the diverted traffic waits on this thread, so on a busy machine
+                // it must not queue behind ordinary work. Highest is safe here because the loop
+                // spends its life blocked in the driver, not spinning. The thread is ours alone
+                // (LongRunning), so the priority does not leak into anything else.
+                Thread.CurrentThread.Priority = ThreadPriority.Highest;
+                loop();
+            },
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 }
