@@ -104,6 +104,16 @@ public class RedirectFilterTests
         Assert.Equal("ip and (tcp or udp) and not impostor and ((outbound and not loopback) or udp.SrcPort == 53)", filter);
     }
 
+    [Fact]
+    public void TheTcpEgressHandleLeavesUdpAndDnsAnswersToTheUdpOne()
+    {
+        string tcpFilter = RedirectFilter.BuildEgress(ipv6: false, tcp: true, udp: false, sniffDnsAnswers: false);
+        string udpFilter = RedirectFilter.BuildEgress(ipv6: false, tcp: false, udp: true, sniffDnsAnswers: true);
+
+        Assert.Equal("ip and (tcp) and not impostor and ((outbound and not loopback))", tcpFilter);
+        Assert.Equal("ip and (udp) and not impostor and ((outbound and not loopback) or udp.SrcPort == 53)", udpFilter);
+    }
+
     [Theory]
     [InlineData(false, "ip")]
     [InlineData(true, "ipv6")]

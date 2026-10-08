@@ -24,6 +24,9 @@ namespace TqkLibrary.WinDivert.Redirect;
 /// redirected process downloads — large loopback segments, each rewritten and re-checksummed — and
 /// on one thread every unrelated application's egress packet queued behind those bursts. Measured
 /// while browsing: unrelated packets waited ~2ms on average for a pump that was busy ~2% of the time.
+/// The egress leg is split again by protocol (<see cref="BuildEgress"/> once with TCP only, once
+/// with UDP only): a browser's QUIC bursts made TCP packets of other applications wait 13–17ms on
+/// average behind them.
 /// </para>
 /// </remarks>
 public static class RedirectFilter

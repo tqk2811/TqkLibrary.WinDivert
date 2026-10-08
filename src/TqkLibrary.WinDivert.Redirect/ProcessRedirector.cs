@@ -49,6 +49,9 @@ public sealed class ProcessRedirector : IProcessRedirector
     // The reply legs of the redirect pumps, on handles of their own — see RedirectFilter.
     private IPacketPump? _ipv4ReplyPump;
     private IPacketPump? _ipv6ReplyPump;
+    // The TCP half of a split egress leg; _ipv4Pump / _ipv6Pump then carry its UDP half.
+    private IPacketPump? _ipv4TcpPump;
+    private IPacketPump? _ipv6TcpPump;
     private IDnsResolver? _dnsResolver;
     private bool _dnsLookupStarted;
 
@@ -300,9 +303,17 @@ public sealed class ProcessRedirector : IProcessRedirector
         if (SplitsReplyLeg)
             _ipv4ReplyPump = StartRelayReplyPump("ipv4-reply", ipv6: false, tracker, natPorts, ports.Tcp, ports.Udp);
 
+        // Egress split by protocol: TCP on a NAT-only handle of its own, so a process nothing
+        // redirects does not queue behind a browser's QUIC bursts; the rest below is the UDP half.
+        if (SplitsReplyLeg)
+        {
+            _ipv4TcpPump = StartEgressTcpPump("ipv4-tcp", ipv6: false, tracker, natPorts);
+            if (!CapturesUdp) return;
+        }
+
         // Only what a stage on this handle can act on — see RedirectFilter.
         string filter = SplitsReplyLeg
-            ? RedirectFilter.BuildEgress(ipv6: false, WantsTcp, CapturesUdp, _options.EnableDnsSniff)
+            ? RedirectFilter.BuildEgress(ipv6: false, tcp: false, udp: true, _options.EnableDnsSniff)
             : BuildRedirectFilter(ipv6: false, ports.Tcp, ports.Udp);
         _logger.LogDebug("opening IPv4 NETWORK handle, filter={Filter}", filter);
         IWinDivertHandle handle = OpenNetworkHandle(filter);
@@ -324,7 +335,7 @@ public sealed class ProcessRedirector : IProcessRedirector
         builder.Use(CreateNatMiddleware(tracker, natPorts));
         AddTrailingMiddlewares(builder, tracker);
 
-        _ipv4Pump = _pumpFactory.Create("ipv4", handle, builder.Build(), CreateBypass(tracker, natPorts));
+        _ipv4Pump = _pumpFactory.Create(SplitsReplyLeg ? "ipv4-udp" : "ipv4", handle, builder.Build(), CreateBypass(tracker, natPorts));
         _ipv4Pump.Stopped += OnPumpStopped;
         _ipv4Pump.Start();
     }
@@ -337,8 +348,14 @@ public sealed class ProcessRedirector : IProcessRedirector
         if (SplitsReplyLeg)
             _ipv6ReplyPump = StartRelayReplyPump("ipv6-reply", ipv6: true, tracker, natPorts, ports.TcpV6, ports.UdpV6);
 
+        if (SplitsReplyLeg)
+        {
+            _ipv6TcpPump = StartEgressTcpPump("ipv6-tcp", ipv6: true, tracker, natPorts);
+            if (!CapturesUdp) return;
+        }
+
         string filter = SplitsReplyLeg
-            ? RedirectFilter.BuildEgress(ipv6: true, WantsTcp, CapturesUdp, _options.EnableDnsSniff)
+            ? RedirectFilter.BuildEgress(ipv6: true, tcp: false, udp: true, _options.EnableDnsSniff)
             : BuildRedirectFilter(ipv6: true, ports.TcpV6, ports.UdpV6);
         _logger.LogDebug("opening IPv6 NETWORK handle for redirect, filter={Filter}", filter);
         IWinDivertHandle handle = OpenNetworkHandle(filter);
@@ -355,9 +372,27 @@ public sealed class ProcessRedirector : IProcessRedirector
         builder.Use(CreateNatMiddleware(tracker, natPorts));
         AddTrailingMiddlewares(builder, tracker);
 
-        _ipv6Pump = _pumpFactory.Create("ipv6", handle, builder.Build(), CreateBypass(tracker, natPorts));
+        _ipv6Pump = _pumpFactory.Create(SplitsReplyLeg ? "ipv6-udp" : "ipv6", handle, builder.Build(), CreateBypass(tracker, natPorts));
         _ipv6Pump.Stopped += OnPumpStopped;
         _ipv6Pump.Start();
+    }
+
+    // The TCP half of a split egress leg. Only NAT: DNS sniffing, DoH and the UDP block act on UDP
+    // alone. A NAT instance of its own over the shared table, like the reply leg.
+    private IPacketPump? StartEgressTcpPump(string name, bool ipv6, ISocketTracker tracker, RelayPorts natPorts)
+    {
+        if (!WantsTcp) return null;
+        string filter = RedirectFilter.BuildEgress(ipv6, tcp: true, udp: false, sniffDnsAnswers: false);
+        _logger.LogDebug("opening {Pump} NETWORK handle, filter={Filter}", name, filter);
+        IWinDivertHandle handle = OpenNetworkHandle(filter);
+
+        var builder = new PacketPipelineBuilder();
+        builder.Use(CreateNatMiddleware(tracker, natPorts));
+
+        IPacketPump pump = _pumpFactory.Create(name, handle, builder.Build(), CreateBypass(tracker, natPorts));
+        pump.Stopped += OnPumpStopped;
+        pump.Start();
+        return pump;
     }
 
     // A caller's own stages may want any packet on one handle, so with them the legs stay together.
@@ -522,6 +557,8 @@ public sealed class ProcessRedirector : IProcessRedirector
         _udpRelay?.Dispose();
         _ipv6Pump?.Dispose();
         _ipv4Pump?.Dispose();
+        _ipv6TcpPump?.Dispose();
+        _ipv4TcpPump?.Dispose();
         _ipv6ReplyPump?.Dispose();
         _ipv4ReplyPump?.Dispose();
         _tracker?.Dispose();
