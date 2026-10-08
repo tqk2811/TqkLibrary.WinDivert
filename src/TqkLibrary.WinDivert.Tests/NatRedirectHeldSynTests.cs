@@ -194,6 +194,25 @@ public class NatRedirectHeldSynTests
         Assert.Equal(0, injector.Count);
     }
 
+    // Any other untracked packet is passed on at once: the kernel sweep is only requested in the
+    // background, never run on the pump, where it stalled every other packet of the machine.
+    [Fact]
+    public async Task AnUntrackedMidFlowSegmentPassesWithoutASweepOnThePump()
+    {
+        var tracker = new FakeTracker();
+        var injector = new RecordingInjector();
+        PacketContext ctx = Syn(50006, injector);
+        ctx.Buffer[33] = 0x10;  // ACK, not SYN
+        ctx.Packet = PacketParser.Default.TryParse(ctx.Buffer, ctx.Length);
+
+        bool passed = await InvokeAsync(Create(new NatTable(), tracker), ctx);
+
+        Assert.True(passed);
+        Assert.Equal(0, tracker.SyncReconciles);
+        Assert.Equal(1, tracker.BackgroundRequests);
+        Assert.Equal(0, injector.Count);
+    }
+
     private static FlowKey Key(ushort localPort) => new FlowKey(6, Local, localPort, Remote, RemotePort);
 
     private static NatRedirectMiddleware Create(NatTable nat, FakeTracker tracker)
@@ -265,6 +284,8 @@ public class NatRedirectHeldSynTests
         private readonly ConcurrentDictionary<FlowKey, byte> _tracked = new();
         private readonly CoalescedSweep _sweep;
         private int _sweeps;
+        private int _syncReconciles;
+        private int _backgroundRequests;
 
         public FakeTracker() { _sweep = new CoalescedSweep(Sweep); }
 
@@ -273,6 +294,8 @@ public class NatRedirectHeldSynTests
         public bool ReportsNothingAdded { get; init; }
         public Action? OnSweep { get; set; }
         public int Sweeps => Volatile.Read(ref _sweeps);
+        public int SyncReconciles => Volatile.Read(ref _syncReconciles);
+        public int BackgroundRequests => Volatile.Read(ref _backgroundRequests);
 
         public void Track(FlowKey key) => _tracked[key] = 0;
 
@@ -314,6 +337,7 @@ public class NatRedirectHeldSynTests
         // The old synchronous path: one sweep per call, reporting what it found.
         public bool TryReconcileFromKernel(out int tcpAdded, out int udpAdded, bool force = false)
         {
+            Interlocked.Increment(ref _syncReconciles);
             int before = _tracked.Count;
             Sweep();
             tcpAdded = ReportsNothingAdded ? 0 : _tracked.Count - before;
@@ -323,6 +347,8 @@ public class NatRedirectHeldSynTests
 
         public Task ReconcileFromKernelAsync(CancellationToken cancellationToken = default)
             => _sweep.RequestAsync(cancellationToken);
+
+        public void RequestReconcileFromKernel() => Interlocked.Increment(ref _backgroundRequests);
 
         public void Dispose() { }
     }

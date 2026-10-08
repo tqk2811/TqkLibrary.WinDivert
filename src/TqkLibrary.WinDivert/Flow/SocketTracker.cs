@@ -503,6 +503,15 @@ public sealed class SocketTracker : ISocketTracker
     public Task ReconcileFromKernelAsync(CancellationToken cancellationToken = default)
         => _coalescedReconcile.RequestAsync(cancellationToken);
 
+    // The throttle is checked here, on the caller's thread, so a flood of unmatched packets from
+    // the whole machine queues one sweep per interval rather than one work item per packet.
+    public void RequestReconcileFromKernel()
+    {
+        if (Environment.TickCount - Volatile.Read(ref _lastReconcileTicks) < ReconcileMinIntervalMs) return;
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static t => t.TryReconcileFromKernel(out _, out _, force: false), this, preferLocal: false);
+    }
+
     /// <summary>
     /// Reads socket events off one handle until it is shut down, and closes the handle on the way
     /// out.

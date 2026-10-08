@@ -79,4 +79,17 @@ public interface ISocketTracker : IDisposable
     /// </remarks>
     Task ReconcileFromKernelAsync(CancellationToken cancellationToken = default)
         => Task.Run(() => { TryReconcileFromKernel(out _, out _, force: true); }, cancellationToken);
+
+    /// <summary>
+    /// The throttled reconcile, queued off the caller's thread and never waited for. For packets
+    /// whose answer cannot be held back for (a non-SYN TCP segment, a UDP datagram): the packet
+    /// goes on now, and a flow the sweep finds is captured from its next packet on.
+    /// </summary>
+    /// <remarks>
+    /// The default queues one throttled sweep per call; <see cref="SocketTracker"/> checks the
+    /// throttle before queueing anything.
+    /// </remarks>
+    void RequestReconcileFromKernel()
+        => ThreadPool.UnsafeQueueUserWorkItem(
+            static t => t.TryReconcileFromKernel(out _, out _, force: false), this, preferLocal: false);
 }

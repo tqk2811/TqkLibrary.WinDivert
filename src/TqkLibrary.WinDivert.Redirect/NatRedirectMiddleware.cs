@@ -179,13 +179,14 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
 
         if (!tracked)
         {
-            _tracker.TryReconcileFromKernel(out _, out _, force: false);
+            // Any other untracked packet — a UDP datagram, a mid-flow TCP segment — is not waited
+            // for: most of them belong to processes nobody tracks, and a synchronous sweep here
+            // stalled the whole machine's traffic behind a read of the kernel tables. The sweep
+            // runs in the background (throttled); a flow it finds is captured from its next packet.
+            _tracker.RequestReconcileFromKernel();
 
-            // Re-check unconditionally, NOT only when the reconcile added something. The two pumps
-            // run in parallel, so the SOCKET pump often records this very flow in the microseconds
-            // between the lookup above and this line — and then the reconcile reports "nothing
-            // new" precisely because the flow is already there. Trusting that return value cost
-            // every first connection its capture.
+            // Re-check anyway: the two pumps run in parallel, so the SOCKET pump often records this
+            // very flow in the microseconds since the lookup above.
             tracked = isTcp
                 ? _tracker.IsTrackedTcp(tcpKey)
                 : _tracker.IsTrackedUdp(srcIp, srcPort);
