@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace TqkLibrary.WinDivert.Flow.Interfaces;
 
@@ -65,4 +67,16 @@ public interface ISocketTracker : IDisposable
     /// decides whether a brand-new connection is captured or lost for its whole lifetime).
     /// </summary>
     bool TryReconcileFromKernel(out int tcpAdded, out int udpAdded, bool force = false);
+
+    /// <summary>
+    /// The same reconcile, unthrottled, off the caller's thread: completes once a sweep that
+    /// STARTED after this call has finished. Concurrent callers share sweeps, so a burst of SYNs
+    /// costs one or two sweeps rather than one each. Callers re-check the flow afterwards rather
+    /// than trusting any "added" count — see the NAT stage. Cancelling abandons only the wait.
+    /// </summary>
+    /// <remarks>
+    /// The default runs one sweep per call; <see cref="SocketTracker"/> coalesces them.
+    /// </remarks>
+    Task ReconcileFromKernelAsync(CancellationToken cancellationToken = default)
+        => Task.Run(() => { TryReconcileFromKernel(out _, out _, force: true); }, cancellationToken);
 }

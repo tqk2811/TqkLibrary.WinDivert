@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.WinDivert.Packet;
@@ -64,6 +65,9 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     private readonly EscapedFlowBlocklist? _flowsToReset;
     private readonly TcpResetPacketBuilder _resetBuilder = new TcpResetPacketBuilder();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<FlowKey, byte> _resetFlows = new();
+
+    // Untracked SYNs whose decision is running off the pump — see HoldSynForReconcile.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<FlowKey, byte> _pendingSyns = new();
 
     public NatRedirectMiddleware(
         INatTable nat,
@@ -150,9 +154,32 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         // connection and losing it for its whole lifetime. Later packets keep the throttle, since
         // by then the answer cannot change anything (see HandleEscapedFlow).
         bool isSyn = isTcp && IsHandshakeStart(p);
+
+        // An untracked SYN is decided OFF the pump thread. Its unthrottled kernel sweep used to run
+        // right here, and the pump handles every captured packet of the machine: each new
+        // connection anywhere stalled everyone else's packets (a game's included) behind a full
+        // read of the kernel tables. The SYN is held — dropped now, re-injected once the sweep has
+        // answered — and concurrent SYNs share sweeps. See HoldSynForReconcile.
+        // A retransmission while the first SYN is still held is dropped even if the flow has
+        // become tracked meanwhile: the held copy may already have decided "unchanged", and a
+        // second copy rewritten here would send one 4-tuple's handshake to two places.
+        if (isSyn && _pendingSyns.ContainsKey(tcpKey))
+        {
+            ctx.Drop();
+            return Task.CompletedTask;
+        }
+
+        // A SYN outside the port filter is passed through whatever the sweep says, so it is not
+        // worth holding.
+        if (!tracked && isSyn)
+        {
+            if (!PassesPortFilter(dstPort)) return next(ctx);
+            return HoldSynForReconcile(ctx, tcpKey, proto, isIpv6, expectedRelay);
+        }
+
         if (!tracked)
         {
-            _tracker.TryReconcileFromKernel(out _, out _, force: isSyn);
+            _tracker.TryReconcileFromKernel(out _, out _, force: false);
 
             // Re-check unconditionally, NOT only when the reconcile added something. The two pumps
             // run in parallel, so the SOCKET pump often records this very flow in the microseconds
@@ -162,7 +189,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             tracked = isTcp
                 ? _tracker.IsTrackedTcp(tcpKey)
                 : _tracker.IsTrackedUdp(srcIp, srcPort);
-            if (tracked)
+            if (tracked && _logger.IsEnabled(LogLevel.Trace))
                 _logger.LogTrace("  egress tracked on re-check (the socket event landed meanwhile)");
         }
 
@@ -171,14 +198,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
                 tracked, _tracker.TcpSnapshot.Count, _nat.Count);
         if (!tracked) return next(ctx);
 
-        // Destination-port whitelist: tracked packets whose dstPort is outside the configured set
-        // bypass NAT entirely and flow straight to the original destination. This means they DO
-        // NOT traverse the relay/proxy — the caller opts into that trade-off explicitly.
-        if (_dstPortFilter != null && !_dstPortFilter.Contains(dstPort))
-        {
-            _logger.LogTrace("  not redirecting, dstPort={DstPort} is outside the filter (passthrough)", dstPort);
-            return next(ctx);
-        }
+        if (!PassesPortFilter(dstPort)) return next(ctx);
 
         // A TCP flow may only be captured from its SYN. If the handshake already started without
         // us — the process was attached mid-flight, or the SOCKET event lost the race against the
@@ -205,14 +225,44 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         if (!isTcp && _shouldRedirectUdp != null && _nat.Find(proto, srcPort, isIpv6) == null
             && !AsksToRedirect(flowPid, dstIp, dstPort, isIpv6))
         {
-            _logger.LogTrace("  not redirecting udp {Source}:{SourcePort} -> {Destination}:{DestinationPort}, the host routes it direct (passthrough)",
-                srcIp, srcPort, dstIp, dstPort);
+            if (_logger.IsEnabled(LogLevel.Trace))
+                _logger.LogTrace("  not redirecting udp {Source}:{SourcePort} -> {Destination}:{DestinationPort}, the host routes it direct (passthrough)",
+                    srcIp, srcPort, dstIp, dstPort);
             return next(ctx);
         }
 
+        RedirectToRelay(p, ref ctx.Address, proto, isTcp, isIpv6, expectedRelay, flowPid);
+        ctx.MarkModified();
+        return Task.CompletedTask;
+    }
+
+    // Destination-port whitelist: tracked packets whose dstPort is outside the configured set
+    // bypass NAT entirely and flow straight to the original destination. This means they DO NOT
+    // traverse the relay/proxy — the caller opts into that trade-off explicitly.
+    private bool PassesPortFilter(ushort dstPort)
+    {
+        if (_dstPortFilter == null || _dstPortFilter.Contains(dstPort)) return true;
+        if (_logger.IsEnabled(LogLevel.Trace))
+            _logger.LogTrace("  not redirecting, dstPort={DstPort} is outside the filter (passthrough)", dstPort);
+        return false;
+    }
+
+    // The redirect itself, shared by the pump's own path and the held-SYN path: records the flow
+    // in the NAT table and rewrites the packet (in its buffer) and its address onto the relay.
+    // The caller decides whether the packet goes out — MarkModified on the pump, Inject off it —
+    // and either way WinDivert recomputes the checksums before sending.
+    private void RedirectToRelay(
+        ParsedPacket p, ref WinDivertAddress address,
+        byte proto, bool isTcp, bool isIpv6, int expectedRelay, uint flowPid)
+    {
+        IPAddress srcIp = p.Source;
+        ushort srcPort = p.SourcePort;
+        IPAddress dstIp = p.Destination;
+        ushort dstPort = p.DestinationPort;
+
         // Store the real-interface IfIdx so the reply path can reinject on the same interface.
         var entry = new NatEntry(flowPid, proto, srcIp, srcPort, dstIp, dstPort,
-            ctx.Address.Network.IfIdx, ctx.Address.Network.SubIfIdx);
+            address.Network.IfIdx, address.Network.SubIfIdx);
         // Only the flow's first packet is worth a line. Logging every packet of every flow put a
         // string format, a locked reverse-name lookup and a file write on the pump thread for each
         // one — thousands a second on a browser, and the pump is what the whole machine's traffic
@@ -223,7 +273,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             _logger.LogDebug("  nat {Protocol} srcPort={SrcPort} -> {Destination}:{DestinationPort}{Name} ifIdx={IfIdx}",
                 isTcp ? "tcp" : "udp", srcPort, dstIp, dstPort,
                 _dnsLookup?.Resolve(dstIp) is string name ? $" ({name})" : "",
-                ctx.Address.Network.IfIdx);
+                address.Network.IfIdx);
         }
 
         IPAddress loopback = isIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
@@ -233,12 +283,98 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         // Re-inject at the WFP OUTBOUND hook on the loopback interface. The kernel handles both
         // halves of the loopback transmission and delivers the SYN to the relay's listener.
         // Switching to Outbound=false here makes WFP silently drop the packet (no listener match).
-        ctx.Address.Loopback = true;
-        ctx.Address.Network.IfIdx = 1;
-        ctx.Address.Network.SubIfIdx = 0;
-        _logger.LogTrace("  -> redirect {Loopback}:{SrcPort} to {Loopback}:{RelayPort}", loopback, srcPort, loopback, expectedRelay);
-        ctx.MarkModified();
+        address.Loopback = true;
+        address.Network.IfIdx = 1;
+        address.Network.SubIfIdx = 0;
+        if (_logger.IsEnabled(LogLevel.Trace))
+            _logger.LogTrace("  -> redirect {Loopback}:{SrcPort} to {Loopback}:{RelayPort}", loopback, srcPort, loopback, expectedRelay);
+    }
+
+    // An untracked SYN, decided off the pump thread.
+    //
+    // The packet is copied out of the pump's buffer (which holds the next packet by the time the
+    // task runs) and dropped; the task waits for a kernel sweep that began AFTER the SYN was
+    // captured — connect() registered the socket before the SYN existed, so that sweep cannot miss
+    // a tracked flow — then re-checks and injects either the redirected SYN or the original bytes,
+    // untouched. The SYN is late by one sweep, which is what it used to cost on the pump anyway,
+    // except that nobody else waits behind it any more.
+    //
+    // While a flow's SYN is held, a retransmission of it is simply dropped: the held one will go
+    // out, and a second copy deciding in parallel could inject twice. Injected packets carry the
+    // impostor flag, which the handle's filter excludes, so they are not captured again.
+    private Task HoldSynForReconcile(PacketContext ctx, FlowKey key, byte proto, bool isIpv6, int expectedRelay)
+    {
+        ctx.Drop();
+        if (!_pendingSyns.TryAdd(key, 0))
+        {
+            if (_logger.IsEnabled(LogLevel.Trace))
+                _logger.LogTrace("  dropping a retransmitted SYN for {Flow}, the first one is still held", key);
+            return Task.CompletedTask;
+        }
+
+        byte[] packet = new byte[ctx.Length];
+        Buffer.BlockCopy(ctx.Buffer, 0, packet, 0, ctx.Length);
+        WinDivertAddress address = ctx.Address;
+        IPacketInjector injector = ctx.Injector;
+        CancellationToken token = ctx.CancellationToken;
+
+        _ = Task.Run(() => DecideHeldSynAsync(packet, address, injector, key, proto, isIpv6, expectedRelay, token));
         return Task.CompletedTask;
+    }
+
+    private async Task DecideHeldSynAsync(
+        byte[] packet, WinDivertAddress address, IPacketInjector injector,
+        FlowKey key, byte proto, bool isIpv6, int expectedRelay, CancellationToken token)
+    {
+        try
+        {
+            try
+            {
+                await _tracker.ReconcileFromKernelAsync(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return;  // the pump is gone; nothing may be injected for it
+            }
+            catch (Exception ex)
+            {
+                // Decide on what the tracker knows anyway — the SOCKET event may well have landed.
+                _logger.LogWarning(ex, "kernel reconcile for the held SYN {Flow} failed", key);
+            }
+            if (token.IsCancellationRequested) return;
+
+            ParsedPacket? p = PacketParser.Default.TryParse(packet, packet.Length);
+
+            // Re-check unconditionally, never on the reconcile's "added" count: the SOCKET pump may
+            // have recorded the flow on its own while the sweep ran, and the sweep then reports
+            // "nothing new" precisely because the flow is already there.
+            bool redirected = false;
+            if (p != null && p.IsTcp && _tracker.IsTrackedTcp(key) && PassesPortFilter(p.DestinationPort))
+            {
+                uint flowPid = _tracker.TryGetTcpProcessId(key, out uint tcpPid) ? tcpPid : _rootProcessId;
+                RedirectToRelay(p, ref address, proto, isTcp: true, isIpv6, expectedRelay, flowPid);
+                redirected = true;
+            }
+
+            if (token.IsCancellationRequested) return;
+            bool sent = injector.Inject(packet, packet.Length, address);
+            if (_logger.IsEnabled(LogLevel.Trace))
+                _logger.LogTrace("  held SYN {Flow} decided off the pump: redirected={Redirected} injected={Injected}",
+                    key, redirected, sent);
+        }
+        catch (Exception ex) when (token.IsCancellationRequested)
+        {
+            // The handle closed between the last check and Inject: stopping, not a failure.
+            _logger.LogDebug(ex, "held SYN {Flow} not injected, the pump stopped", key);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "deciding the held SYN {Flow} failed; it is lost and the process will retransmit", key);
+        }
+        finally
+        {
+            _pendingSyns.TryRemove(key, out _);
+        }
     }
 
     private Task HandleRelayReply(PacketContext ctx, PacketDelegate next, ParsedPacket p, byte proto, bool isIpv6)
@@ -247,7 +383,8 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         NatEntry? entry = _nat.Find(proto, dstPort, isIpv6);
         if (entry == null)
         {
-            _logger.LogTrace("  reply candidate dstPort={DstPort} ipv6={IsIpv6} has no NAT entry", dstPort, isIpv6);
+            if (_logger.IsEnabled(LogLevel.Trace))
+                _logger.LogTrace("  reply candidate dstPort={DstPort} ipv6={IsIpv6} has no NAT entry", dstPort, isIpv6);
             return next(ctx);
         }
 
@@ -256,7 +393,8 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         // produce a spurious RST, so drop it.
         if (!ctx.Address.Outbound)
         {
-            _logger.LogTrace("  -> dropping the inbound loopback duplicate");
+            if (_logger.IsEnabled(LogLevel.Trace))
+                _logger.LogTrace("  -> dropping the inbound loopback duplicate");
             ctx.Drop();
             return Task.CompletedTask;
         }
@@ -269,9 +407,10 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         ctx.Address.Outbound = false;
         ctx.Address.Network.IfIdx = entry.IfIdx;
         ctx.Address.Network.SubIfIdx = entry.SubIfIdx;
-        _logger.LogTrace("  -> reply rewritten to {Source}:{SourcePort} -> {Destination}:{DestinationPort} ifIdx={IfIdx}",
-            entry.OriginalDestinationAddress, entry.OriginalDestinationPort,
-            entry.OriginalSourceAddress, entry.OriginalSourcePort, entry.IfIdx);
+        if (_logger.IsEnabled(LogLevel.Trace))
+            _logger.LogTrace("  -> reply rewritten to {Source}:{SourcePort} -> {Destination}:{DestinationPort} ifIdx={IfIdx}",
+                entry.OriginalDestinationAddress, entry.OriginalDestinationPort,
+                entry.OriginalSourceAddress, entry.OriginalSourcePort, entry.IfIdx);
         ctx.MarkModified();
         return Task.CompletedTask;
     }

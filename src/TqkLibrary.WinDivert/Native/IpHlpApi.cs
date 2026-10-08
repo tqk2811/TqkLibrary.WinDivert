@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Net;
@@ -125,12 +126,30 @@ internal static class IpHlpApi
         return found;
     }
 
-    // Copies one kernel table into managed memory. Returns null when the table cannot be read.
+    // Where the managed copies of the tables come from. A busy machine's TCP table is easily past
+    // the 85 KB large-object threshold, and a fresh array per sweep — four per reconcile, one
+    // reconcile per untracked SYN — meant a steady stream of LOH allocations and the gen-2
+    // collections that clean them up, pausing every thread including the packet pumps. A private
+    // pool (the shared one gives up above 1 MB on older runtimes) keeps a few arrays for reuse; it
+    // is rent/return rather than one cached buffer per table so a nested or concurrent read can
+    // never parse a buffer someone else is refilling.
+    private static readonly ArrayPool<byte> TablePool = ArrayPool<byte>.Create(64 * 1024 * 1024, 8);
+
+    // A pooled copy of one table. Array is null when the table could not be read; disposing it
+    // hands the array back to the pool, so nothing may hold on to it past the using block.
+    private readonly struct RentedTable : IDisposable
+    {
+        public byte[]? Array { get; }
+        public RentedTable(byte[]? array) { Array = array; }
+        public void Dispose() { if (Array != null) TablePool.Return(Array); }
+    }
+
+    // Copies one kernel table into managed memory. Array is null when the table cannot be read.
     //
     // The size is queried and then re-queried on ERROR_INSUFFICIENT_BUFFER: the table can grow
     // between the sizing call and the read on a machine that is opening connections, and treating
     // that as "no table" would silently lose every tracked flow for that sweep.
-    private static byte[]? ReadTable(bool tcp, int af, out int length)
+    private static RentedTable ReadTable(bool tcp, int af, out int length)
     {
         length = 0;
         int size = 0;
@@ -141,8 +160,8 @@ internal static class IpHlpApi
                 int probe = tcp
                     ? GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0)
                     : GetExtendedUdpTable(IntPtr.Zero, ref size, false, af, UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
-                if (probe != ERROR_INSUFFICIENT_BUFFER && probe != 0) return null;
-                if (size <= 0) return null;
+                if (probe != ERROR_INSUFFICIENT_BUFFER && probe != 0) return default;
+                if (size <= 0) return default;
             }
 
             // Ask for a little more than the driver reported, so the common "one more connection
@@ -155,19 +174,20 @@ internal static class IpHlpApi
                     ? GetExtendedTcpTable(buf, ref size, false, af, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_ALL, 0)
                     : GetExtendedUdpTable(buf, ref size, false, af, UDP_TABLE_CLASS.UDP_TABLE_OWNER_PID, 0);
                 if (ret == ERROR_INSUFFICIENT_BUFFER) continue;  // size now holds what it really needs
-                if (ret != 0) return null;
+                if (ret != 0) return default;
 
-                byte[] managed = new byte[size];
+                // Rented arrays may be longer than asked for; callers only look at [0, length).
+                byte[] managed = TablePool.Rent(size);
                 Marshal.Copy(buf, managed, 0, size);
                 length = size;
-                return managed;
+                return new RentedTable(managed);
             }
             finally
             {
                 Marshal.FreeHGlobal(buf);
             }
         }
-        return null;
+        return default;
     }
 
     // Row count plus the offset the rows start at, or false when the buffer is too short to hold
@@ -181,9 +201,9 @@ internal static class IpHlpApi
 
     private static void SnapshotTcp4(Func<uint, bool> wanted, Action<uint, TcpFlow> visit)
     {
-        byte[]? table = ReadTable(tcp: true, AF_INET, out int length);
-        if (table == null) return;
-        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        using RentedTable table = ReadTable(tcp: true, AF_INET, out int length);
+        if (table.Array == null) return;
+        ReadOnlySpan<byte> span = table.Array.AsSpan(0, length);
         if (!TryReadHeader(span, out int count)) return;
 
         for (int i = 0; i < count; i++)
@@ -206,9 +226,9 @@ internal static class IpHlpApi
 
     private static void SnapshotTcp6(Func<uint, bool> wanted, Action<uint, TcpFlow> visit)
     {
-        byte[]? table = ReadTable(tcp: true, AF_INET6, out int length);
-        if (table == null) return;
-        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        using RentedTable table = ReadTable(tcp: true, AF_INET6, out int length);
+        if (table.Array == null) return;
+        ReadOnlySpan<byte> span = table.Array.AsSpan(0, length);
         if (!TryReadHeader(span, out int count)) return;
 
         for (int i = 0; i < count; i++)
@@ -231,9 +251,9 @@ internal static class IpHlpApi
 
     private static void SnapshotUdp4(Func<uint, bool> wanted, Action<uint, UdpBind> visit)
     {
-        byte[]? table = ReadTable(tcp: false, AF_INET, out int length);
-        if (table == null) return;
-        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        using RentedTable table = ReadTable(tcp: false, AF_INET, out int length);
+        if (table.Array == null) return;
+        ReadOnlySpan<byte> span = table.Array.AsSpan(0, length);
         if (!TryReadHeader(span, out int count)) return;
 
         for (int i = 0; i < count; i++)
@@ -253,9 +273,9 @@ internal static class IpHlpApi
 
     private static void SnapshotUdp6(Func<uint, bool> wanted, Action<uint, UdpBind> visit)
     {
-        byte[]? table = ReadTable(tcp: false, AF_INET6, out int length);
-        if (table == null) return;
-        ReadOnlySpan<byte> span = table.AsSpan(0, length);
+        using RentedTable table = ReadTable(tcp: false, AF_INET6, out int length);
+        if (table.Array == null) return;
+        ReadOnlySpan<byte> span = table.Array.AsSpan(0, length);
         if (!TryReadHeader(span, out int count)) return;
 
         for (int i = 0; i < count; i++)

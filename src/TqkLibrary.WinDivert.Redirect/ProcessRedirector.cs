@@ -289,8 +289,8 @@ public sealed class ProcessRedirector : IProcessRedirector
 
     private void StartIpv4Pump(ISocketTracker tracker, RelayPorts ports)
     {
-        // `not impostor` avoids re-capturing packets we reinjected ourselves, which would loop.
-        string filter = $"ip and ({BuildProtoFilter(WantsTcp, CapturesUdp)}) and not impostor";
+        // Only what a stage on this handle can act on — see RedirectFilter.
+        string filter = BuildRedirectFilter(ipv6: false, ports.Tcp, ports.Udp);
         _logger.LogDebug("opening IPv4 NETWORK handle, filter={Filter}", filter);
         IWinDivertHandle handle = OpenNetworkHandle(filter);
 
@@ -320,7 +320,7 @@ public sealed class ProcessRedirector : IProcessRedirector
     // reaches the connection handler exactly like an IPv4 one.
     private void StartIpv6RedirectPump(ISocketTracker tracker, RelayPorts ports)
     {
-        string filter = $"ipv6 and ({BuildProtoFilter(WantsTcp, CapturesUdp)}) and not impostor";
+        string filter = BuildRedirectFilter(ipv6: true, ports.TcpV6, ports.UdpV6);
         _logger.LogDebug("opening IPv6 NETWORK handle for redirect, filter={Filter}", filter);
         IWinDivertHandle handle = OpenNetworkHandle(filter);
 
@@ -444,13 +444,11 @@ public sealed class ProcessRedirector : IProcessRedirector
         return handle;
     }
 
-    private static string BuildProtoFilter(bool tcp, bool udp)
-    {
-        if (tcp && udp) return "tcp or udp";
-        if (tcp) return "tcp";
-        if (udp) return "udp";
-        return "false";
-    }
+    private string BuildRedirectFilter(bool ipv6, int tcpRelayPort, int udpRelayPort)
+        => RedirectFilter.Build(
+            ipv6, WantsTcp, CapturesUdp, tcpRelayPort, udpRelayPort,
+            sniffDnsAnswers: _options.EnableDnsSniff,
+            captureEverything: _options.ConfigureNetworkPipeline != null);
 
     /// <remarks>
     /// The relays go down BEFORE the pumps, and the order is the whole point. Closing a relay

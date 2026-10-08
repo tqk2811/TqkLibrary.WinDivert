@@ -123,6 +123,9 @@ public sealed class SocketTracker : ISocketTracker
     // Cached so the per-sweep predicate does not allocate a delegate on the packet path.
     private readonly Func<uint, bool> _isTrackedPid;
 
+    // Shares kernel sweeps between concurrent ReconcileFromKernelAsync callers (a burst of SYNs).
+    private readonly CoalescedSweep _coalescedReconcile;
+
     public event Action<FlowKey>? TcpConnectEstablished;
     public event Action<FlowKey>? TcpConnectClosed;
     public event Action<IPAddress, ushort>? UdpBindAdded;
@@ -153,6 +156,7 @@ public sealed class SocketTracker : ISocketTracker
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _lastReconcileTicks = Environment.TickCount - ReconcileMinIntervalMs;
         _isTrackedPid = shouldTrackProcess is null ? _pidHandles.ContainsKey : IsAcceptedPid;
+        _coalescedReconcile = new CoalescedSweep(() => TryReconcileFromKernel(out _, out _, force: true));
     }
 
     /// <summary>True when this tracker listens to the whole machine and judges pid by pid.</summary>
@@ -494,6 +498,10 @@ public sealed class SocketTracker : ISocketTracker
             _logger.LogDebug("Reconcile added tcp={TcpAdded} udp={UdpAdded}", tcpAdded, udpAdded);
         return tcpAdded > 0 || udpAdded > 0;
     }
+
+    // TryReconcileFromKernel already logs and swallows its own failures, so the sweep never throws.
+    public Task ReconcileFromKernelAsync(CancellationToken cancellationToken = default)
+        => _coalescedReconcile.RequestAsync(cancellationToken);
 
     /// <summary>
     /// Reads socket events off one handle until it is shut down, and closes the handle on the way
