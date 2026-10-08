@@ -112,10 +112,11 @@ public sealed class PacketPump : IPacketPump
         byte[] buffer = new byte[RecvBufferSize];
         int stopError = 0;
         int failuresInARow = 0;
-        // Split by path, and for the full path also the pump's own work (recv returned → released),
+        // Split by path, each with the pump's own work (recv returned → released),
         // so a slow window says whether packets queued behind the pump or the pipeline itself is slow.
         long statsStart = Stopwatch.GetTimestamp();
         var fastLatency = new PumpLatencyStats(LatencyReportInterval, statsStart);
+        var fastWork = new PumpLatencyStats(LatencyReportInterval, statsStart);
         var fullLatency = new PumpLatencyStats(LatencyReportInterval, statsStart);
         var fullWork = new PumpLatencyStats(LatencyReportInterval, statsStart);
         bool logLatency = _logger.IsEnabled(LogLevel.Debug);
@@ -156,8 +157,10 @@ public sealed class PacketPump : IPacketPump
                 _handle.TrySend(buffer, length, ref addr);
                 if (logLatency)
                 {
-                    fastLatency.Record(captured, Stopwatch.GetTimestamp());
-                    ReportLatency(fastLatency, fullLatency, fullWork);
+                    long released = Stopwatch.GetTimestamp();
+                    fastLatency.Record(captured, released);
+                    fastWork.Record(received, released);
+                    ReportLatency(fastLatency, fastWork, fullLatency, fullWork);
                 }
                 continue;
             }
@@ -184,7 +187,7 @@ public sealed class PacketPump : IPacketPump
                 if (logLatency)
                 {
                     fullWork.Record(received, Stopwatch.GetTimestamp());
-                    ReportLatency(fastLatency, fullLatency, fullWork);
+                    ReportLatency(fastLatency, fastWork, fullLatency, fullWork);
                 }
                 continue;
             }
@@ -201,7 +204,7 @@ public sealed class PacketPump : IPacketPump
                 long released = Stopwatch.GetTimestamp();
                 fullLatency.Record(addr.Timestamp, released);
                 fullWork.Record(received, released);
-                ReportLatency(fastLatency, fullLatency, fullWork);
+                ReportLatency(fastLatency, fastWork, fullLatency, fullWork);
             }
         }
 
@@ -226,13 +229,14 @@ public sealed class PacketPump : IPacketPump
     }
 
     // The three windows share their start, so they elapse together: the first one due decides.
-    private void ReportLatency(PumpLatencyStats fast, PumpLatencyStats full, PumpLatencyStats work)
+    private void ReportLatency(PumpLatencyStats fast, PumpLatencyStats fastWork, PumpLatencyStats full, PumpLatencyStats fullWork)
     {
         long now = Stopwatch.GetTimestamp();
         if (!fast.IsDue(now)) return;
         LogWindow("fast", fast.TryTakeSummary(now));
+        LogWindow("fast-work", fastWork.TryTakeSummary(now));
         LogWindow("full", full.TryTakeSummary(now));
-        LogWindow("full-work", work.TryTakeSummary(now));
+        LogWindow("full-work", fullWork.TryTakeSummary(now));
     }
 
     private void LogWindow(string path, PumpLatencySummary? summary)
