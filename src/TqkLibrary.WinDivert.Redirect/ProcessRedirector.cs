@@ -46,6 +46,9 @@ public sealed class ProcessRedirector : IProcessRedirector
     private IUdpRelayServer? _udpRelay;
     private IPacketPump? _ipv4Pump;
     private IPacketPump? _ipv6Pump;
+    // The reply legs of the redirect pumps, on handles of their own — see RedirectFilter.
+    private IPacketPump? _ipv4ReplyPump;
+    private IPacketPump? _ipv6ReplyPump;
     private IDnsResolver? _dnsResolver;
     private bool _dnsLookupStarted;
 
@@ -289,8 +292,18 @@ public sealed class ProcessRedirector : IProcessRedirector
 
     private void StartIpv4Pump(ISocketTracker tracker, RelayPorts ports)
     {
+        RelayPorts natPorts = RelayPorts.Ipv4Only(ports.Tcp, ports.Udp);
+
+        // The reply leg first: once the egress handle bends a SYN onto the relay, the relay's
+        // SYN-ACK must already have a handle to bend it back, or the process gets it from loopback
+        // and resets the connection.
+        if (SplitsReplyLeg)
+            _ipv4ReplyPump = StartRelayReplyPump("ipv4-reply", ipv6: false, tracker, natPorts, ports.Tcp, ports.Udp);
+
         // Only what a stage on this handle can act on — see RedirectFilter.
-        string filter = BuildRedirectFilter(ipv6: false, ports.Tcp, ports.Udp);
+        string filter = SplitsReplyLeg
+            ? RedirectFilter.BuildEgress(ipv6: false, WantsTcp, CapturesUdp, _options.EnableDnsSniff)
+            : BuildRedirectFilter(ipv6: false, ports.Tcp, ports.Udp);
         _logger.LogDebug("opening IPv4 NETWORK handle, filter={Filter}", filter);
         IWinDivertHandle handle = OpenNetworkHandle(filter);
 
@@ -308,7 +321,6 @@ public sealed class ProcessRedirector : IProcessRedirector
         // DNS-over-HTTPS runs before NAT so it claims DNS/53 first.
         if (WantsSecureDns) builder.Use(CreateSecureDnsMiddleware(tracker));
 
-        RelayPorts natPorts = RelayPorts.Ipv4Only(ports.Tcp, ports.Udp);
         builder.Use(CreateNatMiddleware(tracker, natPorts));
         AddTrailingMiddlewares(builder, tracker);
 
@@ -321,7 +333,13 @@ public sealed class ProcessRedirector : IProcessRedirector
     // reaches the connection handler exactly like an IPv4 one.
     private void StartIpv6RedirectPump(ISocketTracker tracker, RelayPorts ports)
     {
-        string filter = BuildRedirectFilter(ipv6: true, ports.TcpV6, ports.UdpV6);
+        RelayPorts natPorts = RelayPorts.Ipv6Only(ports.TcpV6, ports.UdpV6);
+        if (SplitsReplyLeg)
+            _ipv6ReplyPump = StartRelayReplyPump("ipv6-reply", ipv6: true, tracker, natPorts, ports.TcpV6, ports.UdpV6);
+
+        string filter = SplitsReplyLeg
+            ? RedirectFilter.BuildEgress(ipv6: true, WantsTcp, CapturesUdp, _options.EnableDnsSniff)
+            : BuildRedirectFilter(ipv6: true, ports.TcpV6, ports.UdpV6);
         _logger.LogDebug("opening IPv6 NETWORK handle for redirect, filter={Filter}", filter);
         IWinDivertHandle handle = OpenNetworkHandle(filter);
 
@@ -334,13 +352,35 @@ public sealed class ProcessRedirector : IProcessRedirector
         // DNS-over-HTTPS before NAT, only machine-wide: then DNS/53 over IPv6 is answered over HTTPS
         // like IPv4. Tracked-only keeps the old behaviour — v6 DNS is NAT-routed like other UDP.
         if (WantsMachineWideSecureDns) builder.Use(CreateSecureDnsMiddleware(tracker));
-        RelayPorts natPorts = RelayPorts.Ipv6Only(ports.TcpV6, ports.UdpV6);
         builder.Use(CreateNatMiddleware(tracker, natPorts));
         AddTrailingMiddlewares(builder, tracker);
 
         _ipv6Pump = _pumpFactory.Create("ipv6", handle, builder.Build(), CreateBypass(tracker, natPorts));
         _ipv6Pump.Stopped += OnPumpStopped;
         _ipv6Pump.Start();
+    }
+
+    // A caller's own stages may want any packet on one handle, so with them the legs stay together.
+    private bool SplitsReplyLeg => _options.ConfigureNetworkPipeline == null;
+
+    // Only the NAT stage: nothing else acts on loopback packets from a relay port (DNS sniffing
+    // wants source port 53, DoH and the UDP block want egress on a real interface). A NAT instance
+    // of its own, sharing the table, so no per-handle state (held SYNs) is touched from two threads.
+    private IPacketPump? StartRelayReplyPump(
+        string name, bool ipv6, ISocketTracker tracker, RelayPorts natPorts, int tcpRelayPort, int udpRelayPort)
+    {
+        string? filter = RedirectFilter.BuildRelayReply(ipv6, WantsTcp, CapturesUdp, tcpRelayPort, udpRelayPort);
+        if (filter == null) return null;
+        _logger.LogDebug("opening {Pump} NETWORK handle, filter={Filter}", name, filter);
+        IWinDivertHandle handle = OpenNetworkHandle(filter);
+
+        var builder = new PacketPipelineBuilder();
+        builder.Use(CreateNatMiddleware(tracker, natPorts));
+
+        IPacketPump pump = _pumpFactory.Create(name, handle, builder.Build());
+        pump.Stopped += OnPumpStopped;
+        pump.Start();
+        return pump;
     }
 
     private void StartIpv6BlockPump(ISocketTracker tracker)
@@ -482,6 +522,8 @@ public sealed class ProcessRedirector : IProcessRedirector
         _udpRelay?.Dispose();
         _ipv6Pump?.Dispose();
         _ipv4Pump?.Dispose();
+        _ipv6ReplyPump?.Dispose();
+        _ipv4ReplyPump?.Dispose();
         _tracker?.Dispose();
         _dnsResolver?.Dispose();
         _dnsCacheLookup.Dispose();
