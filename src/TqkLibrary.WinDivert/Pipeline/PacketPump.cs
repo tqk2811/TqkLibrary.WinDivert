@@ -104,6 +104,17 @@ public sealed class PacketPump : IPacketPump
     private void PumpLoop(CancellationToken ct)
     {
         try { Pump(ct); }
+        catch (Exception ex)
+        {
+            // Only the pipeline and the bypass are guarded per packet; anything else that throws
+            // (parsing, checksums, the send, the stats) ends the loop. Without this it ended in a
+            // faulted Task nobody observes: no log, no Stopped, and the handle closed behind it —
+            // a redirected process then goes out direct, or its relayed connections hang.
+            int code = ex.HResult != 0 ? ex.HResult : -1;
+            _logger.LogError(ex, "[{Pump}] pump loop crashed, code={Code}", Name, code);
+            try { Stopped?.Invoke(new PumpStop(Name, code)); }
+            catch (Exception subscriberEx) { _logger.LogError(subscriberEx, "[{Pump}] a Stopped subscriber threw", Name); }
+        }
         finally { _handle.Dispose(); }
     }
 
