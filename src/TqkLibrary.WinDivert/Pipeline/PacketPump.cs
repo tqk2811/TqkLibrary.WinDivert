@@ -1,8 +1,10 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using TqkLibrary.WinDivert.Pipeline.Helpers;
 
 namespace TqkLibrary.WinDivert.Pipeline;
 
@@ -42,6 +44,9 @@ public sealed class PacketPump : IPacketPump
     /// <summary>How many failed recvs in a row mean the handle is gone rather than unlucky.</summary>
     private const int MaxRecvFailuresInARow = 32;
 
+    /// <summary>How often the capture-to-release latency of this pump is logged (Debug).</summary>
+    private static readonly TimeSpan LatencyReportInterval = TimeSpan.FromSeconds(10);
+
     private readonly CancellationTokenSource _cts = new();
     private Task? _pumpTask;
     private volatile bool _started;
@@ -74,7 +79,8 @@ public sealed class PacketPump : IPacketPump
         // and in the window between the pump being started and the assignment landing, a pump
         // would be reading a handle Dispose had already decided nobody owned.
         _started = true;
-        _pumpTask = BlockingLoop.Start(() => PumpLoop(_cts.Token));
+        // Latency-critical: every packet of the machine waits on this thread. See BlockingLoop.
+        _pumpTask = BlockingLoop.Start(() => PumpLoop(_cts.Token), latencyCritical: true, _logger);
     }
 
     /// <summary>
@@ -99,6 +105,8 @@ public sealed class PacketPump : IPacketPump
         byte[] buffer = new byte[RecvBufferSize];
         int stopError = 0;
         int failuresInARow = 0;
+        var latency = new PumpLatencyStats(LatencyReportInterval, Stopwatch.GetTimestamp());
+        bool logLatency = _logger.IsEnabled(LogLevel.Debug);
         while (!ct.IsCancellationRequested)
         {
             if (!_handle.TryRecv(buffer, out int length, out WinDivertAddress addr, out int win32))
@@ -144,7 +152,10 @@ public sealed class PacketPump : IPacketPump
             }
 
             if (ctx.Disposition == PacketDisposition.Drop)
+            {
+                if (logLatency) ReportLatency(latency);
                 continue;
+            }
 
             if (ctx.Disposition == PacketDisposition.Modified)
                 _handle.CalcChecksums(buffer, ctx.Length, ref ctx.Address);
@@ -152,11 +163,24 @@ public sealed class PacketPump : IPacketPump
             bool sent = _handle.TrySend(buffer, ctx.Length, ref ctx.Address);
             if (ctx.Disposition == PacketDisposition.Modified && !sent)
                 _logger.LogWarning("[{Pump}] send of a rewritten packet failed, win32={Win32}", Name, Marshal.GetLastWin32Error());
+
+            if (logLatency)
+            {
+                latency.Record(addr.Timestamp, Stopwatch.GetTimestamp());
+                ReportLatency(latency);
+            }
         }
 
         if (stopError == 0) _logger.LogDebug("[{Pump}] pump loop exited", Name);
         try { Stopped?.Invoke(new PumpStop(Name, stopError)); }
         catch (Exception ex) { _logger.LogError(ex, "[{Pump}] a Stopped subscriber threw", Name); }
+    }
+
+    private void ReportLatency(PumpLatencyStats latency)
+    {
+        if (latency.TryTakeSummary(Stopwatch.GetTimestamp()) is not PumpLatencySummary s) return;
+        _logger.LogDebug("[{Pump}] capture-to-release over {Seconds:0}s: packets={Count} avg={Avg}us p50<={P50}us p99<={P99}us max={Max}us",
+            Name, s.Window.TotalSeconds, s.Count, s.AverageMicros, s.P50Micros, s.P99Micros, s.MaxMicros);
     }
 
     /// <summary>
