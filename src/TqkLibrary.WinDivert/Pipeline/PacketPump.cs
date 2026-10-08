@@ -26,6 +26,7 @@ public sealed class PacketPump : IPacketPump
     private readonly PacketDelegate _pipeline;
     private readonly IPacketParser _parser;
     private readonly ILogger _logger;
+    private readonly IPacketBypass? _bypass;
 
     /// <summary>
     /// One byte over WINDIVERT_MTU_MAX (65575), the largest packet the driver will hand over.
@@ -58,13 +59,19 @@ public sealed class PacketPump : IPacketPump
 
     /// <param name="name">Short label distinguishing this pump from the others in log lines.</param>
     /// <param name="handle">Taken over by the pump and disposed with it.</param>
+    /// <param name="bypass">
+    /// Optional fast path: packets it says the pipeline would not touch are re-sent as they came,
+    /// skipping parse, context and pipeline. Null runs every packet through the pipeline.
+    /// </param>
     public PacketPump(
         string name,
         IWinDivertHandle handle,
         PacketDelegate pipeline,
         IPacketParser parser,
-        ILogger<PacketPump> logger)
+        ILogger<PacketPump> logger,
+        IPacketBypass? bypass = null)
     {
+        _bypass = bypass;
         Name = name ?? throw new ArgumentNullException(nameof(name));
         _handle = handle ?? throw new ArgumentNullException(nameof(handle));
         _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
@@ -134,6 +141,21 @@ public sealed class PacketPump : IPacketPump
             }
 
             failuresInARow = 0;
+
+            // Fast path for traffic no stage would act on: released before anything is allocated,
+            // so a busy machine's unrelated packets (a game's) do not queue behind our parsing.
+            if (_bypass != null && ShouldBypass(buffer, length, addr))
+            {
+                long captured = addr.Timestamp;
+                _handle.TrySend(buffer, length, ref addr);
+                if (logLatency)
+                {
+                    latency.Record(captured, Stopwatch.GetTimestamp());
+                    ReportLatency(latency);
+                }
+                continue;
+            }
+
             var ctx = new PacketContext(buffer, this, ct)
             {
                 Length = length,
@@ -174,6 +196,21 @@ public sealed class PacketPump : IPacketPump
         if (stopError == 0) _logger.LogDebug("[{Pump}] pump loop exited", Name);
         try { Stopped?.Invoke(new PumpStop(Name, stopError)); }
         catch (Exception ex) { _logger.LogError(ex, "[{Pump}] a Stopped subscriber threw", Name); }
+    }
+
+    // A bypass that throws must not take the pump down; the packet just takes the normal path,
+    // which is always correct.
+    private bool ShouldBypass(byte[] buffer, int length, in WinDivertAddress addr)
+    {
+        try
+        {
+            return _bypass!.ShouldRelease(new ReadOnlySpan<byte>(buffer, 0, length), addr);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[{Pump}] bypass threw", Name);
+            return false;
+        }
     }
 
     private void ReportLatency(PumpLatencyStats latency)

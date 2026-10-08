@@ -16,5 +16,8 @@ public sealed class PacketPumpFactory : IPacketPumpFactory
     }
 
     public IPacketPump Create(string name, IWinDivertHandle handle, PacketDelegate pipeline)
-        => new PacketPump(name, handle, pipeline, _parser, _loggerFactory.CreateLogger<PacketPump>());
+        => Create(name, handle, pipeline, bypass: null);
+
+    public IPacketPump Create(string name, IWinDivertHandle handle, PacketDelegate pipeline, IPacketBypass? bypass)
+        => new PacketPump(name, handle, pipeline, _parser, _loggerFactory.CreateLogger<PacketPump>(), bypass);
 }

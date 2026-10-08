@@ -308,10 +308,11 @@ public sealed class ProcessRedirector : IProcessRedirector
         // DNS-over-HTTPS runs before NAT so it claims DNS/53 first.
         if (WantsSecureDns) builder.Use(CreateSecureDnsMiddleware(tracker));
 
-        builder.Use(CreateNatMiddleware(tracker, RelayPorts.Ipv4Only(ports.Tcp, ports.Udp)));
+        RelayPorts natPorts = RelayPorts.Ipv4Only(ports.Tcp, ports.Udp);
+        builder.Use(CreateNatMiddleware(tracker, natPorts));
         AddTrailingMiddlewares(builder, tracker);
 
-        _ipv4Pump = _pumpFactory.Create("ipv4", handle, builder.Build());
+        _ipv4Pump = _pumpFactory.Create("ipv4", handle, builder.Build(), CreateBypass(tracker, natPorts));
         _ipv4Pump.Stopped += OnPumpStopped;
         _ipv4Pump.Start();
     }
@@ -333,10 +334,11 @@ public sealed class ProcessRedirector : IProcessRedirector
         // DNS-over-HTTPS before NAT, only machine-wide: then DNS/53 over IPv6 is answered over HTTPS
         // like IPv4. Tracked-only keeps the old behaviour — v6 DNS is NAT-routed like other UDP.
         if (WantsMachineWideSecureDns) builder.Use(CreateSecureDnsMiddleware(tracker));
-        builder.Use(CreateNatMiddleware(tracker, RelayPorts.Ipv6Only(ports.TcpV6, ports.UdpV6)));
+        RelayPorts natPorts = RelayPorts.Ipv6Only(ports.TcpV6, ports.UdpV6);
+        builder.Use(CreateNatMiddleware(tracker, natPorts));
         AddTrailingMiddlewares(builder, tracker);
 
-        _ipv6Pump = _pumpFactory.Create("ipv6", handle, builder.Build());
+        _ipv6Pump = _pumpFactory.Create("ipv6", handle, builder.Build(), CreateBypass(tracker, natPorts));
         _ipv6Pump.Stopped += OnPumpStopped;
         _ipv6Pump.Start();
     }
@@ -405,6 +407,14 @@ public sealed class ProcessRedirector : IProcessRedirector
             _options.BlockEscapedFlows,
             _options.ShouldRedirectUdp,
             _escapedFlows);
+
+    // The pump's fast path for packets no stage of a redirect pipeline would touch. Only for the
+    // built-in stages: what a caller's own stage wants is unknowable, so with one configured every
+    // packet takes the full pipeline. See UntrackedEgressBypass.
+    private IPacketBypass? CreateBypass(ISocketTracker tracker, RelayPorts natPorts)
+        => _options.ConfigureNetworkPipeline == null
+            ? new UntrackedEgressBypass(tracker, natPorts, _options.Protocols)
+            : null;
 
     // The caller's own middlewares, then the UDP block last — so everything already handled (DNS,
     // NAT, the caller's stages) has been claimed before anything is swallowed.
