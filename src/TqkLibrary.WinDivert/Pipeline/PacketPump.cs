@@ -112,7 +112,12 @@ public sealed class PacketPump : IPacketPump
         byte[] buffer = new byte[RecvBufferSize];
         int stopError = 0;
         int failuresInARow = 0;
-        var latency = new PumpLatencyStats(LatencyReportInterval, Stopwatch.GetTimestamp());
+        // Split by path, and for the full path also the pump's own work (recv returned → released),
+        // so a slow window says whether packets queued behind the pump or the pipeline itself is slow.
+        long statsStart = Stopwatch.GetTimestamp();
+        var fastLatency = new PumpLatencyStats(LatencyReportInterval, statsStart);
+        var fullLatency = new PumpLatencyStats(LatencyReportInterval, statsStart);
+        var fullWork = new PumpLatencyStats(LatencyReportInterval, statsStart);
         bool logLatency = _logger.IsEnabled(LogLevel.Debug);
         while (!ct.IsCancellationRequested)
         {
@@ -141,6 +146,7 @@ public sealed class PacketPump : IPacketPump
             }
 
             failuresInARow = 0;
+            long received = logLatency ? Stopwatch.GetTimestamp() : 0;
 
             // Fast path for traffic no stage would act on: released before anything is allocated,
             // so a busy machine's unrelated packets (a game's) do not queue behind our parsing.
@@ -150,8 +156,8 @@ public sealed class PacketPump : IPacketPump
                 _handle.TrySend(buffer, length, ref addr);
                 if (logLatency)
                 {
-                    latency.Record(captured, Stopwatch.GetTimestamp());
-                    ReportLatency(latency);
+                    fastLatency.Record(captured, Stopwatch.GetTimestamp());
+                    ReportLatency(fastLatency, fullLatency, fullWork);
                 }
                 continue;
             }
@@ -175,7 +181,11 @@ public sealed class PacketPump : IPacketPump
 
             if (ctx.Disposition == PacketDisposition.Drop)
             {
-                if (logLatency) ReportLatency(latency);
+                if (logLatency)
+                {
+                    fullWork.Record(received, Stopwatch.GetTimestamp());
+                    ReportLatency(fastLatency, fullLatency, fullWork);
+                }
                 continue;
             }
 
@@ -188,8 +198,10 @@ public sealed class PacketPump : IPacketPump
 
             if (logLatency)
             {
-                latency.Record(addr.Timestamp, Stopwatch.GetTimestamp());
-                ReportLatency(latency);
+                long released = Stopwatch.GetTimestamp();
+                fullLatency.Record(addr.Timestamp, released);
+                fullWork.Record(received, released);
+                ReportLatency(fastLatency, fullLatency, fullWork);
             }
         }
 
@@ -213,11 +225,21 @@ public sealed class PacketPump : IPacketPump
         }
     }
 
-    private void ReportLatency(PumpLatencyStats latency)
+    // The three windows share their start, so they elapse together: the first one due decides.
+    private void ReportLatency(PumpLatencyStats fast, PumpLatencyStats full, PumpLatencyStats work)
     {
-        if (latency.TryTakeSummary(Stopwatch.GetTimestamp()) is not PumpLatencySummary s) return;
-        _logger.LogDebug("[{Pump}] capture-to-release over {Seconds:0}s: packets={Count} avg={Avg}us p50<={P50}us p99<={P99}us max={Max}us",
-            Name, s.Window.TotalSeconds, s.Count, s.AverageMicros, s.P50Micros, s.P99Micros, s.MaxMicros);
+        long now = Stopwatch.GetTimestamp();
+        if (!fast.IsDue(now)) return;
+        LogWindow("fast", fast.TryTakeSummary(now));
+        LogWindow("full", full.TryTakeSummary(now));
+        LogWindow("full-work", work.TryTakeSummary(now));
+    }
+
+    private void LogWindow(string path, PumpLatencySummary? summary)
+    {
+        if (summary is not PumpLatencySummary s) return;
+        _logger.LogDebug("[{Pump}] capture-to-release {Path} over {Seconds:0}s: packets={Count} avg={Avg}us p50<={P50}us p99<={P99}us max={Max}us",
+            Name, path, s.Window.TotalSeconds, s.Count, s.AverageMicros, s.P50Micros, s.P99Micros, s.MaxMicros);
     }
 
     /// <summary>

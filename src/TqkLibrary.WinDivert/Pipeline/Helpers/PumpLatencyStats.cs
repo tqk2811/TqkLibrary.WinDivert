@@ -53,6 +53,9 @@ public sealed class PumpLatencyStats
         if (micros > _maxMicros) _maxMicros = micros;
     }
 
+    /// <summary>Whether the report interval has elapsed since the window started.</summary>
+    public bool IsDue(long now) => now - _windowStart >= _reportIntervalTicks;
+
     /// <summary>
     /// When the report interval has elapsed, returns the window's summary and starts a new one;
     /// null otherwise, and when the window saw no packets.
