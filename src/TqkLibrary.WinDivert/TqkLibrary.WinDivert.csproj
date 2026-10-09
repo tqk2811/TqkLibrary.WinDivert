@@ -9,6 +9,10 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<InternalsVisibleTo Include="TqkLibrary.WinDivert.Tests" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<PackageReference Include="Native.WinDivert" />
 		<PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
 		<PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
