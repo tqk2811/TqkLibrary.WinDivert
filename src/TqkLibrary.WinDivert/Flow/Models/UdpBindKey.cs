@@ -5,16 +5,22 @@ namespace TqkLibrary.WinDivert.Flow.Models;
 
 internal readonly struct UdpBindKey : IEquatable<UdpBindKey>
 {
-    public IPAddress Address { get; }
+    public IpAddressKey Address { get; }
     public ushort Port { get; }
 
     public UdpBindKey(IPAddress address, ushort port)
+    {
+        Address = IpAddressKey.FromIPAddress(address);
+        Port = port;
+    }
+
+    public UdpBindKey(in IpAddressKey address, ushort port)
     {
         Address = address;
         Port = port;
     }
 
-    public bool Equals(UdpBindKey other) => Port == other.Port && Equals(Address, other.Address);
+    public bool Equals(UdpBindKey other) => Port == other.Port && Address.Equals(other.Address);
     public override bool Equals(object? obj) => obj is UdpBindKey k && Equals(k);
-    public override int GetHashCode() => (Address?.GetHashCode() ?? 0) ^ Port;
+    public override int GetHashCode() => HashCode.Combine(Address, Port);
 }

@@ -165,6 +165,9 @@ public sealed class SocketTracker : ISocketTracker
     public bool IsTrackedTcp(FlowKey key) => _tcpFlows.ContainsKey(key);
 
     public bool IsTrackedUdp(IPAddress localAddr, ushort localPort)
+        => TryGetUdpProcessId(IpAddressKey.FromIPAddress(localAddr), localPort, out _);
+
+    public bool IsTrackedUdp(in IpAddressKey localAddr, ushort localPort)
         => TryGetUdpProcessId(localAddr, localPort, out _);
 
     // Owner of a tracked TCP flow. False when the flow is unknown.
@@ -182,10 +185,13 @@ public sealed class SocketTracker : ISocketTracker
     // Owner of a tracked UDP bind. A bind on ANY (0.0.0.0 / ::) accepts any source address at
     // that port, so it is checked as a fallback.
     public bool TryGetUdpProcessId(IPAddress localAddr, ushort localPort, out uint processId)
+        => TryGetUdpProcessId(IpAddressKey.FromIPAddress(localAddr), localPort, out processId);
+
+    public bool TryGetUdpProcessId(in IpAddressKey localAddr, ushort localPort, out uint processId)
     {
         if (_udpBinds.TryGetValue(new UdpBindKey(localAddr, localPort), out UdpBindState? state)
-            || _udpBinds.TryGetValue(new UdpBindKey(IPAddress.Any, localPort), out state)
-            || _udpBinds.TryGetValue(new UdpBindKey(IPAddress.IPv6Any, localPort), out state))
+            || _udpBinds.TryGetValue(new UdpBindKey(IpAddressKey.Any4, localPort), out state)
+            || _udpBinds.TryGetValue(new UdpBindKey(IpAddressKey.Any6, localPort), out state))
         {
             processId = state.ProcessId;
             return true;
@@ -405,7 +411,7 @@ public sealed class SocketTracker : ISocketTracker
             if (_udpBinds.TryRemove(kv.Key, out _))
             {
                 udpRemoved++;
-                try { UdpBindRemoved?.Invoke(kv.Key.Address, kv.Key.Port); }
+                try { UdpBindRemoved?.Invoke(kv.Key.Address.ToIPAddress(), kv.Key.Port); }
                 catch (Exception ex) { _logger.LogWarning(ex, "a UdpBindRemoved subscriber threw for pid={Pid}", pid); }
             }
         }

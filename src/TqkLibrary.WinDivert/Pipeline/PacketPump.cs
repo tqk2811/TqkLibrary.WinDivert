@@ -52,6 +52,8 @@ public sealed class PacketPump : IPacketPump
     private Task? _pumpTask;
     private volatile bool _started;
     private volatile bool _disposed;
+    // Modified packets seen this window and how many already had each checksum bit set (pump thread only).
+    private long _modified, _ipChecksumValid, _tcpChecksumValid, _udpChecksumValid;
 
     public string Name { get; }
 
@@ -131,6 +133,9 @@ public sealed class PacketPump : IPacketPump
         var fullLatency = new PumpLatencyStats(LatencyReportInterval, statsStart);
         var fullWork = new PumpLatencyStats(LatencyReportInterval, statsStart);
         bool logLatency = _logger.IsEnabled(LogLevel.Debug);
+        // The pump thread's own allocation, so a "zero-allocation" fast path can be told from a busy one.
+        long allocMark = GC.GetAllocatedBytesForCurrentThread();
+        int gen0Mark = GC.CollectionCount(0);
         while (!ct.IsCancellationRequested)
         {
             if (!_handle.TryRecv(buffer, out int length, out WinDivertAddress addr, out int win32))
@@ -171,7 +176,7 @@ public sealed class PacketPump : IPacketPump
                     long released = Stopwatch.GetTimestamp();
                     fastLatency.Record(captured, released);
                     fastWork.Record(received, released);
-                    ReportLatency(fastLatency, fastWork, fullLatency, fullWork);
+                    ReportLatency(fastLatency, fastWork, fullLatency, fullWork, ref allocMark, ref gen0Mark);
                 }
                 continue;
             }
@@ -198,13 +203,17 @@ public sealed class PacketPump : IPacketPump
                 if (logLatency)
                 {
                     fullWork.Record(received, Stopwatch.GetTimestamp());
-                    ReportLatency(fastLatency, fastWork, fullLatency, fullWork);
+                    ReportLatency(fastLatency, fastWork, fullLatency, fullWork, ref allocMark, ref gen0Mark);
                 }
                 continue;
             }
 
             if (ctx.Disposition == PacketDisposition.Modified)
+            {
+                // Read before CalcChecksums, which sets the bits: this is what the stages left valid.
+                if (logLatency) CountChecksumBits(in ctx.Address);
                 _handle.CalcChecksums(buffer, ctx.Length, ref ctx.Address);
+            }
 
             bool sent = _handle.TrySend(buffer, ctx.Length, ref ctx.Address);
             if (ctx.Disposition == PacketDisposition.Modified && !sent)
@@ -215,7 +224,7 @@ public sealed class PacketPump : IPacketPump
                 long released = Stopwatch.GetTimestamp();
                 fullLatency.Record(addr.Timestamp, released);
                 fullWork.Record(received, released);
-                ReportLatency(fastLatency, fastWork, fullLatency, fullWork);
+                ReportLatency(fastLatency, fastWork, fullLatency, fullWork, ref allocMark, ref gen0Mark);
             }
         }
 
@@ -240,21 +249,46 @@ public sealed class PacketPump : IPacketPump
     }
 
     // The three windows share their start, so they elapse together: the first one due decides.
-    private void ReportLatency(PumpLatencyStats fast, PumpLatencyStats fastWork, PumpLatencyStats full, PumpLatencyStats fullWork)
+    private void ReportLatency(PumpLatencyStats fast, PumpLatencyStats fastWork, PumpLatencyStats full, PumpLatencyStats fullWork, ref long allocMark, ref int gen0Mark)
     {
         long now = Stopwatch.GetTimestamp();
         if (!fast.IsDue(now)) return;
-        LogWindow("fast", fast.TryTakeSummary(now));
+        long packets = LogWindow("fast", fast.TryTakeSummary(now));
         LogWindow("fast-work", fastWork.TryTakeSummary(now));
-        LogWindow("full", full.TryTakeSummary(now));
+        packets += LogWindow("full", full.TryTakeSummary(now));
         LogWindow("full-work", fullWork.TryTakeSummary(now));
+
+        // Process-wide GC count, but only this thread's allocation: gen0 collections are a hint, the byte count is the proof.
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - allocMark;
+        int gen0 = GC.CollectionCount(0) - gen0Mark;
+        _logger.LogDebug("[{Pump}] pump thread allocated {Bytes} B over the window ({PerPacket:0.0} B/packet), gen0 GCs={Gen0} (process-wide)",
+            Name, allocated, packets > 0 ? (double)allocated / packets : 0d, gen0);
+        allocMark = GC.GetAllocatedBytesForCurrentThread();
+        gen0Mark = GC.CollectionCount(0);
+
+        if (_modified > 0)
+        {
+            _logger.LogDebug("[{Pump}] modified={Count} ipcsum-valid={Ip} tcpcsum-valid={Tcp} udpcsum-valid={Udp}",
+                Name, _modified, _ipChecksumValid, _tcpChecksumValid, _udpChecksumValid);
+            _modified = _ipChecksumValid = _tcpChecksumValid = _udpChecksumValid = 0;
+        }
     }
 
-    private void LogWindow(string path, PumpLatencySummary? summary)
+    // Pump thread only, so plain counters.
+    private void CountChecksumBits(in WinDivertAddress address)
     {
-        if (summary is not PumpLatencySummary s) return;
+        _modified++;
+        if (address.IPChecksum) _ipChecksumValid++;
+        if (address.TCPChecksum) _tcpChecksumValid++;
+        if (address.UDPChecksum) _udpChecksumValid++;
+    }
+
+    private long LogWindow(string path, PumpLatencySummary? summary)
+    {
+        if (summary is not PumpLatencySummary s) return 0;
         _logger.LogDebug("[{Pump}] capture-to-release {Path} over {Seconds:0}s: packets={Count} avg={Avg}us p50<={P50}us p99<={P99}us max={Max}us",
             Name, path, s.Window.TotalSeconds, s.Count, s.AverageMicros, s.P50Micros, s.P99Micros, s.MaxMicros);
+        return s.Count;
     }
 
     /// <summary>

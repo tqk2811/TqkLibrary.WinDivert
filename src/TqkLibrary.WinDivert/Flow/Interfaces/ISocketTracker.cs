@@ -50,6 +50,9 @@ public interface ISocketTracker : IDisposable
     bool IsTrackedTcp(FlowKey key);
     bool IsTrackedUdp(IPAddress localAddr, ushort localPort);
 
+    /// <summary>Same as the <see cref="IPAddress"/> overload, without building one; trackers override it to stay allocation-free.</summary>
+    bool IsTrackedUdp(in IpAddressKey localAddr, ushort localPort) => IsTrackedUdp(localAddr.ToIPAddress(), localPort);
+
     /// <summary>Owner of a tracked TCP flow. False when the flow is unknown.</summary>
     bool TryGetTcpProcessId(FlowKey key, out uint processId);
 
@@ -58,6 +61,9 @@ public interface ISocketTracker : IDisposable
     /// that port, so it is checked as a fallback.
     /// </summary>
     bool TryGetUdpProcessId(IPAddress localAddr, ushort localPort, out uint processId);
+
+    /// <inheritdoc cref="TryGetUdpProcessId(IPAddress, ushort, out uint)"/>
+    bool TryGetUdpProcessId(in IpAddressKey localAddr, ushort localPort, out uint processId) => TryGetUdpProcessId(localAddr.ToIPAddress(), localPort, out processId);
 
     /// <summary>
     /// Snapshots the kernel's TCP/UDP tables for every tracked pid and adds anything new. Called

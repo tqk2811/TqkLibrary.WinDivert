@@ -24,8 +24,8 @@ namespace TqkLibrary.WinDivert.Redirect;
 /// which is wider than the DNS stages need — the cheap side to err on.
 /// <para>
 /// Everything uncertain is false: loopback, inbound, SYN, fragments, IPv6 extension headers,
-/// anything truncated. The tracker lookups still allocate two <see cref="IPAddress"/> objects
-/// (its keys are built on them); that is all that is left of the per-packet cost.
+/// anything truncated. The addresses are read as <see cref="IpAddressKey"/> straight off the
+/// buffer, so the whole decision allocates nothing.
 /// </para>
 /// </remarks>
 public sealed class UntrackedEgressBypass : IPacketBypass
@@ -56,8 +56,8 @@ public sealed class UntrackedEgressBypass : IPacketBypass
         bool isIpv6;
         int protocol;
         int transportOffset;
-        ReadOnlySpan<byte> src;
-        ReadOnlySpan<byte> dst;
+        IpAddressKey src;
+        IpAddressKey dst;
         switch (packet[0] >> 4)
         {
             case 4:
@@ -72,8 +72,8 @@ public sealed class UntrackedEgressBypass : IPacketBypass
                 isIpv6 = false;
                 protocol = packet[9];
                 transportOffset = ihl;
-                src = packet.Slice(12, 4);
-                dst = packet.Slice(16, 4);
+                src = IpAddressKey.FromIPv4(packet.Slice(12, 4));
+                dst = IpAddressKey.FromIPv4(packet.Slice(16, 4));
                 break;
             }
             case 6:
@@ -83,8 +83,8 @@ public sealed class UntrackedEgressBypass : IPacketBypass
                 isIpv6 = true;
                 protocol = packet[6];
                 transportOffset = 40;
-                src = packet.Slice(8, 16);
-                dst = packet.Slice(24, 16);
+                src = IpAddressKey.FromIPv6(packet.Slice(8, 16));
+                dst = IpAddressKey.FromIPv6(packet.Slice(24, 16));
                 break;
             }
             default:
@@ -121,9 +121,7 @@ public sealed class UntrackedEgressBypass : IPacketBypass
             if (syn && !ack) return false;
         }
 
-        var srcIp = new IPAddress(src);
-        var dstIp = new IPAddress(dst);
-        if (IsTracked(isTcp, srcIp, srcPort, dstIp, dstPort)) return false;
+        if (IsTracked(isTcp, in src, srcPort, in dst, dstPort)) return false;
 
         // NAT only gets as far as its untracked branch when it redirects this protocol and has a
         // relay for this family; mirror that, including the re-check, so the one thing it does to
@@ -132,13 +130,13 @@ public sealed class UntrackedEgressBypass : IPacketBypass
         if ((_protocols & thisProto) != 0 && _relayPorts.For(isTcp, isIpv6) != 0)
         {
             _tracker.RequestReconcileFromKernel();
-            if (IsTracked(isTcp, srcIp, srcPort, dstIp, dstPort)) return false;
+            if (IsTracked(isTcp, in src, srcPort, in dst, dstPort)) return false;
         }
         return true;
     }
 
-    private bool IsTracked(bool isTcp, IPAddress srcIp, ushort srcPort, IPAddress dstIp, ushort dstPort)
+    private bool IsTracked(bool isTcp, in IpAddressKey src, ushort srcPort, in IpAddressKey dst, ushort dstPort)
         => isTcp
-            ? _tracker.IsTrackedTcp(new FlowKey(ProtocolTcp, srcIp, srcPort, dstIp, dstPort))
-            : _tracker.IsTrackedUdp(srcIp, srcPort);
+            ? _tracker.IsTrackedTcp(new FlowKey(ProtocolTcp, in src, srcPort, in dst, dstPort))
+            : _tracker.IsTrackedUdp(in src, srcPort);
 }

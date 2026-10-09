@@ -186,6 +186,30 @@ public class UntrackedEgressBypassTests
         return (handle.Sends, Volatile.Read(ref pipelineRuns));
     }
 
+    // The point of reading addresses as IpAddressKey: the per-packet decision costs no heap at all.
+    [Fact]
+    public void Untracked_egress_decision_allocates_nothing()
+    {
+        var tracker = new FakeTracker();
+        var bypass = Bypass(tracker, RedirectProtocol.Tcp | RedirectProtocol.Udp);
+        byte[][] packets = { Tcp(TcpAck), Udp(LocalPort, RemotePort), Tcp6(6) };
+        WinDivertAddress addr = Outbound();
+
+        // Warm up: JIT, static initialisers, lazily built tables.
+        for (int i = 0; i < 100; i++)
+            foreach (byte[] packet in packets) bypass.ShouldRelease(packet, addr);
+
+        foreach (byte[] packet in packets)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            bool released = true;
+            for (int i = 0; i < 1000; i++) released &= bypass.ShouldRelease(packet, addr);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            Assert.True(released);
+            Assert.Equal(0, allocated);
+        }
+    }
+
     // ---- builders ----
 
     private static UntrackedEgressBypass Bypass(FakeTracker tracker, RedirectProtocol protocols = RedirectProtocol.Tcp)
@@ -337,6 +361,7 @@ public class UntrackedEgressBypassTests
         public bool IsTrackedProcess(uint pid) => false;
         public bool IsTrackedTcp(FlowKey key) => _tcp.ContainsKey(key);
         public bool IsTrackedUdp(IPAddress localAddr, ushort localPort) => _udp.ContainsKey(localPort);
+        public bool IsTrackedUdp(in IpAddressKey localAddr, ushort localPort) => _udp.ContainsKey(localPort);
 
         public bool TryGetTcpProcessId(FlowKey key, out uint processId)
         {
