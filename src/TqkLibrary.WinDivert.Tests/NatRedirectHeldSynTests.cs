@@ -279,7 +279,7 @@ public class NatRedirectHeldSynTests
     }
 
     // Reconciles through the real CoalescedSweep, so the sweep count is what SocketTracker would do.
-    private sealed class FakeTracker : ISocketTracker
+    internal sealed class FakeTracker : ISocketTracker
     {
         private readonly ConcurrentDictionary<FlowKey, byte> _tracked = new();
         private readonly CoalescedSweep _sweep;
