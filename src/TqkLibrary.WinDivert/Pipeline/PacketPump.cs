@@ -52,8 +52,8 @@ public sealed class PacketPump : IPacketPump
     private Task? _pumpTask;
     private volatile bool _started;
     private volatile bool _disposed;
-    // Modified packets seen this window and how many already had each checksum bit set (pump thread only).
-    private long _modified, _ipChecksumValid, _tcpChecksumValid, _udpChecksumValid;
+    // Modified packets seen this window, how many already had each checksum bit set, and how many skipped the recompute (pump thread only).
+    private long _modified, _ipChecksumValid, _tcpChecksumValid, _udpChecksumValid, _incremental;
 
     public string Name { get; }
 
@@ -212,7 +212,8 @@ public sealed class PacketPump : IPacketPump
             {
                 // Read before CalcChecksums, which sets the bits: this is what the stages left valid.
                 if (logLatency) CountChecksumBits(in ctx.Address);
-                _handle.CalcChecksums(buffer, ctx.Length, ref ctx.Address);
+                if (ctx.ChecksumsUpdated) _incremental++;
+                else _handle.CalcChecksums(buffer, ctx.Length, ref ctx.Address);
             }
 
             bool sent = _handle.TrySend(buffer, ctx.Length, ref ctx.Address);
@@ -268,9 +269,9 @@ public sealed class PacketPump : IPacketPump
 
         if (_modified > 0)
         {
-            _logger.LogDebug("[{Pump}] modified={Count} ipcsum-valid={Ip} tcpcsum-valid={Tcp} udpcsum-valid={Udp}",
-                Name, _modified, _ipChecksumValid, _tcpChecksumValid, _udpChecksumValid);
-            _modified = _ipChecksumValid = _tcpChecksumValid = _udpChecksumValid = 0;
+            _logger.LogDebug("[{Pump}] modified={Count} ipcsum-valid={Ip} tcpcsum-valid={Tcp} udpcsum-valid={Udp} incremental={Incremental}",
+                Name, _modified, _ipChecksumValid, _tcpChecksumValid, _udpChecksumValid, _incremental);
+            _modified = _ipChecksumValid = _tcpChecksumValid = _udpChecksumValid = _incremental = 0;
         }
     }
 

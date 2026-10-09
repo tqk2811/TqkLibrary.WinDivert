@@ -46,6 +46,13 @@ public sealed class PacketContext
     public PacketDisposition Disposition { get; set; } = PacketDisposition.Pass;
 
     /// <summary>
+    /// The packet's checksums already match its rewritten bytes, so the pump skips the full
+    /// recompute. Set only by the last middleware that modifies the packet; any later
+    /// modification must clear it.
+    /// </summary>
+    public bool ChecksumsUpdated { get; set; }
+
+    /// <summary>
     /// Emits an out-of-band packet on the same handle — for a middleware that produces a reply
     /// asynchronously, long after this context has been recycled.
     /// </summary>

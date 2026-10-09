@@ -232,7 +232,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             return next(ctx);
         }
 
-        RedirectToRelay(p, ref ctx.Address, proto, isTcp, isIpv6, expectedRelay, flowPid);
+        ctx.ChecksumsUpdated = RedirectToRelay(p, ref ctx.Address, proto, isTcp, isIpv6, expectedRelay, flowPid);
         ctx.MarkModified();
         return Task.CompletedTask;
     }
@@ -251,8 +251,10 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     // The redirect itself, shared by the pump's own path and the held-SYN path: records the flow
     // in the NAT table and rewrites the packet (in its buffer) and its address onto the relay.
     // The caller decides whether the packet goes out — MarkModified on the pump, Inject off it —
-    // and either way WinDivert recomputes the checksums before sending.
-    private void RedirectToRelay(
+    // and either way the checksums are valid before sending: patched in place when WinDivert
+    // marked them valid (returns true, so the pump may skip its recompute), otherwise recomputed
+    // by the pump or by Inject.
+    private bool RedirectToRelay(
         ParsedPacket p, ref WinDivertAddress address,
         byte proto, bool isTcp, bool isIpv6, int expectedRelay, uint flowPid)
     {
@@ -278,8 +280,14 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         }
 
         IPAddress loopback = isIpv6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
-        p.SetSource(loopback, srcPort);
-        p.SetDestination(loopback, (ushort)expectedRelay);
+        Span<byte> loopbackBytes = stackalloc byte[isIpv6 ? 16 : 4];
+        loopback.TryWriteBytes(loopbackBytes, out _);
+        bool checksumsUpdated = p.TryRewriteIncremental(loopbackBytes, srcPort, loopbackBytes, (ushort)expectedRelay, in address);
+        if (!checksumsUpdated)
+        {
+            p.SetSource(loopback, srcPort);
+            p.SetDestination(loopback, (ushort)expectedRelay);
+        }
 
         // Re-inject at the WFP OUTBOUND hook on the loopback interface. The kernel handles both
         // halves of the loopback transmission and delivers the SYN to the relay's listener.
@@ -289,6 +297,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         address.Network.SubIfIdx = 0;
         if (_logger.IsEnabled(LogLevel.Trace))
             _logger.LogTrace("  -> redirect {Loopback}:{SrcPort} to {Loopback}:{RelayPort}", loopback, srcPort, loopback, expectedRelay);
+        return checksumsUpdated;
     }
 
     // An untracked SYN, decided off the pump thread.
@@ -400,8 +409,18 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             return Task.CompletedTask;
         }
 
-        p.SetSource(entry.OriginalDestinationAddress, entry.OriginalDestinationPort);
-        p.SetDestination(entry.OriginalSourceAddress, entry.OriginalSourcePort);
+        int addressLength = isIpv6 ? 16 : 4;
+        Span<byte> originalSource = stackalloc byte[addressLength];
+        Span<byte> originalDestination = stackalloc byte[addressLength];
+        bool restored = entry.OriginalDestinationAddress.TryWriteBytes(originalSource, out int sourceLength) && sourceLength == addressLength
+            && entry.OriginalSourceAddress.TryWriteBytes(originalDestination, out int destinationLength) && destinationLength == addressLength;
+        if (restored && p.TryRewriteIncremental(originalSource, entry.OriginalDestinationPort, originalDestination, entry.OriginalSourcePort, in ctx.Address))
+            ctx.ChecksumsUpdated = true;
+        else
+        {
+            p.SetSource(entry.OriginalDestinationAddress, entry.OriginalDestinationPort);
+            p.SetDestination(entry.OriginalSourceAddress, entry.OriginalSourcePort);
+        }
 
         // Reinject as inbound on the real interface the original socket lives on.
         ctx.Address.Loopback = false;
