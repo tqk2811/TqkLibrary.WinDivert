@@ -63,6 +63,8 @@ public static class BlockingLoop
                 // non-realtime thread of any process, whatever MMCSS manages to do on top.
                 if (latencyCritical && !SetThreadPriority(GetCurrentThread(), ThreadPriorityTimeCritical))
                     logger?.LogWarning("could not raise the pump thread to TimeCritical, win32={Win32}", Marshal.GetLastWin32Error());
+                if (latencyCritical)
+                    PumpCoreHints.ApplyToCurrentThread(logger);
                 IntPtr mmcss = latencyCritical ? EnterMmcss(logger) : IntPtr.Zero;
                 if (latencyCritical)
                     logger?.LogDebug("pump thread priority={Priority} mmcss={Mmcss}", GetThreadPriority(GetCurrentThread()), mmcss != IntPtr.Zero);
