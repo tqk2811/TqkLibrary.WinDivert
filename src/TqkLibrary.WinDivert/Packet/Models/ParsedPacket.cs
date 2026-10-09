@@ -74,13 +74,22 @@ public sealed class ParsedPacket
     /// (RFC 1624), so the cost does not grow with the payload. Returns false and changes nothing
     /// when that is not safe: not TCP/UDP, an IPv4 fragment, an address length that differs, a
     /// checksum WinDivert did not mark valid (offloaded or unset, so there is nothing to patch),
-    /// or a UDP/IPv6 datagram without a checksum (illegal; left for a full recompute).
+    /// a UDP/IPv6 datagram without a checksum (illegal; left for a full recompute), or a packet
+    /// captured on loopback.
     /// </summary>
+    /// <remarks>
+    /// Loopback is refused because Windows does not compute checksums for loopback traffic, yet
+    /// WinDivert still marks them valid: the bytes are not a checksum of anything, so patching them
+    /// gives a wrong one. That broke every redirected IPv4 connection: the relay's SYN-ACK, captured
+    /// on loopback and reinjected inbound on the real interface, was dropped by the stack and the
+    /// client kept retransmitting its SYN.
+    /// </remarks>
     public bool TryRewriteIncremental(
         ReadOnlySpan<byte> newSrcIp, ushort newSrcPort, ReadOnlySpan<byte> newDstIp, ushort newDstPort,
         in WinDivertAddress addr)
     {
         if (!(IsTcp || IsUdp)) return false;
+        if (addr.Loopback) return false;
         int ipLen = IsIpv6 ? 16 : 4;
         if (newSrcIp.Length != ipLen || newDstIp.Length != ipLen) return false;
 

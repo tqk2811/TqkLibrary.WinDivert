@@ -240,6 +240,31 @@ public class ChecksumUpdateTests
         Assert.Equal(before, b);
     }
 
+    // Loopback traffic carries no real checksum even though WinDivert marks it valid; patching it
+    // produced the bad SYN-ACK that killed every redirected IPv4 connection.
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    public void ALoopbackPacketRefusesAndLeavesTheBufferAlone(bool v6, bool tcp)
+    {
+        byte[] src = v6 ? IPAddressBytes("::1") : new byte[] { 127, 0, 0, 1 };
+        byte[] dst = src;
+        byte[] newSrc = v6 ? IPAddressBytes("2001:db8::1") : new byte[] { 45, 129, 229, 1 };
+        byte[] newDst = v6 ? IPAddressBytes("2001:db8::2") : new byte[] { 192, 168, 1, 5 };
+        byte[] b = Build(v6, tcp, src, dst, 10378, 10472, new byte[] { 1, 2, 3 }, fixChecksums: false);
+        byte[] before = (byte[])b.Clone();
+        WinDivertAddress addr = AllValid();
+        addr.Loopback = true;
+
+        Assert.False(Parse(b).TryRewriteIncremental(newSrc, 443, newDst, 10472, in addr));
+
+        Assert.Equal(before, b);
+    }
+
+    private static byte[] IPAddressBytes(string text) => System.Net.IPAddress.Parse(text).GetAddressBytes();
+
     [Fact]
     public void AnIpv4FragmentRefusesAndLeavesTheBufferAlone()
     {
