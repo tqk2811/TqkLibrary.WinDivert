@@ -73,8 +73,11 @@ public class RelayTeardownTests
         relay.Start();
 
         using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, relay.Port);
+        // The relay looks the connection up in the NAT table the moment it accepts it, so the entry
+        // has to be there before the connect: bind first to learn the source port.
+        client.Client.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         nat.Entry = EntryFor((ushort)((IPEndPoint)client.Client.LocalEndPoint!).Port);
+        await client.ConnectAsync(IPAddress.Loopback, relay.Port);
 
         NetworkStream stream = client.GetStream();
         // Give the relay's accept loop the moment it needs to take the connection on.
