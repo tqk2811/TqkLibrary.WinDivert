@@ -35,11 +35,14 @@ public sealed class DnsAnswerSniffMiddleware : IPacketMiddleware
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
+    public void Invoke(PacketContext ctx, PacketDelegate next)
     {
         ParsedPacket? p = ctx.Packet;
         if (p == null || !p.IsUdp || p.SourcePort != DnsPort)
-            return next(ctx);
+        {
+            next(ctx);
+            return;
+        }
 
         try
         {
@@ -64,6 +67,6 @@ public sealed class DnsAnswerSniffMiddleware : IPacketMiddleware
             _logger.LogDebug(ex, "DNS answer sniff failed");
         }
 
-        return next(ctx);
+        next(ctx);
     }
 }

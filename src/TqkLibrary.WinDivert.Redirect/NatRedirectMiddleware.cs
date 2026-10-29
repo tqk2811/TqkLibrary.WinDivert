@@ -97,17 +97,23 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             : null;
     }
 
-    public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
+    public void Invoke(PacketContext ctx, PacketDelegate next)
     {
         ParsedPacket? p = ctx.Packet;
         if (p == null || !(p.IsTcp || p.IsUdp))
-            return next(ctx);
+        {
+            next(ctx);
+            return;
+        }
 
         bool isTcp = p.IsTcp;
         // Only NAT the protocols we were asked to; defer the rest to downstream middlewares.
         RedirectProtocol thisProto = isTcp ? RedirectProtocol.Tcp : RedirectProtocol.Udp;
         if ((_protocols & thisProto) == 0)
-            return next(ctx);
+        {
+            next(ctx);
+            return;
+        }
 
         byte proto = (byte)p.Protocol;
         bool isIpv6 = p.IsIpv6;
@@ -115,23 +121,32 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         // No relay socket for this family: nothing here can redirect the packet, so let the rest
         // of the chain (block/observe middlewares) decide what happens to it.
         if (expectedRelay == 0)
-            return next(ctx);
+        {
+            next(ctx);
+            return;
+        }
 
         if (_logger.IsEnabled(LogLevel.Trace))
             _logger.LogTrace("recv {Packet}", Describe(p, ctx.Address, ctx.Length));
 
         // Case 1: egress from target process on a real interface -> redirect to local relay.
         if (ctx.Address.Outbound && !ctx.Address.Loopback)
-            return HandleEgress(ctx, next, p, proto, isTcp, isIpv6, expectedRelay);
+        {
+            HandleEgress(ctx, next, p, proto, isTcp, isIpv6, expectedRelay);
+            return;
+        }
 
         // Case 2: relay listener's reply on loopback (src=loopback:relayPort, dst=loopback:origSrcPort).
         if (ctx.Address.Loopback && p.SourcePort == expectedRelay)
-            return HandleRelayReply(ctx, next, p, proto, isIpv6);
+        {
+            HandleRelayReply(ctx, next, p, proto, isIpv6);
+            return;
+        }
 
-        return next(ctx);
+        next(ctx);
     }
 
-    private Task HandleEgress(
+    private void HandleEgress(
         PacketContext ctx, PacketDelegate next, ParsedPacket p,
         byte proto, bool isTcp, bool isIpv6, int expectedRelay)
     {
@@ -166,15 +181,20 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         if (isSyn && _pendingSyns.ContainsKey(tcpKey))
         {
             ctx.Drop();
-            return Task.CompletedTask;
+            return;
         }
 
         // A SYN outside the port filter is passed through whatever the sweep says, so it is not
         // worth holding.
         if (!tracked && isSyn)
         {
-            if (!PassesPortFilter(dstPort)) return next(ctx);
-            return HoldSynForReconcile(ctx, tcpKey, proto, isIpv6, expectedRelay);
+            if (!PassesPortFilter(dstPort))
+            {
+                next(ctx);
+                return;
+            }
+            HoldSynForReconcile(ctx, tcpKey, proto, isIpv6, expectedRelay);
+            return;
         }
 
         if (!tracked)
@@ -197,9 +217,17 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         if (_logger.IsEnabled(LogLevel.Trace))
             _logger.LogTrace("  egress tracked={Tracked} tcpFlows={FlowCount} natCount={NatCount}",
                 tracked, _tracker.TcpSnapshot.Count, _nat.Count);
-        if (!tracked) return next(ctx);
+        if (!tracked)
+        {
+            next(ctx);
+            return;
+        }
 
-        if (!PassesPortFilter(dstPort)) return next(ctx);
+        if (!PassesPortFilter(dstPort))
+        {
+            next(ctx);
+            return;
+        }
 
         // A TCP flow may only be captured from its SYN. If the handshake already started without
         // us — the process was attached mid-flight, or the SOCKET event lost the race against the
@@ -207,7 +235,10 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         // different places and the connection dies. That is strictly worse than the leak it was
         // meant to prevent, so such flows are handled separately.
         if (isTcp && !isSyn && _nat.Find(proto, srcPort, isIpv6) == null)
-            return HandleEscapedFlow(ctx, next, p, srcIp, srcPort, dstIp, dstPort);
+        {
+            HandleEscapedFlow(ctx, next, p, srcIp, srcPort, dstIp, dstPort);
+            return;
+        }
 
         // Which tracked process this packet really belongs to. With several pids tracked at once
         // (root + children, or several unrelated targets) the root pid says nothing, and the NAT
@@ -229,12 +260,12 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             if (_logger.IsEnabled(LogLevel.Trace))
                 _logger.LogTrace("  not redirecting udp {Source}:{SourcePort} -> {Destination}:{DestinationPort}, the host routes it direct (passthrough)",
                     srcIp, srcPort, dstIp, dstPort);
-            return next(ctx);
+            next(ctx);
+            return;
         }
 
         ctx.ChecksumsUpdated = RedirectToRelay(p, ref ctx.Address, proto, isTcp, isIpv6, expectedRelay, flowPid);
         ctx.MarkModified();
-        return Task.CompletedTask;
     }
 
     // Destination-port whitelist: tracked packets whose dstPort is outside the configured set
@@ -312,14 +343,14 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     // While a flow's SYN is held, a retransmission of it is simply dropped: the held one will go
     // out, and a second copy deciding in parallel could inject twice. Injected packets carry the
     // impostor flag, which the handle's filter excludes, so they are not captured again.
-    private Task HoldSynForReconcile(PacketContext ctx, FlowKey key, byte proto, bool isIpv6, int expectedRelay)
+    private void HoldSynForReconcile(PacketContext ctx, FlowKey key, byte proto, bool isIpv6, int expectedRelay)
     {
         ctx.Drop();
         if (!_pendingSyns.TryAdd(key, 0))
         {
             if (_logger.IsEnabled(LogLevel.Trace))
                 _logger.LogTrace("  dropping a retransmitted SYN for {Flow}, the first one is still held", key);
-            return Task.CompletedTask;
+            return;
         }
 
         byte[] packet = new byte[ctx.Length];
@@ -329,7 +360,6 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         CancellationToken token = ctx.CancellationToken;
 
         _ = Task.Run(() => DecideHeldSynAsync(packet, address, injector, key, proto, isIpv6, expectedRelay, token));
-        return Task.CompletedTask;
     }
 
     private async Task DecideHeldSynAsync(
@@ -387,7 +417,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         }
     }
 
-    private Task HandleRelayReply(PacketContext ctx, PacketDelegate next, ParsedPacket p, byte proto, bool isIpv6)
+    private void HandleRelayReply(PacketContext ctx, PacketDelegate next, ParsedPacket p, byte proto, bool isIpv6)
     {
         ushort dstPort = p.DestinationPort;
         NatEntry? entry = _nat.Find(proto, dstPort, isIpv6);
@@ -395,7 +425,8 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
         {
             if (_logger.IsEnabled(LogLevel.Trace))
                 _logger.LogTrace("  reply candidate dstPort={DstPort} ipv6={IsIpv6} has no NAT entry", dstPort, isIpv6);
-            return next(ctx);
+            next(ctx);
+            return;
         }
 
         // Loopback packets are captured twice (sender outbound + receiver inbound). Handle the
@@ -406,7 +437,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             if (_logger.IsEnabled(LogLevel.Trace))
                 _logger.LogTrace("  -> dropping the inbound loopback duplicate");
             ctx.Drop();
-            return Task.CompletedTask;
+            return;
         }
 
         int addressLength = isIpv6 ? 16 : 4;
@@ -432,7 +463,6 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
                 entry.OriginalDestinationAddress, entry.OriginalDestinationPort,
                 entry.OriginalSourceAddress, entry.OriginalSourcePort, entry.IfIdx);
         ctx.MarkModified();
-        return Task.CompletedTask;
     }
 
     // The host's answer, with a failure treated as "redirect". Erring towards the relay is the
@@ -468,7 +498,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
     //     reconnect is captured from its SYN. Blocking alone leaves the process retransmitting into
     //     silence for a minute or more.
     // Launching the process suspended avoids the situation entirely.
-    private Task HandleEscapedFlow(
+    private void HandleEscapedFlow(
         PacketContext ctx, PacketDelegate next, ParsedPacket p, IPAddress srcIp, ushort srcPort, IPAddress dstIp, ushort dstPort)
     {
         if (_flowsToReset != null)
@@ -478,7 +508,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             {
                 ResetTowardsProcess(ctx, p, key);
                 ctx.Drop();
-                return Task.CompletedTask;
+                return;
             }
         }
 
@@ -487,7 +517,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             _logger.LogDebug("dropping escaped flow {Source}:{SourcePort} -> {Destination}:{DestinationPort} (it started before capture)",
                 srcIp, srcPort, dstIp, dstPort);
             ctx.Drop();
-            return Task.CompletedTask;
+            return;
         }
 
         // Once per flow, not once per packet: an escaped connection carrying a video stream would
@@ -499,7 +529,7 @@ public sealed class NatRedirectMiddleware : IPacketMiddleware
             _logger.LogWarning("passing escaped flow {Source}:{SourcePort} -> {Destination}:{DestinationPort} — it started before capture, so the real IP is exposed to this destination",
                 srcIp, srcPort, dstIp, dstPort);
         }
-        return next(ctx);
+        next(ctx);
     }
 
     // The reset goes in the direction the peer's packets take: inbound, on the interface the

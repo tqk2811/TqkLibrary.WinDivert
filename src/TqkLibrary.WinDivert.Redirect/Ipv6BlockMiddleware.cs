@@ -30,14 +30,14 @@ public sealed class Ipv6BlockMiddleware : IPacketMiddleware
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
+    public void Invoke(PacketContext ctx, PacketDelegate next)
     {
         if (ShouldDrop(ctx))
         {
             ctx.Drop();
-            return Task.CompletedTask;
+            return;
         }
-        return next(ctx);
+        next(ctx);
     }
 
     // True when the packet belongs to a tracked process and should be dropped. False for other

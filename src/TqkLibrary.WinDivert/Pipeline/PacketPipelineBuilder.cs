@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
 
 namespace TqkLibrary.WinDivert.Pipeline;
 
@@ -19,7 +18,7 @@ public sealed class PacketPipelineBuilder
         return this;
     }
 
-    public PacketPipelineBuilder Use(Func<PacketContext, PacketDelegate, Task> middleware)
+    public PacketPipelineBuilder Use(Action<PacketContext, PacketDelegate> middleware)
     {
         if (middleware is null) throw new ArgumentNullException(nameof(middleware));
         _middlewares.Add(new DelegateMiddleware(middleware));
@@ -29,7 +28,7 @@ public sealed class PacketPipelineBuilder
     public int Count => _middlewares.Count;
 
     // Default terminal: leave the packet to be passed through unchanged.
-    private static readonly PacketDelegate PassTerminal = _ => Task.CompletedTask;
+    private static readonly PacketDelegate PassTerminal = _ => { };
 
     public PacketDelegate Build() => Build(PassTerminal);
 
@@ -42,7 +41,7 @@ public sealed class PacketPipelineBuilder
         {
             IPacketMiddleware middleware = _middlewares[i];
             PacketDelegate next = app;
-            app = ctx => middleware.InvokeAsync(ctx, next);
+            app = ctx => middleware.Invoke(ctx, next);
         }
         return app;
     }

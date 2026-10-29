@@ -28,7 +28,7 @@ public class NatRedirectChecksumTests
     // The relay's SYN-ACK as WinDivert hands it over: captured on loopback, checksum bytes that sum
     // to nothing, both checksum bits set anyway.
     [Fact]
-    public async Task TheRelaySynAckFromLoopbackIsLeftForTheFullRecompute()
+    public void TheRelaySynAckFromLoopbackIsLeftForTheFullRecompute()
     {
         var nat = new NatTable();
         nat.Upsert(new NatEntry(42, 6, Local, LocalPort, Remote, RemotePort, ifIdx: 7, subIfIdx: 0));
@@ -39,7 +39,7 @@ public class NatRedirectChecksumTests
         ctx.Address.Outbound = true;
         ctx.Address.Network.IfIdx = 1;
 
-        await Create(nat, new NatRedirectHeldSynTests.FakeTracker()).InvokeAsync(ctx, _ => Task.CompletedTask);
+        Create(nat, new NatRedirectHeldSynTests.FakeTracker()).Invoke(ctx, _ => { });
 
         Assert.Equal(PacketDisposition.Modified, ctx.Disposition);
         Assert.False(ctx.ChecksumsUpdated);
@@ -56,7 +56,7 @@ public class NatRedirectChecksumTests
     // The other direction still takes the fast path: a tracked SYN on a real interface, with
     // checksums the stack really computed, is patched in place and the result is correct.
     [Fact]
-    public async Task ATrackedSynOnARealInterfaceIsPatchedInPlaceCorrectly()
+    public void ATrackedSynOnARealInterfaceIsPatchedInPlaceCorrectly()
     {
         var tracker = new NatRedirectHeldSynTests.FakeTracker();
         tracker.Track(new FlowKey(6, Local, LocalPort, Remote, RemotePort));
@@ -65,7 +65,7 @@ public class NatRedirectChecksumTests
         ctx.Address.Loopback = false;
         ctx.Address.Network.IfIdx = 7;
 
-        await Create(new NatTable(), tracker).InvokeAsync(ctx, _ => Task.CompletedTask);
+        Create(new NatTable(), tracker).Invoke(ctx, _ => { });
 
         Assert.Equal(PacketDisposition.Modified, ctx.Disposition);
         Assert.True(ctx.ChecksumsUpdated);

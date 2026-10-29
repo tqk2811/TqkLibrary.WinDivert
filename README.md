@@ -85,10 +85,10 @@ public sealed class DropPort9000 : IPacketMiddleware
     private readonly ISocketTracker _tracker;   // injected: the context carries only the packet
     public DropPort9000(ISocketTracker tracker) => _tracker = tracker;
 
-    public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
+    public void Invoke(PacketContext ctx, PacketDelegate next)
     {
-        if (ctx.Packet?.DestinationPort == 9000) { ctx.Drop(); return Task.CompletedTask; }
-        return next(ctx);   // defer: not ours
+        if (ctx.Packet?.DestinationPort == 9000) { ctx.Drop(); return; }
+        next(ctx);   // defer: not ours
     }
 }
 ```

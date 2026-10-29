@@ -14,12 +14,11 @@ namespace TqkLibrary.WinDivert.Pipeline;
 /// composed middleware pipeline.
 /// </summary>
 /// <remarks>
-/// Threading model: the recv loop runs the pipeline SYNCHRONOUSLY on the pump thread
-/// (GetAwaiter().GetResult()) so packets keep their recv order on this handle — essential for the
-/// NAT egress/reply path. Every built-in middleware completes synchronously; a middleware that
-/// needs slow async work (DNS-over-HTTPS) drops the original packet and finishes the work on a
-/// background task, re-injecting the result through <see cref="IPacketInjector"/>. So GetResult()
-/// never actually blocks on I/O.
+/// Threading model: the recv loop runs the pipeline as a plain synchronous call on the pump
+/// thread, so packets keep their recv order on this handle — essential for the NAT egress/reply
+/// path. <see cref="PacketDelegate"/> returns void, so a middleware cannot await on the pump
+/// thread; one that needs slow async work (DNS-over-HTTPS) drops the original packet and finishes
+/// the work on a background task, re-injecting the result through <see cref="IPacketInjector"/>.
 /// </remarks>
 public sealed class PacketPump : IPacketPump
 {
@@ -196,7 +195,7 @@ public sealed class PacketPump : IPacketPump
 
             try
             {
-                _pipeline(ctx).GetAwaiter().GetResult();
+                _pipeline(ctx);
             }
             catch (Exception ex)
             {

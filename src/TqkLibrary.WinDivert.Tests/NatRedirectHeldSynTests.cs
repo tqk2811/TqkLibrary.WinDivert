@@ -37,7 +37,7 @@ public class NatRedirectHeldSynTests
         tracker.OnSweep = () => tracker.Track(Key(50000));  // the sweep finds the socket
 
         PacketContext ctx = Syn(50000, injector);
-        bool passed = await InvokeAsync(middleware, ctx);
+        bool passed = Invoke(middleware, ctx);
 
         Assert.False(passed);
         Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
@@ -68,7 +68,7 @@ public class NatRedirectHeldSynTests
         PacketContext ctx = Syn(50001, injector);
         byte[] original = ctx.Buffer[..ctx.Length];
 
-        await InvokeAsync(Create(nat, tracker), ctx);
+        Invoke(Create(nat, tracker), ctx);
 
         Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
         (byte[] packet, WinDivertAddress address) = await injector.NextAsync();
@@ -89,7 +89,7 @@ public class NatRedirectHeldSynTests
         var nat = new NatTable();
         var injector = new RecordingInjector();
 
-        await InvokeAsync(Create(nat, tracker), Syn(50002, injector));
+        Invoke(Create(nat, tracker), Syn(50002, injector));
 
         (byte[] packet, _) = await injector.NextAsync();
         Assert.Equal(RelayPort, PacketParser.Default.TryParse(packet, packet.Length)!.DestinationPort);
@@ -107,7 +107,7 @@ public class NatRedirectHeldSynTests
         var injector = new RecordingInjector();
 
         for (int i = 0; i < count; i++)
-            await InvokeAsync(middleware, Syn((ushort)(51000 + i), injector));
+            Invoke(middleware, Syn((ushort)(51000 + i), injector));
 
         for (int i = 0; i < count; i++)
         {
@@ -129,8 +129,8 @@ public class NatRedirectHeldSynTests
 
         PacketContext first = Syn(50003, injector);
         PacketContext second = Syn(50003, injector);
-        await InvokeAsync(middleware, first);
-        await InvokeAsync(middleware, second);
+        Invoke(middleware, first);
+        Invoke(middleware, second);
         Assert.Equal(PacketDisposition.Drop, second.Disposition);
 
         gate.Set();
@@ -149,10 +149,10 @@ public class NatRedirectHeldSynTests
         var injector = new RecordingInjector();
         NatRedirectMiddleware middleware = Create(new NatTable(), tracker);
 
-        await InvokeAsync(middleware, Syn(50006, injector));
+        Invoke(middleware, Syn(50006, injector));
         tracker.Track(Key(50006));
         PacketContext second = Syn(50006, injector);
-        await InvokeAsync(middleware, second);
+        Invoke(middleware, second);
         Assert.Equal(PacketDisposition.Drop, second.Disposition);
 
         gate.Set();
@@ -170,7 +170,7 @@ public class NatRedirectHeldSynTests
         var injector = new RecordingInjector();
         using var cts = new CancellationTokenSource();
 
-        await InvokeAsync(Create(new NatTable(), tracker), Syn(50004, injector, cts.Token));
+        Invoke(Create(new NatTable(), tracker), Syn(50004, injector, cts.Token));
         cts.Cancel();
         gate.Set();
 
@@ -180,14 +180,14 @@ public class NatRedirectHeldSynTests
 
     // A tracked SYN stays on the synchronous path: rewritten in place, no sweep, no injection.
     [Fact]
-    public async Task ATrackedSynIsRewrittenOnThePump()
+    public void ATrackedSynIsRewrittenOnThePump()
     {
         var tracker = new FakeTracker();
         tracker.Track(Key(50005));
         var injector = new RecordingInjector();
         PacketContext ctx = Syn(50005, injector);
 
-        await InvokeAsync(Create(new NatTable(), tracker), ctx);
+        Invoke(Create(new NatTable(), tracker), ctx);
 
         Assert.Equal(PacketDisposition.Modified, ctx.Disposition);
         Assert.Equal(0, tracker.Sweeps);
@@ -197,7 +197,7 @@ public class NatRedirectHeldSynTests
     // Any other untracked packet is passed on at once: the kernel sweep is only requested in the
     // background, never run on the pump, where it stalled every other packet of the machine.
     [Fact]
-    public async Task AnUntrackedMidFlowSegmentPassesWithoutASweepOnThePump()
+    public void AnUntrackedMidFlowSegmentPassesWithoutASweepOnThePump()
     {
         var tracker = new FakeTracker();
         var injector = new RecordingInjector();
@@ -205,7 +205,7 @@ public class NatRedirectHeldSynTests
         ctx.Buffer[33] = 0x10;  // ACK, not SYN
         ctx.Packet = PacketParser.Default.TryParse(ctx.Buffer, ctx.Length);
 
-        bool passed = await InvokeAsync(Create(new NatTable(), tracker), ctx);
+        bool passed = Invoke(Create(new NatTable(), tracker), ctx);
 
         Assert.True(passed);
         Assert.Equal(0, tracker.SyncReconciles);
@@ -220,10 +220,10 @@ public class NatRedirectHeldSynTests
             nat, tracker, RelayPorts.Ipv4Only(RelayPort, 0), RedirectProtocol.Tcp, rootProcessId: 1,
             NullLogger<NatRedirectMiddleware>.Instance);
 
-    private static async Task<bool> InvokeAsync(NatRedirectMiddleware middleware, PacketContext ctx)
+    private static bool Invoke(NatRedirectMiddleware middleware, PacketContext ctx)
     {
         bool passed = false;
-        await middleware.InvokeAsync(ctx, _ => { passed = true; return Task.CompletedTask; });
+        middleware.Invoke(ctx, _ => { passed = true; });
         return passed;
     }
 

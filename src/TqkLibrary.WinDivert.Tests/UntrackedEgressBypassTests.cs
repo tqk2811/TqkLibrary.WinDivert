@@ -174,7 +174,7 @@ public class UntrackedEgressBypassTests
         int pipelineRuns = 0;
         var pump = new PacketPump(
             "test", handle,
-            _ => { Interlocked.Increment(ref pipelineRuns); return Task.CompletedTask; },
+            _ => { Interlocked.Increment(ref pipelineRuns); },
             PacketParser.Default,
             NullLogger<PacketPump>.Instance,
             new FixedBypass(bypassAnswer));

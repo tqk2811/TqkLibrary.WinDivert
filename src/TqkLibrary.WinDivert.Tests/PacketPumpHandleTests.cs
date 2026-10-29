@@ -21,7 +21,7 @@ public class PacketPumpHandleTests
         => new PacketPump(
             "test",
             handle,
-            _ => Task.CompletedTask,
+            _ => { },
             new NoParser(),
             NullLogger<PacketPump>.Instance);
 

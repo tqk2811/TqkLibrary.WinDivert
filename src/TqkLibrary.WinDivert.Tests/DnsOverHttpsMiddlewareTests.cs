@@ -38,7 +38,7 @@ public class DnsOverHttpsMiddlewareTests
         var middleware = Create(DnsInterceptScope.WholeMachine, new StubResolver(Answer));
 
         PacketContext ctx = Query(ClientV4, ServerV4, "example.com", injector);
-        bool passed = await InvokeAsync(middleware, ctx);
+        bool passed = Invoke(middleware, ctx);
 
         Assert.False(passed);
         Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
@@ -60,7 +60,7 @@ public class DnsOverHttpsMiddlewareTests
         var middleware = Create(DnsInterceptScope.WholeMachine, new StubResolver(Answer));
 
         PacketContext ctx = Query(ClientV6, ServerV6, "example.com", injector);
-        await InvokeAsync(middleware, ctx);
+        Invoke(middleware, ctx);
 
         Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
         (byte[] packet, WinDivertAddress addr) = await injector.NextAsync();
@@ -74,7 +74,7 @@ public class DnsOverHttpsMiddlewareTests
         var injector = new RecordingInjector();
         var middleware = Create(DnsInterceptScope.WholeMachine, new StubResolver(Answer) { Throw = true });
 
-        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", injector));
+        Invoke(middleware, Query(ClientV4, ServerV4, "example.com", injector));
 
         (byte[] packet, _) = await injector.NextAsync();
         byte[] dns = packet[28..];  // IPv4 header 20 + UDP header 8
@@ -95,7 +95,7 @@ public class DnsOverHttpsMiddlewareTests
         var injector = new RecordingInjector();
         var middleware = Create(DnsInterceptScope.WholeMachine, new StubResolver(Array.Empty<byte>()));
 
-        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", injector));
+        Invoke(middleware, Query(ClientV4, ServerV4, "example.com", injector));
 
         (byte[] packet, _) = await injector.NextAsync();
         Assert.Equal(2, packet[28 + 3] & 0x0F);
@@ -109,7 +109,7 @@ public class DnsOverHttpsMiddlewareTests
         var middleware = Create(DnsInterceptScope.WholeMachine, resolver);
         using var cts = new CancellationTokenSource();
 
-        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", injector, cts.Token));
+        Invoke(middleware, Query(ClientV4, ServerV4, "example.com", injector, cts.Token));
         await resolver.WaitForCallAsync();
         cts.Cancel();
         await resolver.WaitForExitAsync();
@@ -126,7 +126,7 @@ public class DnsOverHttpsMiddlewareTests
         var resolver = new StubResolver(Answer) { ThrowCancel = true };
         var middleware = Create(DnsInterceptScope.WholeMachine, resolver);
 
-        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", injector));
+        Invoke(middleware, Query(ClientV4, ServerV4, "example.com", injector));
 
         (byte[] packet, _) = await injector.NextAsync();
         Assert.Equal(2, packet[28 + 3] & 0x0F);
@@ -158,7 +158,7 @@ public class DnsOverHttpsMiddlewareTests
 
         PacketContext[] ctxs = Enumerable.Range(0, 5)
             .Select(_ => Query(ClientV4, ServerV4, "example.com", injector)).ToArray();
-        foreach (PacketContext ctx in ctxs) await InvokeAsync(middleware, ctx);
+        foreach (PacketContext ctx in ctxs) Invoke(middleware, ctx);
 
         Assert.All(ctxs, c => Assert.Equal(PacketDisposition.Drop, c.Disposition));
         await resolver.WaitForCallAsync();
@@ -183,34 +183,34 @@ public class DnsOverHttpsMiddlewareTests
     }
 
     [Fact]
-    public async Task TrackedOnlyLeavesAQueryFromAnUntrackedSocketAlone()
+    public void TrackedOnlyLeavesAQueryFromAnUntrackedSocketAlone()
     {
         var resolver = new StubResolver(Answer);
         var middleware = Create(DnsInterceptScope.TrackedProcesses, resolver);
 
         PacketContext ctx = Query(ClientV4, ServerV4, "example.com", new RecordingInjector());
 
-        Assert.True(await InvokeAsync(middleware, ctx));
+        Assert.True(Invoke(middleware, ctx));
         Assert.Equal(PacketDisposition.Pass, ctx.Disposition);
         Assert.Equal(0, resolver.Calls);
     }
 
     [Fact]
-    public async Task TrackedOnlyStillTakesAQueryFromATrackedSocket()
+    public void TrackedOnlyStillTakesAQueryFromATrackedSocket()
     {
         var tracker = new StubTracker { TrackedUdp = (ClientV4, ClientPort) };
         var middleware = Create(DnsInterceptScope.TrackedProcesses, new StubResolver(Answer), tracker);
 
         PacketContext ctx = Query(ClientV4, ServerV4, "example.com", new RecordingInjector());
 
-        Assert.False(await InvokeAsync(middleware, ctx));
+        Assert.False(Invoke(middleware, ctx));
         Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
     }
 
     [Theory]
     [InlineData(true, false)]   // inbound
     [InlineData(false, true)]   // loopback
-    public async Task InboundAndLoopbackAreNeverTaken(bool inbound, bool loopback)
+    public void InboundAndLoopbackAreNeverTaken(bool inbound, bool loopback)
     {
         var resolver = new StubResolver(Answer);
         var middleware = Create(DnsInterceptScope.WholeMachine, resolver);
@@ -219,7 +219,7 @@ public class DnsOverHttpsMiddlewareTests
         ctx.Address.Outbound = !inbound;
         ctx.Address.Loopback = loopback;
 
-        Assert.True(await InvokeAsync(middleware, ctx));
+        Assert.True(Invoke(middleware, ctx));
         Assert.Equal(PacketDisposition.Pass, ctx.Disposition);
         Assert.Equal(0, resolver.Calls);
     }
@@ -227,17 +227,17 @@ public class DnsOverHttpsMiddlewareTests
     // The resolver's own lookup of a host-name endpoint goes out through the OS resolver; taking
     // it machine-wide would leave DoH waiting on an answer only DoH could give.
     [Fact]
-    public async Task TheLookupOfTheEndpointsOwnNameIsLetThrough()
+    public void TheLookupOfTheEndpointsOwnNameIsLetThrough()
     {
         var resolver = new StubResolver(Answer, new Uri("https://dns.google/dns-query"));
         var middleware = Create(DnsInterceptScope.WholeMachine, resolver);
 
         PacketContext own = Query(ClientV4, ServerV4, "DNS.google", new RecordingInjector());
-        Assert.True(await InvokeAsync(middleware, own));
+        Assert.True(Invoke(middleware, own));
         Assert.Equal(0, resolver.Calls);
 
         PacketContext other = Query(ClientV4, ServerV4, "example.com", new RecordingInjector());
-        Assert.False(await InvokeAsync(middleware, other));
+        Assert.False(Invoke(middleware, other));
     }
 
     [Fact]
@@ -281,7 +281,7 @@ public class DnsOverHttpsMiddlewareTests
     // ---- decider mode ----------------------------------------------------------------------
 
     [Fact]
-    public async Task DeciderPassHandsTheQueryOnAndInjectsNothing()
+    public void DeciderPassHandsTheQueryOnAndInjectsNothing()
     {
         var injector = new RecordingInjector();
         var resolver = new StubResolver(Answer);
@@ -289,7 +289,7 @@ public class DnsOverHttpsMiddlewareTests
         var middleware = Create((in DnsQueryInfo _) => { asked++; return DnsQueryDecision.Pass; });
 
         PacketContext ctx = Query(ClientV4, ServerV4, "example.com", injector);
-        bool passed = await InvokeAsync(middleware, ctx);
+        bool passed = Invoke(middleware, ctx);
 
         Assert.True(passed);
         Assert.Equal(1, asked);
@@ -307,7 +307,7 @@ public class DnsOverHttpsMiddlewareTests
         var middleware = Create((in DnsQueryInfo _) => DnsQueryDecision.Resolve(picked, false));
 
         PacketContext ctx = Query(ClientV6, ServerV6, "example.com", injector);
-        bool passed = await InvokeAsync(middleware, ctx);
+        bool passed = Invoke(middleware, ctx);
 
         Assert.False(passed);
         Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
@@ -322,13 +322,13 @@ public class DnsOverHttpsMiddlewareTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task DeciderGetsThePidOnlyWhenTheSocketIsTracked(bool tracked)
+    public void DeciderGetsThePidOnlyWhenTheSocketIsTracked(bool tracked)
     {
         var tracker = new StubTracker { UdpOwner = tracked ? (ClientV4, ClientPort, 4242u) : null };
         DnsQueryInfo? seen = null;
         var middleware = Create((in DnsQueryInfo q) => { seen = q; return DnsQueryDecision.Pass; }, tracker);
 
-        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", new RecordingInjector()));
+        Invoke(middleware, Query(ClientV4, ServerV4, "example.com", new RecordingInjector()));
 
         Assert.NotNull(seen);
         Assert.Equal(tracked ? 4242u : (uint?)null, seen.Value.ProcessId);
@@ -336,12 +336,12 @@ public class DnsOverHttpsMiddlewareTests
     }
 
     [Fact]
-    public async Task DeciderGetsTheLowerCasedNameAndTheQueryType()
+    public void DeciderGetsTheLowerCasedNameAndTheQueryType()
     {
         DnsQueryInfo? seen = null;
         var middleware = Create((in DnsQueryInfo q) => { seen = q; return DnsQueryDecision.Pass; });
 
-        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "WWW.Example.COM", new RecordingInjector(), qtype: 28));
+        Invoke(middleware, Query(ClientV4, ServerV4, "WWW.Example.COM", new RecordingInjector(), qtype: 28));
 
         Assert.NotNull(seen);
         Assert.Equal("www.example.com", seen.Value.QueryName);
@@ -349,13 +349,13 @@ public class DnsOverHttpsMiddlewareTests
     }
 
     [Fact]
-    public async Task ADeciderThatThrowsLetsTheQueryThrough()
+    public void ADeciderThatThrowsLetsTheQueryThrough()
     {
         var injector = new RecordingInjector();
         var middleware = Create((in DnsQueryInfo _) => throw new InvalidOperationException("decider broke"));
 
         PacketContext ctx = Query(ClientV4, ServerV4, "example.com", injector);
-        bool passed = await InvokeAsync(middleware, ctx);
+        bool passed = Invoke(middleware, ctx);
 
         Assert.True(passed);
         Assert.NotEqual(PacketDisposition.Drop, ctx.Disposition);
@@ -364,14 +364,14 @@ public class DnsOverHttpsMiddlewareTests
 
     // A resolver with a host-name endpoint must not be asked for that very name.
     [Fact]
-    public async Task DeciderPicksAResolverForItsOwnEndpointNameAndTheQueryPassesThrough()
+    public void DeciderPicksAResolverForItsOwnEndpointNameAndTheQueryPassesThrough()
     {
         var injector = new RecordingInjector();
         var resolver = new StubResolver(Answer, new Uri("https://dns.google/dns-query"));
         var middleware = Create((in DnsQueryInfo _) => DnsQueryDecision.Resolve(resolver, false));
 
         PacketContext ctx = Query(ClientV4, ServerV4, "DNS.google", injector);
-        bool passed = await InvokeAsync(middleware, ctx);
+        bool passed = Invoke(middleware, ctx);
 
         Assert.True(passed);
         Assert.NotEqual(PacketDisposition.Drop, ctx.Disposition);
@@ -389,7 +389,7 @@ public class DnsOverHttpsMiddlewareTests
 
         PacketContext ctx = Query(ClientV4, ServerV4, "example.com", injector);
         byte[] original = ctx.Buffer[..ctx.Length];
-        bool passed = await InvokeAsync(middleware, ctx);
+        bool passed = Invoke(middleware, ctx);
 
         Assert.False(passed);
         Assert.Equal(PacketDisposition.Drop, ctx.Disposition);
@@ -406,7 +406,7 @@ public class DnsOverHttpsMiddlewareTests
         var resolver = new StubResolver(Answer) { Throw = true };
         var middleware = Create((in DnsQueryInfo _) => DnsQueryDecision.Resolve(resolver, false));
 
-        await InvokeAsync(middleware, Query(ClientV4, ServerV4, "example.com", injector));
+        Invoke(middleware, Query(ClientV4, ServerV4, "example.com", injector));
 
         (byte[] packet, WinDivertAddress addr) = await injector.NextAsync();
         Assert.False(addr.Outbound);
@@ -427,9 +427,9 @@ public class DnsOverHttpsMiddlewareTests
 
         PacketContext first = Query(ClientV4, ServerV4, "example.com", injector);
         PacketContext second = Query(ClientV4, ServerV4, "example.com", injector);
-        Assert.False(await InvokeAsync(middleware, first));
+        Assert.False(Invoke(middleware, first));
         await resolver.WaitForCallAsync();
-        bool secondPassed = await InvokeAsync(middleware, second);
+        bool secondPassed = Invoke(middleware, second);
 
         Assert.True(secondPassed);
         Assert.NotEqual(PacketDisposition.Drop, second.Disposition);
@@ -455,10 +455,10 @@ public class DnsOverHttpsMiddlewareTests
             NullLogger<DnsOverHttpsMiddleware>.Instance, scope: scope);
 
     // True when the middleware handed the packet on rather than claiming it.
-    private static async Task<bool> InvokeAsync(DnsOverHttpsMiddleware middleware, PacketContext ctx)
+    private static bool Invoke(DnsOverHttpsMiddleware middleware, PacketContext ctx)
     {
         bool passed = false;
-        await middleware.InvokeAsync(ctx, _ => { passed = true; return Task.CompletedTask; });
+        middleware.Invoke(ctx, _ => { passed = true; });
         return passed;
     }
 

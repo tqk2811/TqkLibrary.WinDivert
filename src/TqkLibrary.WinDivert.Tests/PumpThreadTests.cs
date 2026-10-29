@@ -31,7 +31,7 @@ public class PumpThreadTests
     {
         var handle = new FakeWinDivertHandle(layer: Native.Enums.WinDivertLayer.Network);
         var pump = new PacketPump(
-            "test", handle, _ => Task.CompletedTask, new NoParser(), NullLogger<PacketPump>.Instance);
+            "test", handle, _ => { }, new NoParser(), NullLogger<PacketPump>.Instance);
 
         pump.Start();
         Assert.True(handle.WaitForFirstRecv(Patience), "the pump never reached its first recv");

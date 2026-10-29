@@ -20,7 +20,7 @@ public sealed class PacketPumpCrashTests
     {
         var handle = new ThrowingSendHandle();
         var logger = new CapturingLogger();
-        var pump = new PacketPump("test", handle, _ => Task.CompletedTask, PacketParser.Default, logger);
+        var pump = new PacketPump("test", handle, _ => { }, PacketParser.Default, logger);
         PumpStop? stop = null;
         using var stopped = new ManualResetEventSlim();
         pump.Stopped += s => { stop = s; stopped.Set(); };

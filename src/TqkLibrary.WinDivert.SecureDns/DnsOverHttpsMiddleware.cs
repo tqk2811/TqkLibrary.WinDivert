@@ -115,15 +115,30 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         _maxPendingQueries = maxPendingQueries < 1 ? 1 : maxPendingQueries;
     }
 
-    public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
+    public void Invoke(PacketContext ctx, PacketDelegate next)
     {
         ParsedPacket? p = ctx.Packet;
         // Scope: outbound UDP/53 on a real interface, from a target process or from anyone.
-        if (p == null || !p.IsUdp) return next(ctx);
-        if (!ctx.Address.Outbound || ctx.Address.Loopback) return next(ctx);
-        if (p.DestinationPort != DnsPort) return next(ctx);
+        if (p == null || !p.IsUdp)
+        {
+            next(ctx);
+            return;
+        }
+        if (!ctx.Address.Outbound || ctx.Address.Loopback)
+        {
+            next(ctx);
+            return;
+        }
+        if (p.DestinationPort != DnsPort)
+        {
+            next(ctx);
+            return;
+        }
         if (_scope == DnsInterceptScope.TrackedProcesses && !_tracker.IsTrackedUdp(p.Source, p.SourcePort))
-            return next(ctx);
+        {
+            next(ctx);
+            return;
+        }
 
         int payloadOffset = p.Udp.PayloadOffset;
         int available = ctx.Length - payloadOffset;
@@ -135,8 +150,16 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
         string? queryName = null;
         if (_decider != null)
         {
-            if (payloadLen <= 0) return next(ctx);
-            if (!TryDecide(ctx, p, payloadOffset, payloadLen, out DnsQueryDecision decision, out queryName)) return next(ctx);
+            if (payloadLen <= 0)
+            {
+                next(ctx);
+                return;
+            }
+            if (!TryDecide(ctx, p, payloadOffset, payloadLen, out DnsQueryDecision decision, out queryName))
+            {
+                next(ctx);
+                return;
+            }
             resolver = decision.Resolver!;
             fallback = decision.FallbackToPlainDnsOnFailure;
         }
@@ -145,9 +168,13 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             if (payloadLen <= 0)
             {
                 ctx.Drop();
-                return Task.CompletedTask;
+                return;
             }
-            if (IsEndpointLookup(ctx.Buffer, payloadOffset, payloadLen)) return next(ctx);
+            if (IsEndpointLookup(ctx.Buffer, payloadOffset, payloadLen))
+            {
+                next(ctx);
+                return;
+            }
             resolver = _resolver!;
             fallback = false;
         }
@@ -164,7 +191,8 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
                 if (_logger.IsEnabled(LogLevel.Debug))
                     _logger.LogDebug("DoH backlog full ({Max}), query {Query} from {Client}:{ClientPort} goes out as plain DNS",
                         _maxPendingQueries, queryName, p.Source, p.SourcePort);
-                return next(ctx);
+                next(ctx);
+                return;
             }
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("DoH backlog full ({Max}), SERVFAIL for query {Query} from {Client}:{ClientPort}",
@@ -180,7 +208,7 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
                     _logger.LogWarning(ex, "DoH SERVFAIL injection failed for {Client}:{ClientPort}", excess.ClientIp, excess.ClientPort);
                 }
             }
-            return Task.CompletedTask;
+            return;
         }
 
         // Copy the DNS query payload + the 5-tuple/interface out of the shared buffer NOW.
@@ -206,7 +234,6 @@ public sealed class DnsOverHttpsMiddleware : IPacketMiddleware
             try { await ResolveAndInjectAsync(resolver, query, target, original, queryName, startedAt, token).ConfigureAwait(false); }
             finally { Interlocked.Decrement(ref _pendingQueries); }
         });
-        return Task.CompletedTask;
     }
 
     // Asks the decider about one query. False means let it through: decided so, unparseable, or

@@ -28,7 +28,7 @@ public sealed class BlockTargetUdpMiddleware : IPacketMiddleware
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    public Task InvokeAsync(PacketContext ctx, PacketDelegate next)
+    public void Invoke(PacketContext ctx, PacketDelegate next)
     {
         ParsedPacket? p = ctx.Packet;
         if (p != null && p.IsUdp
@@ -38,8 +38,8 @@ public sealed class BlockTargetUdpMiddleware : IPacketMiddleware
             _logger.LogTrace("dropping udp {Source}:{SourcePort} -> {Destination}:{DestinationPort} len={Length}",
                 p.Source, p.SourcePort, p.Destination, p.DestinationPort, ctx.Length);
             ctx.Drop();
-            return Task.CompletedTask;
+            return;
         }
-        return next(ctx);
+        next(ctx);
     }
 }
