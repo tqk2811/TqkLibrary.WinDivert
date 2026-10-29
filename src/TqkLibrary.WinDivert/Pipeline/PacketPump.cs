@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TqkLibrary.WinDivert.Pipeline.Helpers;
+using TqkLibrary.WinDivert.Pipeline.Models;
 
 namespace TqkLibrary.WinDivert.Pipeline;
 
@@ -27,6 +28,7 @@ public sealed class PacketPump : IPacketPump
     private readonly IPacketParser _parser;
     private readonly ILogger _logger;
     private readonly IPacketBypass? _bypass;
+    private readonly PumpLatencyAlertOptions _latencyAlert;
 
     /// <summary>
     /// One byte over WINDIVERT_MTU_MAX (65575), the largest packet the driver will hand over.
@@ -65,15 +67,18 @@ public sealed class PacketPump : IPacketPump
     /// Optional fast path: packets it says the pipeline would not touch are re-sent as they came,
     /// skipping parse, context and pipeline. Null runs every packet through the pipeline.
     /// </param>
+    /// <param name="latencyAlert">When a slow window is logged below Debug; null takes the defaults.</param>
     public PacketPump(
         string name,
         IWinDivertHandle handle,
         PacketDelegate pipeline,
         IPacketParser parser,
         ILogger<PacketPump> logger,
-        IPacketBypass? bypass = null)
+        IPacketBypass? bypass = null,
+        PumpLatencyAlertOptions? latencyAlert = null)
     {
         _bypass = bypass;
+        _latencyAlert = latencyAlert ?? new PumpLatencyAlertOptions();
         Name = name ?? throw new ArgumentNullException(nameof(name));
         _handle = handle ?? throw new ArgumentNullException(nameof(handle));
         _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
@@ -132,7 +137,8 @@ public sealed class PacketPump : IPacketPump
         var fastWork = new PumpLatencyStats(LatencyReportInterval, statsStart);
         var fullLatency = new PumpLatencyStats(LatencyReportInterval, statsStart);
         var fullWork = new PumpLatencyStats(LatencyReportInterval, statsStart);
-        bool logLatency = _logger.IsEnabled(LogLevel.Debug);
+        // Measured below Debug too when an alert is on: the slow window is what the alert reports.
+        bool logLatency = _logger.IsEnabled(LogLevel.Debug) || _latencyAlert.IsEnabled();
         // The pump thread's own allocation, so a "zero-allocation" fast path can be told from a busy one.
         long allocMark = GC.GetAllocatedBytesForCurrentThread();
         int gen0Mark = GC.CollectionCount(0);
@@ -254,10 +260,10 @@ public sealed class PacketPump : IPacketPump
     {
         long now = Stopwatch.GetTimestamp();
         if (!fast.IsDue(now)) return;
-        long packets = LogWindow("fast", fast.TryTakeSummary(now));
-        LogWindow("fast-work", fastWork.TryTakeSummary(now));
-        packets += LogWindow("full", full.TryTakeSummary(now));
-        LogWindow("full-work", fullWork.TryTakeSummary(now));
+        long packets = LogWindow("fast", fast.TryTakeSummary(now), alert: true);
+        LogWindow("fast-work", fastWork.TryTakeSummary(now), alert: false);
+        packets += LogWindow("full", full.TryTakeSummary(now), alert: true);
+        LogWindow("full-work", fullWork.TryTakeSummary(now), alert: false);
 
         // Process-wide GC count, but only this thread's allocation: gen0 collections are a hint, the byte count is the proof.
         long allocated = GC.GetAllocatedBytesForCurrentThread() - allocMark;
@@ -284,11 +290,19 @@ public sealed class PacketPump : IPacketPump
         if (address.UDPChecksum) _udpChecksumValid++;
     }
 
-    private long LogWindow(string path, PumpLatencySummary? summary)
+    // alert: only the capture-to-release paths; the -work ones are a breakdown of them.
+    private long LogWindow(string path, PumpLatencySummary? summary, bool alert)
     {
         if (summary is not PumpLatencySummary s) return 0;
         _logger.LogDebug("[{Pump}] capture-to-release {Path} over {Seconds:0}s: packets={Count} avg={Avg}us p50<={P50}us p99<={P99}us max={Max}us",
             Name, path, s.Window.TotalSeconds, s.Count, s.AverageMicros, s.P50Micros, s.P99Micros, s.MaxMicros);
+        if (alert)
+        {
+            LogLevel level = _latencyAlert.LevelFor(s.AverageMicros);
+            if (level != LogLevel.None)
+                _logger.Log(level, "[{Pump}] {Path} path slow over {Seconds:0}s: avg={Avg}us p99<={P99}us max={Max}us packets={Count}",
+                    Name, path, s.Window.TotalSeconds, s.AverageMicros, s.P99Micros, s.MaxMicros, s.Count);
+        }
         return s.Count;
     }
 
