@@ -25,6 +25,14 @@ public interface ISocketTracker : IDisposable
     event Action<IPAddress, ushort>? UdpBindAdded;
     event Action<IPAddress, ushort>? UdpBindRemoved;
 
+    /// <summary>
+    /// Fired when the SOCKET pump of one tracked pid gave up on its handle (the driver kept failing)
+    /// rather than being stopped. The pid has already been dropped from scope; the host decides
+    /// whether to add it again or report it. Raised on the pump's thread.
+    /// </summary>
+    /// <remarks>Defaults to an event that never fires, so existing implementations keep compiling.</remarks>
+    event Action<uint>? ProcessPumpStopped { add { } remove { } }
+
     /// <summary>Process ids currently in scope.</summary>
     IReadOnlyCollection<uint> TrackedProcessIds { get; }
 

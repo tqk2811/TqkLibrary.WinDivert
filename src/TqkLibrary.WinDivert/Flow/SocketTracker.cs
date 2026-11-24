@@ -97,12 +97,26 @@ public sealed class SocketTracker : ISocketTracker
     {
         public IWinDivertHandle Handle { get; }
         public Task PumpTask { get; }
+        public PumpGiveUp GiveUp { get; }
 
-        public PerPidHandle(IWinDivertHandle h, Task t)
+        public PerPidHandle(IWinDivertHandle h, Task t, PumpGiveUp giveUp)
         {
             Handle = h;
             PumpTask = t;
+            GiveUp = giveUp;
         }
+    }
+
+    /// <summary>
+    /// Set by a pump that stopped because its handle kept failing, before it tries to drop its own
+    /// entry. The pump starts before AddProcess publishes that entry, so AddProcess reads this after
+    /// publishing: one of the two always sees the other and the entry is never left behind.
+    /// </summary>
+    private sealed class PumpGiveUp
+    {
+        private int _happened;
+        public bool Happened => Volatile.Read(ref _happened) != 0;
+        public void Mark() => Interlocked.Exchange(ref _happened, 1);
     }
 
     // Linger window before a closed TCP flow is purged. Kernel typically retransmits the
@@ -130,6 +144,7 @@ public sealed class SocketTracker : ISocketTracker
     public event Action<FlowKey>? TcpConnectClosed;
     public event Action<IPAddress, ushort>? UdpBindAdded;
     public event Action<IPAddress, ushort>? UdpBindRemoved;
+    public event Action<uint>? ProcessPumpStopped;
 
     /// <param name="processId">
     /// Root process to follow. Zero means "start with nothing tracked" — pids are then added via
@@ -243,7 +258,8 @@ public sealed class SocketTracker : ISocketTracker
             return;
         }
 
-        _allHandle = new PerPidHandle(handle, BlockingLoop.Start(() => PumpLoop(handle, 0, _cts.Token)));
+        var allGiveUp = new PumpGiveUp();
+        _allHandle = new PerPidHandle(handle, BlockingLoop.Start(() => PumpLoop(handle, 0, allGiveUp, _cts.Token)), allGiveUp);
     }
 
     // The verdict on one pid, asked once and then remembered. "Not yet known" is not remembered:
@@ -337,8 +353,9 @@ public sealed class SocketTracker : ISocketTracker
         // Read here rather than inside the task: Dispose disposes the source, and a task body that
         // reaches for the token afterwards throws ObjectDisposedException with nobody watching.
         CancellationToken token = _cts.Token;
-        Task pumpTask = BlockingLoop.Start(() => PumpLoop(handle, pid, token));
-        var entry = new PerPidHandle(handle, pumpTask);
+        var giveUp = new PumpGiveUp();
+        Task pumpTask = BlockingLoop.Start(() => PumpLoop(handle, pid, giveUp, token));
+        var entry = new PerPidHandle(handle, pumpTask, giveUp);
         if (!_pidHandles.TryAdd(pid, entry))
         {
             // Race with another AddProcess for the same pid — discard ours. Shut down and leave:
@@ -360,6 +377,13 @@ public sealed class SocketTracker : ISocketTracker
             try { orphan.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
             return;
         }
+
+        // The pump may already have given up on this handle — it starts before the entry is
+        // published, so its own clean-up can run before there is anything to remove. Dropped here
+        // so the pid does not read as tracked behind a dead handle. Compare-and-remove: only this
+        // very entry, never one a later AddProcess put in its place.
+        if (giveUp.Happened)
+            _pidHandles.TryRemove(new KeyValuePair<uint, PerPidHandle>(pid, entry));
 
         // Pre-populate this pid's existing sockets so events that fired before the filter
         // attached are not lost (mirrors the root-pid behaviour at Start time).
@@ -535,13 +559,13 @@ public sealed class SocketTracker : ISocketTracker
     /// wait for the pump task. The close belongs to the thread doing the reading. When a wait times
     /// out the handle simply closes a moment later instead of being pulled out from under the pump.
     /// </remarks>
-    private void PumpLoop(IWinDivertHandle handle, uint pid, CancellationToken ct)
+    private void PumpLoop(IWinDivertHandle handle, uint pid, PumpGiveUp giveUp, CancellationToken ct)
     {
-        try { PumpEvents(handle, pid, ct); }
+        try { PumpEvents(handle, pid, giveUp, ct); }
         finally { handle.Dispose(); }
     }
 
-    private void PumpEvents(IWinDivertHandle handle, uint pid, CancellationToken ct)
+    private void PumpEvents(IWinDivertHandle handle, uint pid, PumpGiveUp giveUp, CancellationToken ct)
     {
         byte[] dummy = new byte[0];
         int failuresInARow = 0;
@@ -556,6 +580,8 @@ public sealed class SocketTracker : ISocketTracker
                 if (++failuresInARow >= MaxRecvFailuresInARow)
                 {
                     _logger.LogError("Socket pump for pid={Pid} giving up after {Count} consecutive failures", pid, failuresInARow);
+                    giveUp.Mark();
+                    OnPumpGaveUp(handle, pid);
                     break;
                 }
                 continue;
@@ -579,6 +605,21 @@ public sealed class SocketTracker : ISocketTracker
             }
         }
         _logger.LogDebug("Socket pump for pid={Pid} exited (0 = machine-wide)", pid);
+    }
+
+    /// <summary>
+    /// Takes a pid whose pump gave up out of scope, so IsTrackedProcess stops answering true and the
+    /// next AddProcess opens a fresh handle, then tells the host. Only the entry that owns this
+    /// handle is removed; the machine-wide pump (pid 0) has no entry and only raises the event.
+    /// </summary>
+    private void OnPumpGaveUp(IWinDivertHandle handle, uint pid)
+    {
+        if (_pidHandles.TryGetValue(pid, out PerPidHandle? entry) && ReferenceEquals(entry.Handle, handle))
+            _pidHandles.TryRemove(new KeyValuePair<uint, PerPidHandle>(pid, entry));
+
+        if (Volatile.Read(ref _disposed) != 0) return;
+        try { ProcessPumpStopped?.Invoke(pid); }
+        catch (Exception ex) { _logger.LogWarning(ex, "a ProcessPumpStopped subscriber threw for pid={Pid}", pid); }
     }
 
     private async Task CleanupLoop(CancellationToken ct)

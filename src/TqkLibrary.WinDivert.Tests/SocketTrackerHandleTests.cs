@@ -116,4 +116,34 @@ public class SocketTrackerHandleTests
             tracker.Dispose();
         }
     }
+
+    // A pump that gives up on a failing handle used to leave its entry in the table: the pid still
+    // read as tracked, and AddProcess saw the entry and never opened a new handle.
+    [Fact]
+    public void A_pump_that_gives_up_drops_its_pid_and_says_so()
+    {
+        const uint pid = 4321;
+        const int ErrorAccessDenied = 5;
+        var factory = new FakeHandleFactory(filter => new FakeWinDivertHandle(filter) { FailsEveryRecvWith = ErrorAccessDenied });
+        var tracker = new SocketTracker(0, factory, Log);
+        using var stopped = new ManualResetEventSlim(false);
+        uint stoppedPid = 0;
+        tracker.ProcessPumpStopped += p => { stoppedPid = p; stopped.Set(); };
+
+        try
+        {
+            tracker.AddProcess(pid);
+
+            Assert.True(stopped.Wait(Patience), "ProcessPumpStopped never fired");
+            Assert.Equal(pid, stoppedPid);
+            Assert.True(SpinWait.SpinUntil(() => !tracker.IsTrackedProcess(pid), Patience), "the pid still reads as tracked");
+
+            tracker.AddProcess(pid);
+            Assert.Equal(2, factory.Opened.Count);
+        }
+        finally
+        {
+            tracker.Dispose();
+        }
+    }
 }

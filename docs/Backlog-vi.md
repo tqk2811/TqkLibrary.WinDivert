@@ -96,12 +96,11 @@ Phần lớn mục chuyển từ backlog của app ProxyDivert ngày 2026-11-08.
 - **Vì sao:** hiếm gặp hoặc chỉ tốn tài nguyên.
 - **Ngày ghi:** 2026-09-08 (kiểm lại 2026-09-11 và 2026-10-09).
 
-### B17. Socket pump bỏ cuộc sau 32 lỗi mà entry vẫn ở `_pidHandles` (Vừa)
+### `ISocketTracker.ProcessPumpStopped` chưa được chuyển lên `IProcessRedirector`
 
-- **Vấn đề:** pump thoát và đóng handle, nhưng entry còn trong `_pidHandles` nên `IsTrackedProcess(pid)` vẫn trả `true`, không có sự kiện tương đương `PumpStopped` cho lớp SOCKET, và `AddProcess` lần sau thấy đã có entry nên không mở lại: pid ngừng được theo dõi trong im lặng (cùng họ với A23).
-- **Vị trí:** [SocketTracker.cs:556-558](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L556-L558) (vòng `TryRecv`: `++failuresInARow >= MaxRecvFailuresInARow` thì `break`).
-- **Cách sửa:** khi bỏ cuộc thì `TryRemove` entry và bắn sự kiện (`ProcessPumpStopped(pid)`) để host quyết mở lại hay báo.
-- **Ngày ghi:** 2026-09-11 (kiểm lại 2026-10-09).
+- **Vấn đề:** từ B17, pump SOCKET bỏ cuộc thì gỡ pid khỏi `_pidHandles` và bắn `ISocketTracker.ProcessPumpStopped(pid)`, nhưng `ProcessRedirector` không chuyển tiếp sự kiện này nên app (ProxyDivert.Core) chưa nghe được để mở lại hoặc báo; hiện chỉ có log Error. Lần `AddProcess` kế tiếp cho pid đó (vd watcher thấy lại tiến trình) giờ đã mở được handle mới.
+- **Vị trí:** `src/TqkLibrary.WinDivert/Flow/SocketTracker.cs` (`OnPumpGaveUp`), `src/TqkLibrary.WinDivert.Redirect/ProcessRedirector.cs` (`StartCore`), `Interfaces/IProcessRedirector.cs`.
+- **Ngày ghi:** 2026-11-25.
 
 ### E1.3. Sở hữu chỉ nằm trong doc, không trong kiểu, WinDivert (Should)
 
@@ -114,7 +113,7 @@ Phần lớn mục chuyển từ backlog của app ProxyDivert ngày 2026-11-08.
 
 - **Vấn đề:** [SocketTracker.cs](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs) gồm: handle per-pid, mode machine-wide + `_pidDecisions`, bảng TCP/UDP, decode socket event, reconcile kernel + throttle, cleanup loop, pre-populate. Có 7 điểm rẽ `IsMachineWide`; `FakeTracker` trong test phải implement 13 member chỉ để test NAT (`src/ProxyDivert.Core.Tests/NatRedirectMiddlewareEscapedFlowTests.cs`).
 - **Vì sao:** mọi lỗi race SYN/attach/trễ quét/RemoveProcess đều đổ về file này; reconcile gọi `IpHlpApi` static nên không test được.
-- **Cách sửa:** `FlowTable` (thuần, 4 dictionary + `Record/Close/Reap(now)` + 4 event, test không cần driver); `SocketEventPump` (decode `WinDivertAddress` → `SocketEvent` record); `IKernelConnectionTable` bọc `IpHlpApi` + `KernelReconciler` (throttle, dùng `IClock`); `IProcessScope` (strategy) với `PerProcessHandleScope`/`MachineWideScope` xoá mọi `if (IsMachineWide)`; `SocketTracker` còn façade ~120 dòng; `ISocketTracker` thu về `IFlowLookup` + `IProcessScope`. Thứ tự: `FlowTable` (viết test trước khi dời, giữ ngữ nghĩa `TryAdd else overwrite` và `wasLive`) → kernel table → scope. Giải quyết luôn B4 (khoá `(pid, startTime)` trong `MachineWideScope`) và A8, B16, B17.
+- **Cách sửa:** `FlowTable` (thuần, 4 dictionary + `Record/Close/Reap(now)` + 4 event, test không cần driver); `SocketEventPump` (decode `WinDivertAddress` → `SocketEvent` record); `IKernelConnectionTable` bọc `IpHlpApi` + `KernelReconciler` (throttle, dùng `IClock`); `IProcessScope` (strategy) với `PerProcessHandleScope`/`MachineWideScope` xoá mọi `if (IsMachineWide)`; `SocketTracker` còn façade ~120 dòng; `ISocketTracker` thu về `IFlowLookup` + `IProcessScope`. Thứ tự: `FlowTable` (viết test trước khi dời, giữ ngữ nghĩa `TryAdd else overwrite` và `wasLive`) → kernel table → scope. Giải quyết luôn B4 (khoá `(pid, startTime)` trong `MachineWideScope`) và A8.
 - **Ngày ghi:** 2026-09-08.
 
 ### E2.3. `NatRedirectMiddleware` gộp NAT + policy cổng + escaped flow + reset + dedupe log (Should)
