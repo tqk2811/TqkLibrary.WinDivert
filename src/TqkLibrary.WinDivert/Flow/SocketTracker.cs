@@ -383,7 +383,10 @@ public sealed class SocketTracker : ISocketTracker
         // so the pid does not read as tracked behind a dead handle. Compare-and-remove: only this
         // very entry, never one a later AddProcess put in its place.
         if (giveUp.Happened)
+        {
             _pidHandles.TryRemove(new KeyValuePair<uint, PerPidHandle>(pid, entry));
+            return;
+        }
 
         // Pre-populate this pid's existing sockets so events that fired before the filter
         // attached are not lost (mirrors the root-pid behaviour at Start time).
@@ -614,8 +617,15 @@ public sealed class SocketTracker : ISocketTracker
     /// </summary>
     private void OnPumpGaveUp(IWinDivertHandle handle, uint pid)
     {
-        if (_pidHandles.TryGetValue(pid, out PerPidHandle? entry) && ReferenceEquals(entry.Handle, handle))
-            _pidHandles.TryRemove(new KeyValuePair<uint, PerPidHandle>(pid, entry));
+        // Report only when this pump still owned the pid. An entry holding a different handle means
+        // the pid was removed and added again since: this is a stale pump, and the pid is tracked.
+        // No entry at all is the pump that gave up before AddProcess published it (AddProcess then
+        // drops it silently, so this is the one report) or the machine-wide pump.
+        if (_pidHandles.TryGetValue(pid, out PerPidHandle? entry))
+        {
+            if (!ReferenceEquals(entry.Handle, handle)) return;
+            if (!_pidHandles.TryRemove(new KeyValuePair<uint, PerPidHandle>(pid, entry))) return;
+        }
 
         if (Volatile.Read(ref _disposed) != 0) return;
         try { ProcessPumpStopped?.Invoke(pid); }

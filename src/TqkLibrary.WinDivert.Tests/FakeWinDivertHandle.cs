@@ -59,6 +59,12 @@ internal sealed class FakeWinDivertHandle : IWinDivertHandle
     public int FailsEveryRecvWith { get; init; }
 
     /// <summary>
+    /// When set together with FailsEveryRecvWith, recv blocks like a quiet driver until this is set,
+    /// and only then starts failing — lets a test decide when a pump gives up.
+    /// </summary>
+    public ManualResetEventSlim? FailsOnlyOnceSet { get; init; }
+
+    /// <summary>
     /// How long a recv keeps running after it has been asked to stop. Longer than the second a
     /// disposer waits is the case that matters: that is when the old code gave up and closed the
     /// handle anyway.
@@ -117,6 +123,7 @@ internal sealed class FakeWinDivertHandle : IWinDivertHandle
 
         if (FailsEveryRecvWith != 0)
         {
+            FailsOnlyOnceSet?.Wait();
             win32Error = FailsEveryRecvWith;
             return false;
         }

@@ -146,4 +146,43 @@ public class SocketTrackerHandleTests
             tracker.Dispose();
         }
     }
+
+    // A pump of an old handle that gives up after the pid was removed and added again must not report:
+    // the pid is tracked by the new handle, and the event would make the host treat it as lost.
+    [Fact]
+    public void A_stale_pump_giving_up_after_the_pid_was_added_again_says_nothing()
+    {
+        const uint pid = 4321;
+        const int ErrorAccessDenied = 5;
+        using var gate = new ManualResetEventSlim(false);
+        FakeWinDivertHandle? first = null;
+        var factory = new FakeHandleFactory(filter =>
+        {
+            if (first is null)
+                return first = new FakeWinDivertHandle(filter) { FailsEveryRecvWith = ErrorAccessDenied, FailsOnlyOnceSet = gate };
+            return new FakeWinDivertHandle(filter);
+        });
+        var tracker = new SocketTracker(0, factory, Log);
+        int stoppedCount = 0;
+        tracker.ProcessPumpStopped += _ => Interlocked.Increment(ref stoppedCount);
+
+        try
+        {
+            tracker.AddProcess(pid);
+            Assert.True(first!.WaitForFirstRecv(Patience));
+            Assert.True(tracker.RemoveProcess(pid));
+            tracker.AddProcess(pid);
+            Assert.Equal(2, factory.Opened.Count);
+
+            gate.Set();
+            Assert.True(first.WaitUntilClosed(Patience), "the stale pump never gave up");
+
+            Assert.Equal(0, Volatile.Read(ref stoppedCount));
+            Assert.True(tracker.IsTrackedProcess(pid));
+        }
+        finally
+        {
+            tracker.Dispose();
+        }
+    }
 }
