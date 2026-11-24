@@ -33,7 +33,17 @@ public sealed class NatTable : INatTable
     private const int SweepIntervalMs = 5_000;
 
     private readonly ConcurrentDictionary<NatKey, Slot> _entries = new();
-    private long _nextSweepTicks = Environment.TickCount64 + SweepIntervalMs;
+    private readonly Func<long> _clock;
+    private long _nextSweepTicks;
+
+    public NatTable() : this(static () => Environment.TickCount64) { }
+
+    /// <summary>Takes the millisecond clock, so tests can run out a grace window without waiting it.</summary>
+    internal NatTable(Func<long> clock)
+    {
+        _clock = clock;
+        _nextSweepTicks = clock() + SweepIntervalMs;
+    }
 
     // Returns true when this is a flow the table had not seen — a brand-new source port, or a
     // recycled one now going somewhere else. Callers use it to do the per-flow work (logging, the
@@ -43,7 +53,7 @@ public sealed class NatTable : INatTable
     {
         var key = new NatKey(entry.Protocol, entry.OriginalSourcePort, entry.IsIpv6);
         bool isNew = !_entries.TryGetValue(key, out Slot? previous)
-            || previous.IsExpired
+            || previous.IsExpired(_clock())
             || previous.Entry.OriginalDestinationPort != entry.OriginalDestinationPort
             || !previous.Entry.OriginalDestinationAddress.Equals(entry.OriginalDestinationAddress);
         _entries[key] = new Slot(entry);
@@ -57,7 +67,7 @@ public sealed class NatTable : INatTable
 
         // Correctness does not wait on the sweep: past its grace an entry must not answer for
         // whatever flow holds that port now.
-        if (slot.IsExpired)
+        if (slot.IsExpired(_clock()))
         {
             _entries.TryRemove(key, out _);
             return null;
@@ -71,7 +81,7 @@ public sealed class NatTable : INatTable
     public void MarkClosed(byte protocol, ushort srcPort, bool isIpv6)
     {
         if (_entries.TryGetValue(new NatKey(protocol, srcPort, isIpv6), out Slot? slot))
-            slot.ExpireAt(Environment.TickCount64 + CloseGraceMs);
+            slot.ExpireAt(_clock() + CloseGraceMs);
 
         SweepIfDue();
     }
@@ -85,14 +95,14 @@ public sealed class NatTable : INatTable
     /// </summary>
     private void SweepIfDue()
     {
-        long now = Environment.TickCount64;
+        long now = _clock();
         long due = Interlocked.Read(ref _nextSweepTicks);
         if (now < due) return;
         if (Interlocked.CompareExchange(ref _nextSweepTicks, now + SweepIntervalMs, due) != due) return;
 
         foreach (var kv in _entries)
         {
-            if (kv.Value.IsExpired) _entries.TryRemove(kv.Key, out _);
+            if (kv.Value.IsExpired(now)) _entries.TryRemove(kv.Key, out _);
         }
     }
 
@@ -112,13 +122,10 @@ public sealed class NatTable : INatTable
         public void ExpireAt(long ticks) => Interlocked.Exchange(ref _expireAtTicks, ticks);
 
         /// <summary>Zero means the flow is still open, and TickCount64 never returns to zero.</summary>
-        public bool IsExpired
+        public bool IsExpired(long now)
         {
-            get
-            {
-                long at = Interlocked.Read(ref _expireAtTicks);
-                return at != 0 && Environment.TickCount64 >= at;
-            }
+            long at = Interlocked.Read(ref _expireAtTicks);
+            return at != 0 && now >= at;
         }
     }
 }

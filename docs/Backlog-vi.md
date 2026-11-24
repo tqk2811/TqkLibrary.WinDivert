@@ -4,13 +4,6 @@ Việc còn treo và việc nên làm của thư viện. Xử lý xong mục nà
 
 Phần lớn mục chuyển từ backlog của app ProxyDivert ngày 2026-11-08. Mục mang mã A/B/E đến từ đợt rà soát ngày 2026-09-08: A = lỗi phát hiện từ phía app, B = lỗi WinDivert, E = thiết kế (OOP, tái sử dụng, test). Mức `Cao`/`Vừa`/`Thấp` theo nhãn trong tiêu đề; mục E: `Must` = đã gây lỗi thật hoặc chặn việc mở rộng, `Should` = giảm trùng lặp hoặc cho phép test, `Nice` = sạch hơn, không đổi hành vi. Đường dẫn `src/ProxyDivert.*` là của repo app ProxyDivert (repo cha, nhúng thư viện này làm submodule); đường dẫn khác tính từ gốc repo này.
 
-### B3. `NatTable.Remove` không có ai gọi: còn nửa UDP (Cao)
-
-- **Vấn đề:** nhánh TCP đã đủ (`MarkClosed` từ `TcpConnectClosed`, `Find` tự loại entry hết hạn, có vòng quét). Entry UDP (proto 17) vào cùng bảng qua `Upsert` nhưng không ai gọi `MarkClosed`/`Remove` cho chúng (`UdpBindRemoved` không được nối vào `_nat`), nên bệnh gốc (cổng nguồn tái dùng trả đích cũ, bảng không nhả) còn nguyên ở nửa UDP; `NatTable.Remove` vẫn không có caller. Chưa có test hết hạn (test chỉ dùng `NatTable` làm phụ kiện). Khi Windows tái dùng cổng nguồn mà SYN mới bị lỡ, `Find` trả entry cũ thì bỏ qua nhánh luồng thoát, NAT giữa dòng và kết nối chết; bộ nhớ bị chặn trên ~262k entry nhưng không bao giờ nhả.
-- **Vị trí:** [NatTable.cs:42-97](../src/TqkLibrary.WinDivert.Redirect/NatTable.cs#L42-L97), [ProcessRedirector.cs:184](../src/TqkLibrary.WinDivert.Redirect/ProcessRedirector.cs#L184) (chỉ nối `TcpConnectClosed` → `MarkClosed`), [SocketTracker.cs:413](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L413) và [:674](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L674) (nơi bắn `UdpBindRemoved`).
-- **Cách sửa:** nối `UdpBindRemoved` → `MarkClosed`, hoặc cho entry UDP TTL riêng trong vòng quét; thêm test hết hạn cho cả hai proto.
-- **Ngày ghi:** 2026-09-08 (kiểm lại 2026-09-11 và 2026-10-09).
-
 ### Pump NETWORK: nhận gói theo lô (RecvEx/SendEx)
 
 - **Vấn đề:** pump nhận và gửi từng gói một. Batch giảm số syscall nhưng làm gói đầu lô chờ cả lô, tăng trễ từng gói; vì vậy chưa làm.

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -178,10 +179,8 @@ public sealed class ProcessRedirector : IProcessRedirector
         tracker.TcpConnectClosed += k => TcpConnectClosed?.Invoke(k);
         // A flow marked for reset is done with once the process has closed it.
         tracker.TcpConnectClosed += k => _escapedFlows.Remove(k);
-        // And its NAT entry stops being the truth about that port. The tracker is the only thing
-        // that knows a flow ended, so without this the table only ever grows and stale entries
-        // answer for ports the OS has since handed to somebody else.
-        tracker.TcpConnectClosed += k => _nat.MarkClosed(k.Protocol, k.LocalPort, IsIpv6Flow(k));
+        // And its NAT entry stops being the truth about that port.
+        WireNatExpiry(tracker, _nat);
         tracker.Start();
 
         Ipv6Mode ipv6Mode = ResolveIpv6Mode();
@@ -226,6 +225,29 @@ public sealed class ProcessRedirector : IProcessRedirector
     /// Which of the two port spaces a flow belongs to. A v4-mapped address is an IPv4 flow riding
     /// a dual-stack socket, and its port lives in the IPv4 space — the NAT key has to agree.
     /// </summary>
+    /// <summary>
+    /// Dates the NAT entry of every flow the tracker reports closed, TCP and UDP alike. The tracker
+    /// is the only thing that knows a flow ended, so without this the table only ever grows and
+    /// stale entries answer for ports the OS has since handed to somebody else.
+    /// </summary>
+    internal static void WireNatExpiry(ISocketTracker tracker, INatTable nat)
+    {
+        tracker.TcpConnectClosed += k => nat.MarkClosed(k.Protocol, k.LocalPort, IsIpv6Flow(k));
+        tracker.UdpBindRemoved += (address, port) =>
+        {
+            // A dual-stack bind on [::] owns the port in both families, and its IPv4 datagrams
+            // were keyed as IPv4 by the NAT stage.
+            if (address.Equals(IPAddress.IPv6Any))
+            {
+                nat.MarkClosed(17, port, isIpv6: false);
+                nat.MarkClosed(17, port, isIpv6: true);
+                return;
+            }
+            bool isIpv6 = address.AddressFamily == AddressFamily.InterNetworkV6 && !address.IsIPv4MappedToIPv6;
+            nat.MarkClosed(17, port, isIpv6);
+        };
+    }
+
     private static bool IsIpv6Flow(FlowKey flow)
         => flow.LocalAddress.AddressFamily == AddressFamily.InterNetworkV6
             && !flow.LocalAddress.IsIPv4MappedToIPv6;

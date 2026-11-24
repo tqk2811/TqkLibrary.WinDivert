@@ -9,6 +9,10 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<InternalsVisibleTo Include="TqkLibrary.WinDivert.Tests" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<ProjectReference Include="..\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
 		<ProjectReference Include="..\TqkLibrary.WinDivert.SecureDns\TqkLibrary.WinDivert.SecureDns.csproj" />
 		<ProjectReference Include="..\TqkLibrary.WinDivert.Inspection\TqkLibrary.WinDivert.Inspection.csproj" />
