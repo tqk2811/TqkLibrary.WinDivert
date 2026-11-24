@@ -133,6 +133,9 @@ public sealed class ProcessTreeMonitor : IProcessTreeMonitor
     {
         try { _cts.Cancel(); } catch { }
         try { _pollTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
+        // Let go of the subscribers: a poll that outlived the wait above must not announce children
+        // after Dispose, and the monitor should not keep its listeners alive.
+        ChildSpawned = null;
         _cts.Dispose();
     }
 }

@@ -16,6 +16,7 @@
 	<ItemGroup>
 		<ProjectReference Include="..\TqkLibrary.WinDivert\TqkLibrary.WinDivert.csproj" />
 		<ProjectReference Include="..\TqkLibrary.WinDivert.Inspection\TqkLibrary.WinDivert.Inspection.csproj" />
+		<ProjectReference Include="..\TqkLibrary.WinDivert.ProcessControl\TqkLibrary.WinDivert.ProcessControl.csproj" />
 		<ProjectReference Include="..\TqkLibrary.WinDivert.Redirect\TqkLibrary.WinDivert.Redirect.csproj" />
 	</ItemGroup>
 

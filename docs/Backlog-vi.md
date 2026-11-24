@@ -81,16 +81,12 @@ Phần lớn mục chuyển từ backlog của app ProxyDivert ngày 2026-11-08.
 ### B14. Nhóm mức Thấp (WinDivert)
 
 - **Vấn đề:** các lỗi nhỏ trong submodule, mỗi gạch một việc:
-  - Parser không kiểm đủ byte cho header TCP/UDP, không xét fragment: [PacketParser.cs:20-24](../src/TqkLibrary.WinDivert/Packet/PacketParser.cs#L20-L24). Đã có `ihl < 20 || ihl > length`; còn thiếu `ihl + 20/8 <= length` và bỏ qua fragment-offset != 0. `Tcp`/`Udp` view đọc thẳng tại `TransportHeaderOffset` không kiểm biên ([ParsedPacket.cs:20-21](../src/TqkLibrary.WinDivert/Packet/Models/ParsedPacket.cs#L20-L21)), buffer pump dùng lại nên đọc rác của gói trước. Gắn với mục "Mảnh IPv4 thứ hai trở đi" ở trên.
+  - Parser không xét fragment: [PacketParser.cs:20-24](../src/TqkLibrary.WinDivert/Packet/PacketParser.cs#L20-L24). Đã kiểm `ihl + 20/8 <= length` cho TCP/UDP (IPv4 và IPv6), còn thiếu bỏ qua fragment-offset != 0. Gắn với mục "Mảnh IPv4 thứ hai trở đi" ở trên.
   - IPv6 extension header không được duyệt, gói TCP đứng sau Hop-by-Hop bị cho qua không redirect: [PacketParser.cs:28-33](../src/TqkLibrary.WinDivert/Packet/PacketParser.cs#L28-L33). Duyệt chuỗi extension chuẩn hoặc Drop rõ ràng.
   - `ExpireTick == 0` trùng giá trị thật một lần mỗi 49.7 ngày: [SocketTracker.cs:665](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L665), [TcpFlowState.cs:7](../src/TqkLibrary.WinDivert/Flow/Models/TcpFlowState.cs#L7). Dùng `long?` hoặc `bool IsClosing`.
   - `SocketClose` lặp lại cho cùng flow TCP gia hạn `ExpireTick` mãi: [SocketTracker.cs:658-668](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L658-L668). (Phần UDP đã xử lý: `SocketClose` giờ gỡ bind UDP.)
   - Bind UDP trên ANY che phủ mọi tiến trình cùng cổng: [SocketTracker.cs:192-194](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L192-L194).
-  - `DnsMessageParser` cấp phát `List(answerCount)` theo số do gói tin quyết định: [DnsMessageParser.cs:55](../src/TqkLibrary.WinDivert.SecureDns/DnsMessageParser.cs#L55). `Math.Min(answerCount, 64)`.
   - `RelayToAsync` không truyền half-close: [RedirectedTcpConnection.cs:84](../src/TqkLibrary.WinDivert.Redirect/Models/RedirectedTcpConnection.cs#L84). `Shutdown(Send)` phía còn lại rồi đợi chiều kia.
-  - `TcpRelayServer.Dispose` dispose CTS khi handler còn chạy: [TcpRelayServer.cs:198-211](../src/TqkLibrary.WinDivert.Redirect/TcpRelayServer.cs#L198-L211) (đã có danh sách kết nối đóng trước, cần kiểm lại còn hở không).
-  - `ProcessTreeMonitor.Dispose` không gỡ event ([ProcessTreeMonitor.cs:132](../src/TqkLibrary.WinDivert.ProcessControl/ProcessTreeMonitor.cs#L132)); `SemaphoreSlim` trong [DnsOverHttpsMiddleware.cs:114](../src/TqkLibrary.WinDivert.SecureDns/DnsOverHttpsMiddleware.cs#L114) không dispose.
-  - `SuspendedProcess.Resume()` sau `Dispose()` ném `Win32Exception` khó hiểu: [SuspendedProcess.cs:29-45](../src/TqkLibrary.WinDivert.ProcessControl/SuspendedProcess.cs#L29-L45). Set `_resumed = true` trong `Dispose`.
   - Dead code: `WinDivertNative.RecvEx`/`HelperCompileFilter`/`Ntohs`/`Htons` ([WinDivertNative.cs:35-90](../src/TqkLibrary.WinDivert/Native/WinDivertNative.cs#L35-L90)), `IpHlpApi.EnumerateProcessTcpFlows`/`EnumerateProcessUdpBinds` ([IpHlpApi.cs:115-122](../src/TqkLibrary.WinDivert/Native/IpHlpApi.cs#L115-L122)). Lưu ý: `RecvEx` và `HelperCompileFilter` có thể được dùng lại bởi hai mục "Pump NETWORK: nhận gói theo lô" và "Test filter" ở trên; kiểm trước khi xoá.
 - **Vị trí:** xem từng gạch.
 - **Vì sao:** hiếm gặp hoặc chỉ tốn tài nguyên.

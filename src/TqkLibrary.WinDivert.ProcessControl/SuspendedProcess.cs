@@ -57,5 +57,8 @@ public sealed class SuspendedProcess : ISuspendedProcess
         }
         if (_threadHandle != IntPtr.Zero) { ProcessNativeMethods.CloseHandle(_threadHandle); _threadHandle = IntPtr.Zero; }
         if (_processHandle != IntPtr.Zero) { ProcessNativeMethods.CloseHandle(_processHandle); _processHandle = IntPtr.Zero; }
+        // Whatever happened above, the process is no longer ours to resume: a Resume() after this
+        // would call into a closed (zero) handle and throw a Win32Exception that explains nothing.
+        _resumed = true;
     }
 }

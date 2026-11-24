@@ -52,7 +52,9 @@ public sealed class DnsMessageParser : IDnsMessageParser
         }
 
         // ---- answers ----
-        var records = new List<DnsAddressRecord>(answerCount);
+        // Capped: answerCount comes straight off the wire, and a forged 65535 would reserve a large
+        // list for a reply that holds a handful of records.
+        var records = new List<DnsAddressRecord>(Math.Min(answerCount, 64));
         // owner name -> the question name it ultimately answers, extended as CNAMEs are walked.
         var aliasOf = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (questionName.Length > 0) aliasOf[questionName] = questionName;

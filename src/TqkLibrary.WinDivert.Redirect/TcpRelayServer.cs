@@ -70,7 +70,10 @@ public sealed class TcpRelayServer : ITcpRelayServer
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
         _logger.LogDebug("TCP relay listening on 127.0.0.1:{Port}", Port);
-        _acceptLoops.Add(Task.Run(() => AcceptLoop(_listener, isIpv6: false, _cts.Token)));
+        // Read once, here: a loop that has not started by the time Dispose runs would otherwise
+        // reach for _cts.Token on a disposed source and fault with ObjectDisposedException.
+        CancellationToken token = _cts.Token;
+        _acceptLoops.Add(Task.Run(() => AcceptLoop(_listener, isIpv6: false, token)));
 
         if (_listenerV6 != null)
         {
@@ -82,7 +85,7 @@ public sealed class TcpRelayServer : ITcpRelayServer
                 _listenerV6.Start();
                 PortV6 = ((IPEndPoint)_listenerV6.LocalEndpoint).Port;
                 _logger.LogDebug("TCP relay listening on [::1]:{Port}", PortV6);
-                _acceptLoops.Add(Task.Run(() => AcceptLoop(_listenerV6, isIpv6: true, _cts.Token)));
+                _acceptLoops.Add(Task.Run(() => AcceptLoop(_listenerV6, isIpv6: true, token)));
             }
             catch (SocketException ex)
             {
