@@ -96,13 +96,6 @@ Phần lớn mục chuyển từ backlog của app ProxyDivert ngày 2026-11-08.
 - **Vì sao:** hiếm gặp hoặc chỉ tốn tài nguyên.
 - **Ngày ghi:** 2026-09-08 (kiểm lại 2026-09-11 và 2026-10-09).
 
-### B16. `SocketTracker.Dispose` `Clear()` bảng handle sau khi chờ, hở khe với `AddProcess` (Thấp)
-
-- **Vấn đề:** `TryAdd` của `AddProcess` lọt vào sau hai vòng shutdown của `Dispose`, nhưng `Clear()` chạy giữa `TryAdd` và `TryRemove` nên re-check thấy `_disposed` mà `TryRemove` trượt: không ai `Shutdown()`, pump per-pid nằm trong `TryRecv` cho tới sự kiện socket kế tiếp của pid đó (có thể không bao giờ), rò 1 handle + 1 thread. Khe rất hẹp.
-- **Vị trí:** [SocketTracker.cs:713](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L713) (`_pidHandles.Clear()`), [:342-357](../src/TqkLibrary.WinDivert/Flow/SocketTracker.cs#L342-L357) (`AddProcess`: `TryAdd` rồi re-check `_disposed` + `TryRemove`).
-- **Cách sửa:** bỏ `Clear()`, hoặc `Dispose` `TryRemove` từng entry trong chính vòng shutdown.
-- **Ngày ghi:** 2026-09-11 (kiểm lại 2026-10-09).
-
 ### B17. Socket pump bỏ cuộc sau 32 lỗi mà entry vẫn ở `_pidHandles` (Vừa)
 
 - **Vấn đề:** pump thoát và đóng handle, nhưng entry còn trong `_pidHandles` nên `IsTrackedProcess(pid)` vẫn trả `true`, không có sự kiện tương đương `PumpStopped` cho lớp SOCKET, và `AddProcess` lần sau thấy đã có entry nên không mở lại: pid ngừng được theo dõi trong im lặng (cùng họ với A23).

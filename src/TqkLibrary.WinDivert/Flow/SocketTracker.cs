@@ -702,15 +702,22 @@ public sealed class SocketTracker : ISocketTracker
 
         // Shut every handle down first and wait afterwards, so the waits overlap instead of adding
         // up. Neither loop closes a handle: the pump that reads it does, as it leaves. See PumpLoop.
+        //
+        // Each entry is taken out one by one rather than cleared at the end: an AddProcess that
+        // publishes after this loop re-checks _disposed and removes its own entry, and a Clear()
+        // running between its TryAdd and that TryRemove would make the TryRemove miss — leaving a
+        // handle nobody shuts down and a pump parked in recv.
+        var stopping = new List<PerPidHandle>();
         foreach (var kv in _pidHandles)
         {
-            try { kv.Value.Handle.Shutdown(); } catch { }
+            if (!_pidHandles.TryRemove(kv.Key, out PerPidHandle? entry)) continue;
+            stopping.Add(entry);
+            try { entry.Handle.Shutdown(); } catch { }
         }
-        foreach (var kv in _pidHandles)
+        foreach (PerPidHandle entry in stopping)
         {
-            try { kv.Value.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
+            try { entry.PumpTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
         }
-        _pidHandles.Clear();
         _pidDecisions.Clear();
         try { _cleanupTask?.Wait(TimeSpan.FromSeconds(1)); } catch { }
         _cts.Dispose();
